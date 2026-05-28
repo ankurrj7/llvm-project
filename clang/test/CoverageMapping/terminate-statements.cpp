@@ -378,6 +378,14 @@ int nestedcallnoret() {
   return 0;
 }
 
+// CHECK-LABEL: _Z17indirectcallnoretv:
+int indirectcallnoret() {
+  void (*fp)() = nr2;
+  fp();      // CHECK: Gap,File 0, [[@LINE]]:8 -> [[@LINE+1]]:3 = 0
+  sink();    // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE+1]]:11 = 0
+  return 0;
+}
+
 // CHECK-LABEL: _Z18infinitewhilenoretv:
 int infinitewhilenoret() {
   while (true) { // CHECK: Branch,File 0, [[@LINE]]:10 -> [[@LINE]]:14 = #1, 0
@@ -448,6 +456,7 @@ int main() {
   statementexprnoret(false);
   directcallnoret();
   nestedcallnoret();
+  indirectcallnoret();
   infinitewhilenoret();
   infinitefornoret();
   do_with_break(0);

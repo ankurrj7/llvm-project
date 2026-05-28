@@ -14,14 +14,14 @@
 #include "CodeGenFunction.h"
 #include "CodeGenPGO.h"
 #include "clang/AST/ParentMap.h"
-#include "clang/AST/StmtVisitor.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Analysis/CFG.h"
 #include "clang/Analysis/CFGStmtMap.h"
+#include "clang/AST/StmtVisitor.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticFrontend.h"
 #include "clang/Lex/Lexer.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ProfileData/Coverage/CoverageMapping.h"
@@ -1826,10 +1826,88 @@ struct CounterCoverageMappingBuilder
     return CurrentParentMap.has_value();
   }
 
+  const FunctionDecl *resolveReferencedFunction(const Expr *E) {
+    E = E->IgnoreParenImpCasts();
+    if (const auto *UO = dyn_cast<UnaryOperator>(E))
+      if (UO->getOpcode() == UO_AddrOf)
+        E = UO->getSubExpr()->IgnoreParenImpCasts();
+
+    const auto *DRE = dyn_cast<DeclRefExpr>(E);
+    return DRE ? dyn_cast<FunctionDecl>(DRE->getDecl()) : nullptr;
+  }
+
+  const FunctionDecl *resolveStaticIndirectCallee(const CallExpr *E) {
+    const Expr *CalleeExpr = E->getCallee()->IgnoreParenImpCasts();
+    if (const auto *UO = dyn_cast<UnaryOperator>(CalleeExpr))
+      if (UO->getOpcode() == UO_Deref)
+        CalleeExpr = UO->getSubExpr()->IgnoreParenImpCasts();
+
+    const auto *DRE = dyn_cast<DeclRefExpr>(CalleeExpr);
+    const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+    if (!VD || VD->hasGlobalStorage() || !VD->hasInit() ||
+        !ensureCurrentParentMap())
+      return nullptr;
+
+    const FunctionDecl *Target = resolveReferencedFunction(VD->getInit());
+    if (!Target)
+      return nullptr;
+
+    struct FunctionPointerUseVisitor
+        : RecursiveASTVisitor<FunctionPointerUseVisitor> {
+      using Base = RecursiveASTVisitor<FunctionPointerUseVisitor>;
+
+      const VarDecl *TargetVar;
+      const ParentMap &Parents;
+      bool IsSafe = true;
+
+      FunctionPointerUseVisitor(const VarDecl *TargetVar,
+                                const ParentMap &Parents)
+          : TargetVar(TargetVar), Parents(Parents) {}
+
+      bool TraverseStmt(Stmt *S) {
+        return IsSafe && Base::TraverseStmt(S);
+      }
+
+      bool VisitDeclRefExpr(DeclRefExpr *Ref) {
+        if (Ref->getDecl() != TargetVar)
+          return true;
+        IsSafe = isCallCalleeUse(Ref);
+        return IsSafe;
+      }
+
+      bool isCallCalleeUse(const Stmt *S) const {
+        const Stmt *Node = S;
+        while (const Stmt *Parent = Parents.getParent(Node)) {
+          if (isa<ParenExpr>(Parent) || isa<CastExpr>(Parent)) {
+            Node = Parent;
+            continue;
+          }
+          if (const auto *UO = dyn_cast<UnaryOperator>(Parent))
+            if (UO->getOpcode() == UO_Deref) {
+              Node = Parent;
+              continue;
+            }
+          if (const auto *Call = dyn_cast<CallExpr>(Parent))
+            return Call->getCallee() == Node;
+          return false;
+        }
+        return false;
+      }
+    };
+
+    FunctionPointerUseVisitor Visitor(VD, *CurrentParentMap);
+    Visitor.TraverseStmt(const_cast<Stmt *>(CurrentBody));
+    if (!Visitor.IsSafe)
+      return nullptr;
+
+    return Target;
+  }
+
   bool isCallInevitablySinking(const CallExpr *E) {
     QualType CalleeType = E->getCallee()->getType();
     return getFunctionExtInfo(*CalleeType).getNoReturn() ||
-           isDirectCalleeInevitablySinking(E);
+           isDirectCalleeInevitablySinking(E) ||
+           isFunctionInevitablySinking(resolveStaticIndirectCallee(E));
   }
 
   bool buildCurrentStmtSinkAnalysis() {
