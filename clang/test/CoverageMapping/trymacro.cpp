@@ -31,7 +31,7 @@ catch (...) {}
 void fn5() {
   for (;;) {
     TRY4 { return; } // CHECK-DAG: Expansion,File 0, [[@LINE]]:5 -> [[@LINE]]:9 = #1 (Expanded file = 1)
-  }                  // CHECK-DAG: File 0, [[@LINE-1]]:10 -> [[@LINE-1]]:21 = #5
+  }                  // CHECK-DAG: File 0, [[@LINE-1]]:10 -> [[@LINE-1]]:21 = #6
 }
 
 int main() {

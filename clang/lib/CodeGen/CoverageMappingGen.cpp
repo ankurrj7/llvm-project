@@ -1025,16 +1025,19 @@ struct CounterCoverageMappingBuilder
     BranchCounterPair Counters = {ExecCnt,
                                   Builder.subtract(ParentCnt, ExecCnt)};
 
-    if (!llvm::EnableSingleByteCoverage || !Counters.Skipped.isExpression()) {
-      assert(
-          !TheMap.Skipped.hasValue() &&
-          "SkipCnt shouldn't be allocated but refer to an existing counter.");
+    if (TheMap.Skipped.hasValue()) {
+      Counter SkipCnt = Counter::getCounter(TheMap.Skipped);
+      if (llvm::EnableSingleByteCoverage && Counters.Skipped.isExpression())
+        MapToExpand[SkipCnt] = Builder.subst(Counters.Skipped, MapToExpand);
+      Counters.Skipped = SkipCnt;
       return Counters;
     }
 
+    if (!llvm::EnableSingleByteCoverage || !Counters.Skipped.isExpression())
+      return Counters;
+
     // Assign second if second is not assigned yet.
-    if (!TheMap.Skipped.hasValue())
-      TheMap.Skipped = NextCounterNum++;
+    TheMap.Skipped = NextCounterNum++;
 
     // Replace an expression (ParentCnt - ExecCnt) with SkipCnt.
     Counter SkipCnt = Counter::getCounter(TheMap.Skipped);
@@ -1887,10 +1890,12 @@ struct CounterCoverageMappingBuilder
     HasTerminateStmt = false;
 
     // Go back to handle the condition.
-    Counter CondCount =
+    Counter LoopCount =
         addCounters(ParentCount, BackedgeCount, BC.ContinueCount);
-    auto BranchCount = getBranchCounterPair(S, CondCount);
+    auto BranchCount = getBranchCounterPair(S, LoopCount);
     assert(BranchCount.Executed.isZero() || BranchCount.Executed == BodyCount);
+    Counter CondCount =
+        addCounters(BranchCount.Executed, BranchCount.Skipped);
 
     propagateCounts(CondCount, S->getCond());
     adjustForOutOfOrderTraversal(getEnd(S));
@@ -1932,9 +1937,11 @@ struct CounterCoverageMappingBuilder
 
     HasTerminateStmt = false;
 
-    Counter CondCount = addCounters(BackedgeCount, BC.ContinueCount);
-    auto BranchCount = getBranchCounterPair(S, CondCount);
+    Counter LoopCount = addCounters(BackedgeCount, BC.ContinueCount);
+    auto BranchCount = getBranchCounterPair(S, LoopCount);
     assert(BranchCount.Executed.isZero() || BranchCount.Executed == BodyCount);
+    Counter CondCount =
+        addCounters(BranchCount.Executed, BranchCount.Skipped);
 
     propagateCounts(CondCount, S->getCond());
 
@@ -1988,11 +1995,13 @@ struct CounterCoverageMappingBuilder
       LoopIsSink = true;
 
     // Go back to handle the condition.
-    Counter CondCount = addCounters(
+    Counter LoopCount = addCounters(
         addCounters(ParentCount, BackedgeCount, BodyBC.ContinueCount),
         IncrementBC.ContinueCount);
-    auto BranchCount = getBranchCounterPair(S, CondCount);
+    auto BranchCount = getBranchCounterPair(S, LoopCount);
     assert(BranchCount.Executed.isZero() || BranchCount.Executed == BodyCount);
+    Counter CondCount =
+        addCounters(BranchCount.Executed, BranchCount.Skipped);
 
     if (const Expr *Cond = S->getCond()) {
       propagateCounts(CondCount, Cond);
@@ -2047,6 +2056,9 @@ struct CounterCoverageMappingBuilder
         addCounters(ParentCount, BackedgeCount, BC.ContinueCount);
     auto BranchCount = getBranchCounterPair(S, LoopCount);
     assert(BranchCount.Executed.isZero() || BranchCount.Executed == BodyCount);
+    Counter CondCount =
+        addCounters(BranchCount.Executed, BranchCount.Skipped);
+    propagateCounts(CondCount, S->getCond());
 
     Counter OutCount = addCounters(BC.BreakCount, BranchCount.Skipped);
     if (!LoopIsSink && !IsCounterEqual(OutCount, ParentCount)) {

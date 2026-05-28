@@ -15,31 +15,31 @@ int f2(int i) {
 
 int f3() {
   for (int a = 1; a < 9; a--)
-    return a; // CHECK: Gap,File 0, [[@LINE]]:14 -> [[@LINE+1]]:3 = (#0 - #1)
-  return 0;   // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = (#0 - #1)
+    return a; // CHECK: Gap,File 0, [[@LINE]]:14 -> [[@LINE+1]]:3 = #2
+  return 0;   // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = #2
 }
 
 int f4(int i) {
   while (i > 0) {
     i++;
     return i;
-  }         // CHECK: File 0, [[@LINE]]:4 -> [[@LINE+1]]:3 = (#0 - #1)
-  return 0; // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = (#0 - #1)
+  }         // CHECK: Gap,File 0, [[@LINE]]:4 -> [[@LINE+1]]:3 = #2
+  return 0; // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = #2
 }
 
 int f5(int i) {
   do {
     return i;
-  } while (i > 0); // CHECK: Gap,File 0, [[@LINE]]:19 -> [[@LINE+1]]:3 = (0 - #1)
-  return 0;        // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = (0 - #1)
+  } while (i > 0); // CHECK: Gap,File 0, [[@LINE]]:19 -> [[@LINE+1]]:3 = #2
+  return 0;        // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = #2
 }
 
 int f6() {
   int arr[] = {1, 2, 3, 4};
   for (int i : arr) {
     return i;
-  }         // CHECK: Gap,File 0, [[@LINE]]:4 -> [[@LINE+1]]:3 = (#0 - #1)
-  return 0; // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = (#0 - #1)
+  }         // CHECK: Gap,File 0, [[@LINE]]:4 -> [[@LINE+1]]:3 = #2
+  return 0; // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = #2
 }
 
 int f7() {
@@ -115,8 +115,8 @@ int f14(int i) {
       i++;
       return 0;
     }
-  }         // CHECK: Gap,File 0, [[@LINE]]:4 -> [[@LINE+1]]:3 = (#0 - #2)
-  return 0; // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = (#0 - #2)
+  }         // CHECK: Gap,File 0, [[@LINE]]:4 -> [[@LINE+1]]:3 = #2
+  return 0; // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = #2
 }
 
 int f15(int i) {
@@ -125,16 +125,16 @@ int f15(int i) {
     while (i < 10) { // CHECK-NEXT: File 0, [[@LINE]]:5 -> [[@LINE+3]]:4 = 0
       i++;
     }
-  }         // CHECK: Gap,File 0, [[@LINE]]:4 -> [[@LINE+1]]:3 = (#0 - #1)
-  return 0; // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = (#0 - #1)
+  }         // CHECK: Gap,File 0, [[@LINE]]:4 -> [[@LINE+1]]:3 = #2
+  return 0; // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = #2
 }
 
 int f16(int i) {
   while (i == 0) {
     break;
     return 0;
-  }
-  return 0; // CHECK-NOT: Gap,File 0, [[@LINE-1]]
+  }         // CHECK: Gap,File 0, [[@LINE]]:4 -> [[@LINE+1]]:3 = (#1 + #2)
+  return 0; // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = (#1 + #2)
 }
 
 #define IF if
@@ -247,12 +247,12 @@ void for_loop() {
 
   for (int i = 0; i < 10; ++i) {
     if (i % 2 == 0)
-      continue; // CHECK: Gap,File 0, [[@LINE]]:16 -> [[@LINE+2]]:5 = (#2 - #3)
+      continue; // CHECK: Gap,File 0, [[@LINE]]:16 -> [[@LINE+2]]:5 = (#2 - #4)
 
     if (i % 5 == 0)
-      break; // CHECK: Gap,File 0, [[@LINE]]:13 -> [[@LINE+2]]:5 = ((#2 - #3) - #4)
+      break; // CHECK: Gap,File 0, [[@LINE]]:13 -> [[@LINE+2]]:5 = ((#2 - #4) - #5)
 
-    int x = i; // CHECK: [[@LINE]]:5 -> [[@LINE+1]]:11 = ((#2 - #3) - #4)
+    int x = i; // CHECK: [[@LINE]]:5 -> [[@LINE+1]]:11 = ((#2 - #4) - #5)
     return; // CHECK-NOT: [[@LINE]]:11 -> [[@LINE+2]]
 
   }
@@ -268,17 +268,17 @@ void while_loop() {
   int x = 0;
   while (++x < 10) {
     if (x == 1)
-      continue; // CHECK: Gap,File 0, [[@LINE]]:16 -> [[@LINE+2]]:5 = (#2 - #3)
+      continue; // CHECK: Gap,File 0, [[@LINE]]:16 -> [[@LINE+2]]:5 = (#2 - #4)
 
     while (++x < 4) {
       if (x == 3)
-        break; // CHECK: Gap,File 0, [[@LINE]]:15 -> [[@LINE+2]]:7 = (#4 - #5)
+        break; // CHECK: Gap,File 0, [[@LINE]]:15 -> [[@LINE+2]]:7 = (#5 - #7)
 
       while (++x < 5) {}
     }
 
     if (x == 0)
-      throw Error(); // CHECK: Gap,File 0, [[@LINE]]:21 -> [[@LINE+2]]:5 = ((#2 - #3) - #7)
+      throw Error(); // CHECK: Gap,File 0, [[@LINE]]:21 -> [[@LINE+2]]:5 = ((#6 + #7) - #10)
 
     while (++x < 9) {
       if (x == 0)
@@ -413,14 +413,34 @@ int virtualcallnoret(Base &b) { // CHECK: File 0, [[@LINE]]:31 -> [[@LINE+4]]:2 
   return 0;
 }
 
+extern "C" int test_setjmp(int *) __attribute__((returns_twice));
+extern "C" void test_longjmp(int *, int) __attribute__((noreturn));
+
+int TestEnv[5];
+
+void jumpback() {
+  test_longjmp(TestEnv, 1);
+}
+
+// CHECK-LABEL: _Z13setjmpifnoretv:
+int setjmpifnoret() {
+  if (test_setjmp(TestEnv) == 0) { // CHECK: Branch,File 0, [[@LINE]]:{{[0-9]+}} -> [[@LINE]]:{{[0-9]+}} = #1, #2
+    jumpback();
+  } else {                        // CHECK: File 0, [[@LINE]]:10 -> [[@LINE+2]]:4 = #2
+    sink();
+  }
+  return 0;                       // CHECK: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = #2
+}
+
 // CHECK-LABEL: _Z13do_with_breaki:
 int do_with_break(int n) {
   do {
     if (n == 87) {
       break;
-    }               // CHECK: File 0, [[@LINE-2]]:18 -> [[@LINE]]:6 = #2
-  } while (0);      // CHECK: File 0, [[@LINE]]:12 -> [[@LINE]]:13 = ((#0 + #1) - #2)
-  return 0;         // CHECK-NOT: Gap,File 0, [[@LINE-1]]:15
+    }               // CHECK: File 0, [[@LINE-2]]:18 -> [[@LINE]]:6 = #3
+  } while (0);      // CHECK: File 0, [[@LINE]]:12 -> [[@LINE]]:13 = (#1 + #2)
+                    // CHECK: Gap,File 0, [[@LINE-1]]:15 -> [[@LINE+1]]:3 = (#2 + #3)
+  return 0;         // CHECK-NEXT: File 0, [[@LINE]]:3 -> [[@LINE]]:11 = (#2 + #3)
 }
 
 int main() {
@@ -450,6 +470,7 @@ int main() {
   nestedcallnoret();
   infinitewhilenoret();
   infinitefornoret();
+  setjmpifnoret();
   do_with_break(0);
   return 0;
 }

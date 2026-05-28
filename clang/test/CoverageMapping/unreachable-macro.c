@@ -12,6 +12,6 @@ void counters_in_macro_following_unreachable(void) {
   WHILE
 }
 // CHECK-NEXT: File 1, 3:15 -> 3:27 = 0
-// CHECK-NEXT: File 1, 3:22 -> 3:23 = #1
-// CHECK-NEXT: Branch,File 1, 3:22 -> 3:23 = 0, 0
+// CHECK-NEXT: File 1, 3:22 -> 3:23 = (#1 + #2)
+// CHECK-NEXT: Branch,File 1, 3:22 -> 3:23 = 0, #2
 // CHECK-NEXT: File 1, 3:25 -> 3:27 = #1

@@ -177,14 +177,20 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
   uint64_t ProfileVersion;
   /// Diagnostics Engine used to report warnings.
   DiagnosticsEngine &Diag;
+  /// Whether coverage mapping needs explicit skip counters for exits that
+  /// cannot always be reconstructed from structural flow, such as
+  /// returns_twice conditions or loop false edges after abnormal body exits.
+  bool UseExplicitSkipCountersForCoverage;
 
   MapRegionCounters(PGOHashVersion HashVersion, uint64_t ProfileVersion,
                     llvm::DenseMap<const Stmt *, CounterPair> &CounterMap,
                     MCDC::State &MCDCState, unsigned MCDCMaxCond,
-                    DiagnosticsEngine &Diag)
+                    DiagnosticsEngine &Diag,
+                    bool UseExplicitSkipCountersForCoverage)
       : NextCounter(0), Hash(HashVersion), CounterMap(CounterMap),
         MCDCState(MCDCState), MCDCMaxCond(MCDCMaxCond),
-        ProfileVersion(ProfileVersion), Diag(Diag) {}
+        ProfileVersion(ProfileVersion), Diag(Diag),
+        UseExplicitSkipCountersForCoverage(UseExplicitSkipCountersForCoverage) {}
 
   // Blocks and lambdas are handled as separate functions, so we need not
   // traverse them in the parent context.
@@ -219,8 +225,11 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
   /// V1 hash of \p S.
   PGOHash::HashType updateCounterMappings(Stmt *S) {
     auto Type = getHashType(PGO_HASH_V1, S);
-    if (Type != PGOHash::None)
+    if (Type != PGOHash::None) {
+      auto SkipCount = CounterMap[S].Skipped;
       CounterMap[S] = NextCounter++;
+      CounterMap[S].Skipped = SkipCount;
+    }
     return Type;
   }
 
@@ -343,6 +352,51 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
     return Base::VisitBinaryOperator(S);
   }
 
+  void maybeAssignCoverageSkipCounter(Stmt *S) {
+    if (!UseExplicitSkipCountersForCoverage)
+      return;
+
+    auto &Counters = CounterMap[S];
+    if (!Counters.Skipped.hasValue())
+      Counters.Skipped = NextCounter++;
+  }
+
+  void maybeAssignReturnsTwiceSkipCounter(IfStmt *S) {
+    if (UseExplicitSkipCountersForCoverage &&
+        conditionContainsReturnsTwiceCall(S->getCond()))
+      maybeAssignCoverageSkipCounter(S);
+  }
+
+  bool VisitIfStmt(IfStmt *S) {
+    maybeAssignReturnsTwiceSkipCounter(S);
+    return true;
+  }
+
+  bool VisitWhileStmt(WhileStmt *S) {
+    maybeAssignCoverageSkipCounter(S);
+    return true;
+  }
+
+  bool VisitDoStmt(DoStmt *S) {
+    maybeAssignCoverageSkipCounter(S);
+    return true;
+  }
+
+  bool VisitForStmt(ForStmt *S) {
+    maybeAssignCoverageSkipCounter(S);
+    return true;
+  }
+
+  bool VisitCXXForRangeStmt(CXXForRangeStmt *S) {
+    maybeAssignCoverageSkipCounter(S);
+    return true;
+  }
+
+  bool VisitObjCForCollectionStmt(ObjCForCollectionStmt *S) {
+    maybeAssignCoverageSkipCounter(S);
+    return true;
+  }
+
   /// Include \p S in the function hash.
   bool VisitStmt(Stmt *S) {
     auto Type = updateCounterMappings(S);
@@ -360,6 +414,7 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
 
     // Otherwise, keep track of which branch we're in while traversing.
     VisitStmt(If);
+    maybeAssignReturnsTwiceSkipCounter(If);
 
     for (Stmt *CS : If->children()) {
       if (!CS)
@@ -481,6 +536,29 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
 
     return PGOHash::None;
   }
+
+  bool conditionContainsReturnsTwiceCall(const Stmt *S) {
+    struct ReturnsTwiceCallVisitor
+        : RecursiveASTVisitor<ReturnsTwiceCallVisitor> {
+      using Base = RecursiveASTVisitor<ReturnsTwiceCallVisitor>;
+      bool Found = false;
+
+      bool TraverseStmt(Stmt *S) {
+        return !Found && Base::TraverseStmt(S);
+      }
+
+      bool VisitCallExpr(CallExpr *E) {
+        if (const auto *Callee = E->getDirectCallee();
+            Callee && Callee->hasAttr<ReturnsTwiceAttr>())
+          Found = true;
+        return !Found;
+      }
+    };
+
+    ReturnsTwiceCallVisitor Visitor;
+    Visitor.TraverseStmt(const_cast<Stmt *>(S));
+    return Visitor.Found;
+  }
 };
 
 /// A StmtVisitor that propagates the raw counts through the AST and
@@ -522,6 +600,11 @@ struct ComputeRegionCounts : public ConstStmtVisitor<ComputeRegionCounts> {
   uint64_t setCount(uint64_t Count) {
     CurrentCount = Count;
     return Count;
+  }
+
+  uint64_t getSkipCount(const Stmt *S, uint64_t TotalCount,
+                        uint64_t ExecutedCount) {
+    return PGO.getSkipRegionCount(S).value_or(TotalCount - ExecutedCount);
   }
 
   void VisitStmt(const Stmt *S) {
@@ -627,11 +710,12 @@ struct ComputeRegionCounts : public ConstStmtVisitor<ComputeRegionCounts> {
     // the backedge from the end of the loop body, and the edges from
     // continue statements.
     BreakContinue BC = BreakContinueStack.pop_back_val();
-    uint64_t CondCount =
-        setCount(ParentCount + BackedgeCount + BC.ContinueCount);
+    uint64_t DerivedCondCount = ParentCount + BackedgeCount + BC.ContinueCount;
+    uint64_t SkipCount = getSkipCount(S, DerivedCondCount, BodyCount);
+    uint64_t CondCount = setCount(BodyCount + SkipCount);
     CountMap[S->getCond()] = CondCount;
     Visit(S->getCond());
-    setCount(BC.BreakCount + CondCount - BodyCount);
+    setCount(BC.BreakCount + SkipCount);
     RecordNextStmtCount = true;
   }
 
@@ -649,10 +733,12 @@ struct ComputeRegionCounts : public ConstStmtVisitor<ComputeRegionCounts> {
     BreakContinue BC = BreakContinueStack.pop_back_val();
     // The count at the start of the condition is equal to the count at the
     // end of the body, plus any continues.
-    uint64_t CondCount = setCount(BackedgeCount + BC.ContinueCount);
+    uint64_t DerivedCondCount = BackedgeCount + BC.ContinueCount;
+    uint64_t SkipCount = getSkipCount(S, DerivedCondCount, LoopCount);
+    uint64_t CondCount = setCount(LoopCount + SkipCount);
     CountMap[S->getCond()] = CondCount;
     Visit(S->getCond());
-    setCount(BC.BreakCount + CondCount - LoopCount);
+    setCount(BC.BreakCount + SkipCount);
     RecordNextStmtCount = true;
   }
 
@@ -681,13 +767,14 @@ struct ComputeRegionCounts : public ConstStmtVisitor<ComputeRegionCounts> {
     }
 
     // ...then go back and propagate counts through the condition.
-    uint64_t CondCount =
-        setCount(ParentCount + BackedgeCount + BC.ContinueCount);
+    uint64_t DerivedCondCount = ParentCount + BackedgeCount + BC.ContinueCount;
+    uint64_t SkipCount = getSkipCount(S, DerivedCondCount, BodyCount);
+    uint64_t CondCount = setCount(BodyCount + SkipCount);
     if (S->getCond()) {
       CountMap[S->getCond()] = CondCount;
       Visit(S->getCond());
     }
-    setCount(BC.BreakCount + CondCount - BodyCount);
+    setCount(BC.BreakCount + SkipCount);
     RecordNextStmtCount = true;
   }
 
@@ -717,11 +804,12 @@ struct ComputeRegionCounts : public ConstStmtVisitor<ComputeRegionCounts> {
     Visit(S->getInc());
 
     // ...then go back and propagate counts through the condition.
-    uint64_t CondCount =
-        setCount(ParentCount + BackedgeCount + BC.ContinueCount);
+    uint64_t DerivedCondCount = ParentCount + BackedgeCount + BC.ContinueCount;
+    uint64_t SkipCount = getSkipCount(S, DerivedCondCount, BodyCount);
+    uint64_t CondCount = setCount(BodyCount + SkipCount);
     CountMap[S->getCond()] = CondCount;
     Visit(S->getCond());
-    setCount(BC.BreakCount + CondCount - BodyCount);
+    setCount(BC.BreakCount + SkipCount);
     RecordNextStmtCount = true;
   }
 
@@ -737,8 +825,9 @@ struct ComputeRegionCounts : public ConstStmtVisitor<ComputeRegionCounts> {
     uint64_t BackedgeCount = CurrentCount;
     BreakContinue BC = BreakContinueStack.pop_back_val();
 
-    setCount(BC.BreakCount + ParentCount + BackedgeCount + BC.ContinueCount -
-             BodyCount);
+    uint64_t DerivedCondCount = ParentCount + BackedgeCount + BC.ContinueCount;
+    uint64_t SkipCount = getSkipCount(S, DerivedCondCount, BodyCount);
+    setCount(BC.BreakCount + SkipCount);
     RecordNextStmtCount = true;
   }
 
@@ -795,7 +884,8 @@ struct ComputeRegionCounts : public ConstStmtVisitor<ComputeRegionCounts> {
     Visit(S->getThen());
     uint64_t OutCount = CurrentCount;
 
-    uint64_t ElseCount = ParentCount - ThenCount;
+    uint64_t ElseCount =
+        PGO.getSkipRegionCount(S).value_or(ParentCount - ThenCount);
     if (S->getElse()) {
       setCount(ElseCount);
       CountMap[S->getElse()] = ElseCount;
@@ -995,8 +1085,12 @@ void CodeGenPGO::mapRegionCounters(const Decl *D) {
 
   RegionCounterMap.reset(new llvm::DenseMap<const Stmt *, CounterPair>);
   RegionMCDCState.reset(new MCDC::State);
+  bool UseExplicitSkipCountersForCoverage =
+      CGM.getCodeGenOpts().CoverageMapping &&
+      CGM.getCodeGenOpts().hasProfileClangInstr();
   MapRegionCounters Walker(HashVersion, ProfileVersion, *RegionCounterMap,
-                           *RegionMCDCState, MCDCMaxConditions, CGM.getDiags());
+                           *RegionMCDCState, MCDCMaxConditions, CGM.getDiags(),
+                           UseExplicitSkipCountersForCoverage);
   if (const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(D))
     Walker.TraverseDecl(const_cast<FunctionDecl *>(FD));
   else if (const ObjCMethodDecl *MD = dyn_cast_or_null<ObjCMethodDecl>(D))

@@ -20,9 +20,9 @@ void func2(NSArray *array) {   // CHECK-NEXT: File 0, [[@LINE]]:28 -> {{[0-9]+}}
   int i = 0;                   // CHECK-NEXT: Gap,File 0, [[@LINE+1]]:28 -> [[@LINE+1]]:29 = #1
   for (NSArray *x in array) {  // CHECK-NEXT: File 0, [[@LINE]]:29 -> [[@LINE+7]]:4 = #1
                                // CHECK-NEXT: File 0, [[@LINE+1]]:9 -> [[@LINE+1]]:10 = #1
-    if (x) {                   // CHECK: File 0, [[@LINE]]:12 -> [[@LINE+2]]:6 = #2
+    if (x) {                   // CHECK: File 0, [[@LINE]]:12 -> [[@LINE+2]]:6 = #3
       i = 1;
-    } else {                   // CHECK: File 0, [[@LINE]]:12 -> [[@LINE+2]]:6 = (#1 - #2)
+    } else {                   // CHECK: File 0, [[@LINE]]:12 -> [[@LINE+2]]:6 = (#1 - #3)
       i = -1;
     }
   }

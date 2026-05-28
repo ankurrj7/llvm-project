@@ -4,17 +4,18 @@ void bar(void);
 static void static_func(void);
 
                                  // CHECK: main
-int main(void) {                 // CHECK-NEXT: File 0, [[@LINE]]:16 -> [[@LINE+8]]:2 = #0
-                                 // CHECK-NEXT: File 0, [[@LINE+2]]:18 -> [[@LINE+2]]:24 = (#0 + #1)
-                                 // CHECK-NEXT: Branch,File 0, [[@LINE+1]]:18 -> [[@LINE+1]]:24 = #1, #0
-  for(int i = 0; i < 10; ++i) {  // CHECK-NEXT: File 0, [[@LINE]]:26 -> [[@LINE]]:29 = #1
+int main(void) {                 // CHECK-NEXT: File 0, [[@LINE]]:16 -> [[@LINE+9]]:2 = #0
+                                 // CHECK-NEXT: File 0, [[@LINE+3]]:18 -> [[@LINE+3]]:24 = (#1 + #2)
+                                 // CHECK-NEXT: Branch,File 0, [[@LINE+2]]:18 -> [[@LINE+2]]:24 = #1, #2
+                                 // CHECK-NEXT: File 0, [[@LINE+1]]:26 -> [[@LINE+1]]:29 = #1
+  for(int i = 0; i < 10; ++i) {  // CHECK-NEXT: Gap,File 0, [[@LINE]]:30 -> [[@LINE]]:31 = #1
     bar();                       // CHECK: File 0, [[@LINE-1]]:31 -> [[@LINE+1]]:4 = #1
   }
   static_func();
   return 0;
 }
 
-                                 // CHECK-NEXT: foo
+                                 // CHECK: foo
 void foo(void) {                 // CHECK-NEXT: File 0, [[@LINE]]:16 -> [[@LINE+5]]:2 = #0
                                  // CHECK-NEXT: File 0, [[@LINE+1]]:6 -> [[@LINE+1]]:7 = #0
   if(1) {                        // CHECK: File 0, [[@LINE]]:9 -> [[@LINE+2]]:4 = #1

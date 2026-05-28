@@ -71,6 +71,18 @@ public:
     return I->second;
   }
 
+  std::optional<uint64_t> getSkipRegionCount(const Stmt *S) const {
+    if (!RegionCounterMap || !haveRegionCounts())
+      return std::nullopt;
+    auto I = RegionCounterMap->find(S);
+    if (I == RegionCounterMap->end() || !I->second.Skipped.hasValue())
+      return std::nullopt;
+    auto Index = I->second.Skipped;
+    if (Index >= RegionCounts.size())
+      return std::nullopt;
+    return RegionCounts[Index];
+  }
+
   /// If the execution count for the current statement is known, record that
   /// as the current count.
   void setCurrentStmt(const Stmt *S) {

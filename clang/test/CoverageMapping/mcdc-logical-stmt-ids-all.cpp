@@ -34,12 +34,12 @@ bool func_while_and(bool a, bool b, bool c, bool d, bool e, bool f) {
 }
 
 // CHECK-LABEL:  Decision,File 0, 32:10 -> 32:36 = M:7, C:6
-// CHECK-NEXT:  Branch,File 0, 32:10 -> 32:11 = #10, (#0 - #10) [1,6,0]
-// CHECK:  Branch,File 0, 32:15 -> 32:16 = #11, (#10 - #11) [6,5,0]
-// CHECK:  Branch,File 0, 32:20 -> 32:21 = #9, (#8 - #9) [5,4,0]
-// CHECK:  Branch,File 0, 32:25 -> 32:26 = #7, (#6 - #7) [4,3,0]
-// CHECK:  Branch,File 0, 32:30 -> 32:31 = #5, (#4 - #5) [3,2,0]
-// CHECK:  Branch,File 0, 32:35 -> 32:36 = #3, (#2 - #3) [2,0,0]
+// CHECK-NEXT:  Branch,File 0, 32:10 -> 32:11 = #11, ((#1 + #2) - #11) [1,6,0]
+// CHECK:  Branch,File 0, 32:15 -> 32:16 = #12, (#11 - #12) [6,5,0]
+// CHECK:  Branch,File 0, 32:20 -> 32:21 = #10, (#9 - #10) [5,4,0]
+// CHECK:  Branch,File 0, 32:25 -> 32:26 = #8, (#7 - #8) [4,3,0]
+// CHECK:  Branch,File 0, 32:30 -> 32:31 = #6, (#5 - #6) [3,2,0]
+// CHECK:  Branch,File 0, 32:35 -> 32:36 = #4, (#3 - #4) [2,0,0]
 
 bool func_while_or(bool a, bool b, bool c, bool d, bool e, bool f) {
   while (a || b || c || d || e || f) { return true; }
@@ -47,12 +47,12 @@ bool func_while_or(bool a, bool b, bool c, bool d, bool e, bool f) {
 }
 
 // CHECK-LABEL:  Decision,File 0, 45:10 -> 45:36 = M:7, C:6
-// CHECK-NEXT:  Branch,File 0, 45:10 -> 45:11 = (#0 - #10), #10 [1,0,6]
-// CHECK:  Branch,File 0, 45:15 -> 45:16 = (#10 - #11), #11 [6,0,5]
-// CHECK:  Branch,File 0, 45:20 -> 45:21 = (#8 - #9), #9 [5,0,4]
-// CHECK:  Branch,File 0, 45:25 -> 45:26 = (#6 - #7), #7 [4,0,3]
-// CHECK:  Branch,File 0, 45:30 -> 45:31 = (#4 - #5), #5 [3,0,2]
-// CHECK:  Branch,File 0, 45:35 -> 45:36 = (#2 - #3), #3 [2,0,0]
+// CHECK-NEXT:  Branch,File 0, 45:10 -> 45:11 = ((#1 + #2) - #11), #11 [1,0,6]
+// CHECK:  Branch,File 0, 45:15 -> 45:16 = (#11 - #12), #12 [6,0,5]
+// CHECK:  Branch,File 0, 45:20 -> 45:21 = (#9 - #10), #10 [5,0,4]
+// CHECK:  Branch,File 0, 45:25 -> 45:26 = (#7 - #8), #8 [4,0,3]
+// CHECK:  Branch,File 0, 45:30 -> 45:31 = (#5 - #6), #6 [3,0,2]
+// CHECK:  Branch,File 0, 45:35 -> 45:36 = (#3 - #4), #4 [2,0,0]
 
 bool func_for_and(bool a, bool b, bool c, bool d, bool e, bool f) {
   for (;a && b && c && d && e && f;) { return true; }
@@ -60,12 +60,12 @@ bool func_for_and(bool a, bool b, bool c, bool d, bool e, bool f) {
 }
 
 // CHECK-LABEL:  Decision,File 0, 58:9 -> 58:35 = M:7, C:6
-// CHECK-NEXT:  Branch,File 0, 58:9 -> 58:10 = #10, (#0 - #10) [1,6,0]
-// CHECK:  Branch,File 0, 58:14 -> 58:15 = #11, (#10 - #11) [6,5,0]
-// CHECK:  Branch,File 0, 58:19 -> 58:20 = #9, (#8 - #9) [5,4,0]
-// CHECK:  Branch,File 0, 58:24 -> 58:25 = #7, (#6 - #7) [4,3,0]
-// CHECK:  Branch,File 0, 58:29 -> 58:30 = #5, (#4 - #5) [3,2,0]
-// CHECK:  Branch,File 0, 58:34 -> 58:35 = #3, (#2 - #3) [2,0,0]
+// CHECK-NEXT:  Branch,File 0, 58:9 -> 58:10 = #11, ((#1 + #2) - #11) [1,6,0]
+// CHECK:  Branch,File 0, 58:14 -> 58:15 = #12, (#11 - #12) [6,5,0]
+// CHECK:  Branch,File 0, 58:19 -> 58:20 = #10, (#9 - #10) [5,4,0]
+// CHECK:  Branch,File 0, 58:24 -> 58:25 = #8, (#7 - #8) [4,3,0]
+// CHECK:  Branch,File 0, 58:29 -> 58:30 = #6, (#5 - #6) [3,2,0]
+// CHECK:  Branch,File 0, 58:34 -> 58:35 = #4, (#3 - #4) [2,0,0]
 
 bool func_for_or(bool a, bool b, bool c, bool d, bool e, bool f) {
   for (;a || b || c || d || e || f;) { return true; }
@@ -73,12 +73,12 @@ bool func_for_or(bool a, bool b, bool c, bool d, bool e, bool f) {
 }
 
 // CHECK-LABEL:  Decision,File 0, 71:9 -> 71:35 = M:7, C:6
-// CHECK-NEXT:  Branch,File 0, 71:9 -> 71:10 = (#0 - #10), #10 [1,0,6]
-// CHECK:  Branch,File 0, 71:14 -> 71:15 = (#10 - #11), #11 [6,0,5]
-// CHECK:  Branch,File 0, 71:19 -> 71:20 = (#8 - #9), #9 [5,0,4]
-// CHECK:  Branch,File 0, 71:24 -> 71:25 = (#6 - #7), #7 [4,0,3]
-// CHECK:  Branch,File 0, 71:29 -> 71:30 = (#4 - #5), #5 [3,0,2]
-// CHECK:  Branch,File 0, 71:34 -> 71:35 = (#2 - #3), #3 [2,0,0]
+// CHECK-NEXT:  Branch,File 0, 71:9 -> 71:10 = ((#1 + #2) - #11), #11 [1,0,6]
+// CHECK:  Branch,File 0, 71:14 -> 71:15 = (#11 - #12), #12 [6,0,5]
+// CHECK:  Branch,File 0, 71:19 -> 71:20 = (#9 - #10), #10 [5,0,4]
+// CHECK:  Branch,File 0, 71:24 -> 71:25 = (#7 - #8), #8 [4,0,3]
+// CHECK:  Branch,File 0, 71:29 -> 71:30 = (#5 - #6), #6 [3,0,2]
+// CHECK:  Branch,File 0, 71:34 -> 71:35 = (#3 - #4), #4 [2,0,0]
 
 bool func_do_and(bool a, bool b, bool c, bool d, bool e, bool f) {
   do {} while (a && b && c && d && e && f);
@@ -86,12 +86,12 @@ bool func_do_and(bool a, bool b, bool c, bool d, bool e, bool f) {
 }
 
 // CHECK-LABEL:  Decision,File 0, 84:16 -> 84:42 = M:7, C:6
-// CHECK-NEXT:  Branch,File 0, 84:16 -> 84:17 = #10, ((#0 + #1) - #10) [1,6,0]
-// CHECK:  Branch,File 0, 84:21 -> 84:22 = #11, (#10 - #11) [6,5,0]
-// CHECK:  Branch,File 0, 84:26 -> 84:27 = #9, (#8 - #9) [5,4,0]
-// CHECK:  Branch,File 0, 84:31 -> 84:32 = #7, (#6 - #7) [4,3,0]
-// CHECK:  Branch,File 0, 84:36 -> 84:37 = #5, (#4 - #5) [3,2,0]
-// CHECK:  Branch,File 0, 84:41 -> 84:42 = #3, (#2 - #3) [2,0,0]
+// CHECK-NEXT:  Branch,File 0, 84:16 -> 84:17 = #11, ((#1 + #2) - #11) [1,6,0]
+// CHECK:  Branch,File 0, 84:21 -> 84:22 = #12, (#11 - #12) [6,5,0]
+// CHECK:  Branch,File 0, 84:26 -> 84:27 = #10, (#9 - #10) [5,4,0]
+// CHECK:  Branch,File 0, 84:31 -> 84:32 = #8, (#7 - #8) [4,3,0]
+// CHECK:  Branch,File 0, 84:36 -> 84:37 = #6, (#5 - #6) [3,2,0]
+// CHECK:  Branch,File 0, 84:41 -> 84:42 = #4, (#3 - #4) [2,0,0]
 
 bool func_do_or(bool a, bool b, bool c, bool d, bool e, bool f) {
   do {} while (a || b || c || d || e || f);
@@ -99,12 +99,12 @@ bool func_do_or(bool a, bool b, bool c, bool d, bool e, bool f) {
 }
 
 // CHECK-LABEL:  Decision,File 0, 97:16 -> 97:42 = M:7, C:6
-// CHECK-NEXT:  Branch,File 0, 97:16 -> 97:17 = ((#0 + #1) - #10), #10 [1,0,6]
-// CHECK:  Branch,File 0, 97:21 -> 97:22 = (#10 - #11), #11 [6,0,5]
-// CHECK:  Branch,File 0, 97:26 -> 97:27 = (#8 - #9), #9 [5,0,4]
-// CHECK:  Branch,File 0, 97:31 -> 97:32 = (#6 - #7), #7 [4,0,3]
-// CHECK:  Branch,File 0, 97:36 -> 97:37 = (#4 - #5), #5 [3,0,2]
-// CHECK:  Branch,File 0, 97:41 -> 97:42 = (#2 - #3), #3 [2,0,0]
+// CHECK-NEXT:  Branch,File 0, 97:16 -> 97:17 = ((#1 + #2) - #11), #11 [1,0,6]
+// CHECK:  Branch,File 0, 97:21 -> 97:22 = (#11 - #12), #12 [6,0,5]
+// CHECK:  Branch,File 0, 97:26 -> 97:27 = (#9 - #10), #10 [5,0,4]
+// CHECK:  Branch,File 0, 97:31 -> 97:32 = (#7 - #8), #8 [4,0,3]
+// CHECK:  Branch,File 0, 97:36 -> 97:37 = (#5 - #6), #6 [3,0,2]
+// CHECK:  Branch,File 0, 97:41 -> 97:42 = (#3 - #4), #4 [2,0,0]
 
 bool func_ternary_and(bool a, bool b, bool c, bool d, bool e, bool f) {
   return (a && b && c && d && e && f) ? true : false;

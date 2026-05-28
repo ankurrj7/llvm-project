@@ -40,14 +40,14 @@ void func3(void) { // CHECK-NEXT: File 0, [[@LINE]]:18 -> [[@LINE+3]]:2 = #0
 // CHECK-NEXT: func4
 void func4(void) { // CHECK-NEXT: File 0, [[@LINE]]:18 -> [[@LINE+8]]:2 = #0
   int i = 0;
-  while (i++ < 10) // CHECK-NEXT: File 0, [[@LINE]]:10 -> [[@LINE]]:18 = (#0 + #1)
+  while (i++ < 10) // CHECK-NEXT: File 0, [[@LINE]]:10 -> [[@LINE]]:18 = (#1 + #2)
     if (i < 5) // CHECK: File 0, [[@LINE]]:5 -> [[@LINE+4]]:14 = #1
                // CHECK-NEXT: File 0, [[@LINE-1]]:9 -> [[@LINE-1]]:14 = #1
-               // CHECK-NEXT: Branch,File 0, [[@LINE-2]]:9 -> [[@LINE-2]]:14 = #2, (#1 - #2)
-               // CHECK-NEXT: Gap,File 0, [[@LINE-3]]:15 -> [[@LINE+1]]:7 = #2
-      MACRO_2; // CHECK-NEXT: Expansion,File 0, [[@LINE]]:7 -> [[@LINE]]:14 = #2
+               // CHECK-NEXT: Branch,File 0, [[@LINE-2]]:9 -> [[@LINE-2]]:14 = #3, (#1 - #3)
+               // CHECK-NEXT: Gap,File 0, [[@LINE-3]]:15 -> [[@LINE+1]]:7 = #3
+      MACRO_2; // CHECK-NEXT: Expansion,File 0, [[@LINE]]:7 -> [[@LINE]]:14 = #3
 }
-// CHECK-NEXT: File 1, 4:17 -> 4:22 = #2
+// CHECK-NEXT: File 1, 4:17 -> 4:22 = #3
 // CHECK-NOT: File 1
 
 // CHECK-NEXT: func5
