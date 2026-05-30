@@ -536,8 +536,9 @@ static void addPGOAndCoverageFlags(const ToolChain &TC, Compilation &C,
                       Args.hasArg(options::OPT_coverage);
   bool EmitCovData = TC.needsGCovInstrumentation(Args);
 
-  if (Args.hasFlag(options::OPT_fcoverage_mapping,
-                   options::OPT_fno_coverage_mapping, false)) {
+  bool CoverageMappingEnabled = Args.hasFlag(
+      options::OPT_fcoverage_mapping, options::OPT_fno_coverage_mapping, false);
+  if (CoverageMappingEnabled) {
     if (!ProfileGenerateArg)
       D.Diag(clang::diag::err_drv_argument_only_allowed_with)
           << "-fcoverage-mapping"
@@ -546,10 +547,19 @@ static void addPGOAndCoverageFlags(const ToolChain &TC, Compilation &C,
     CmdArgs.push_back("-fcoverage-mapping");
   }
 
+  if (Args.hasFlag(options::OPT_fcoverage_call_continuations,
+                   options::OPT_fno_coverage_call_continuations, false)) {
+    if (!CoverageMappingEnabled)
+      D.Diag(clang::diag::err_drv_argument_only_allowed_with)
+          << "-fcoverage-call-continuations"
+          << "-fcoverage-mapping";
+
+    CmdArgs.push_back("-fcoverage-call-continuations");
+  }
+
   if (Args.hasFlag(options::OPT_fmcdc_coverage, options::OPT_fno_mcdc_coverage,
                    false)) {
-    if (!Args.hasFlag(options::OPT_fcoverage_mapping,
-                      options::OPT_fno_coverage_mapping, false))
+    if (!CoverageMappingEnabled)
       D.Diag(clang::diag::err_drv_argument_only_allowed_with)
           << "-fcoverage-mcdc"
           << "-fcoverage-mapping";
@@ -9203,7 +9213,6 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
       OPT_flto_partitions_EQ,
       OPT_flto_EQ,
       OPT_use_spirv_backend};
-
   const llvm::DenseSet<unsigned> LinkerOptions{OPT_mllvm, OPT_Zlinker_input};
   auto ShouldForwardForToolChain = [&](Arg *A, const ToolChain &TC) {
     // Don't forward -mllvm to toolchains that don't support LLVM.
