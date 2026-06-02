@@ -6247,7 +6247,8 @@ RValue CodeGenFunction::EmitCallExpr(const CallExpr *E,
   };
 
   RValue RV = EmitTheCall();
-  incrementCallContinuationProfileCounter(E);
+  if (E != MustTailCall)
+    incrementCallContinuationProfileCounter(E);
   return RV;
 }
 
