@@ -1691,8 +1691,11 @@ struct CounterCoverageMappingBuilder
       for (auto *Initializer : Ctor->inits()) {
         if (Initializer->isWritten()) {
           auto *Init = Initializer->getInit();
+          // Written initializers run before the constructor body. Seed the
+          // body with the initializer's exit count so a non-returning call in
+          // the initializer does not make the body look covered.
           if (getStart(Init).isValid() && getEnd(Init).isValid())
-            propagateCounts(BodyCounter, Init);
+            BodyCounter = propagateCounts(BodyCounter, Init);
         }
       }
     }
@@ -1771,6 +1774,13 @@ struct CounterCoverageMappingBuilder
       terminateRegion(E);
     else if (std::optional<Counter> ContinuationCounter =
                  getCallContinuationCounter(E))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitCXXConstructExpr(const CXXConstructExpr *E) {
+    VisitStmt(E);
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(E))
       startCallContinuationRegion(E, *ContinuationCounter);
   }
 
@@ -1908,13 +1918,15 @@ struct CounterCoverageMappingBuilder
     // The increment is essentially part of the body but it needs to include
     // the count for all the continue statements.
     BreakContinue IncrementBC;
+    Counter IncrementCount = addCounters(BackedgeCount, BodyBC.ContinueCount);
+    Counter IncrementExitCount = IncrementCount;
     if (const Stmt *Inc = S->getInc()) {
-      Counter IncCount;
       if (llvm::EnableSingleByteCoverage)
-        IncCount = getRegionCounter(S->getInc());
-      else
-        IncCount = addCounters(BackedgeCount, BodyBC.ContinueCount);
-      propagateCounts(IncCount, Inc);
+        IncrementCount = getRegionCounter(Inc);
+      // for (...; ...; f()) only reaches the next condition evaluation if the
+      // increment returns normally. Use the propagated exit count here instead
+      // of feeding the pre-increment count straight back to the condition.
+      IncrementExitCount = propagateCounts(IncrementCount, Inc);
       IncrementBC = BreakContinueStack.pop_back_val();
     }
 
@@ -1922,9 +1934,8 @@ struct CounterCoverageMappingBuilder
     Counter CondCount =
         llvm::EnableSingleByteCoverage
             ? getRegionCounter(S->getCond())
-            : addCounters(
-                  addCounters(ParentCount, BackedgeCount, BodyBC.ContinueCount),
-                  IncrementBC.ContinueCount);
+            : addCounters(addCounters(ParentCount, IncrementExitCount),
+                          IncrementBC.ContinueCount);
 
     Counter CondExitCount = CondCount;
     if (const Expr *Cond = S->getCond()) {
