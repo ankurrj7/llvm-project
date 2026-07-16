@@ -108,6 +108,56 @@ struct CoverageMappingReaderMock : CoverageMappingReader {
   }
 };
 
+struct FilteringCoverageMappingReaderMock : CoverageMappingReaderMock {
+  unsigned InspectedRecords = 0;
+  unsigned DecodedRecords = 0;
+
+  using CoverageMappingReaderMock::CoverageMappingReaderMock;
+  using CoverageMappingReaderMock::readNextRecord;
+
+  Error readNextRecord(
+      CoverageMappingRecord &Record,
+      function_ref<Expected<bool>(StringRef, uint64_t)> ShouldRead) override {
+    while (!Functions.empty()) {
+      const OutputFunctionCoverageData &Function = Functions.front();
+      Functions = Functions.slice(1);
+      ++InspectedRecords;
+      Expected<bool> Read = ShouldRead(Function.Name, Function.Hash);
+      if (!Read)
+        return Read.takeError();
+      if (!*Read)
+        continue;
+      ++DecodedRecords;
+      Function.fillCoverageMappingRecord(Record);
+      return Error::success();
+    }
+    return make_error<CoverageMapError>(coveragemap_error::eof);
+  }
+};
+
+struct RecordingFunctionConsumer : CoverageMappingFunctionRecordConsumer {
+  std::vector<std::string> RawNames;
+  std::vector<uint64_t> Hashes;
+  std::vector<FunctionRecord> Functions;
+
+  Error consume(StringRef RawFunctionName, uint64_t FunctionHash,
+                FunctionRecord &&Function) override {
+    RawNames.push_back(RawFunctionName.str());
+    Hashes.push_back(FunctionHash);
+    Functions.push_back(std::move(Function));
+    return Error::success();
+  }
+};
+
+struct CountingFunctionConsumer : CoverageMappingFunctionRecordConsumer {
+  unsigned Count = 0;
+
+  Error consume(StringRef, uint64_t, FunctionRecord &&) override {
+    ++Count;
+    return Error::success();
+  }
+};
+
 struct InputFunctionCoverageData {
   // Maps the global file index from CoverageMappingTest.Files
   // to the index of that file within this function. We can't just use
@@ -1114,6 +1164,157 @@ TEST(CoverageMappingTest, filename_compilation_dir) {
       ASSERT_EQ(ReadFilenames[I], P);
     }
   }
+}
+
+TEST(CoverageMappingTest, CounterExpressionDAGIsEvaluatedOnce) {
+  std::vector<CounterExpression> Expressions;
+  Expressions.emplace_back(CounterExpression::Subtract, Counter::getCounter(0),
+                           Counter::getCounter(0));
+  for (unsigned I = 1; I != 64; ++I)
+    Expressions.emplace_back(CounterExpression::Add,
+                             Counter::getExpression(I - 1),
+                             Counter::getExpression(I - 1));
+
+  const uint64_t Counts[] = {1};
+  CounterMappingContext Ctx(Expressions, Counts);
+  EXPECT_THAT_EXPECTED(Ctx.evaluate(Counter::getExpression(63)), HasValue(0));
+  // Exercise both persistent caches. Without DAG memoization, each of these
+  // operations expands to 2^63 visits.
+  EXPECT_THAT_EXPECTED(Ctx.evaluate(Counter::getExpression(63)), HasValue(0));
+  EXPECT_EQ(Ctx.getMaxCounterID(Counter::getExpression(63)), 0u);
+}
+
+TEST(CoverageMappingTest, CounterExpressionCacheIsInvalidatedByNewCounts) {
+  const CounterExpression Expressions[] = {
+      {CounterExpression::Add, Counter::getCounter(0), Counter::getCounter(1)}};
+  const uint64_t InitialCounts[] = {1, 2};
+  CounterMappingContext Ctx(Expressions, InitialCounts);
+  EXPECT_THAT_EXPECTED(Ctx.evaluate(Counter::getExpression(0)), HasValue(3));
+
+  const uint64_t UpdatedCounts[] = {10, 20};
+  Ctx.setCounts(UpdatedCounts);
+  EXPECT_THAT_EXPECTED(Ctx.evaluate(Counter::getExpression(0)), HasValue(30));
+}
+
+TEST(CoverageMappingTest, CyclicCounterExpressionsAreRejected) {
+  const CounterExpression Expressions[] = {
+      {CounterExpression::Add, Counter::getExpression(1), Counter::getZero()},
+      {CounterExpression::Add, Counter::getExpression(0), Counter::getZero()}};
+  CounterMappingContext Ctx(Expressions);
+  EXPECT_THAT_EXPECTED(Ctx.evaluate(Counter::getExpression(0)), Failed());
+  EXPECT_EQ(Ctx.getMaxCounterID(Counter::getExpression(0)), 0u);
+}
+
+TEST(CoverageMappingTest, ExecutedFunctionsAreFilteredBeforeDecode) {
+  std::vector<OutputFunctionCoverageData> Functions;
+  Functions.reserve(6);
+  auto AddFunction = [&](StringRef Name, uint64_t Hash) {
+    OutputFunctionCoverageData &Function = Functions.emplace_back();
+    Function.Name = Name;
+    Function.Hash = Hash;
+    Function.FilenamesStorage.push_back("source.c");
+    Function.Filenames.push_back(Function.FilenamesStorage.front());
+    Function.Regions.push_back(CounterMappingRegion::makeRegion(
+        Counter::getCounter(0), 0, 1, 1, 1, 2));
+  };
+  AddFunction("hit", 1);
+  AddFunction("bitmap", 5);
+  AddFunction("zero", 2);
+  AddFunction("mismatch", 3);
+  AddFunction("missing", 4);
+  AddFunction("hit", 1);
+  Functions.front().Regions.push_back(CounterMappingRegion::makeBranchRegion(
+      Counter::getCounter(0), Counter::getZero(), 0, 1, 1, 1, 2));
+
+  InstrProfWriter Writer;
+  Writer.addRecord({"hit", 1, {7}}, Err);
+  Writer.addRecord({"bitmap", 5, {0}, {1}}, Err);
+  Writer.addRecord({"zero", 2, {0}}, Err);
+  Writer.addRecord({"mismatch", 99, {5}}, Err);
+  auto ReaderOrErr = IndexedInstrProfReader::create(Writer.writeBuffer());
+  ASSERT_THAT_EXPECTED(ReaderOrErr, Succeeded());
+  std::unique_ptr<IndexedInstrProfReader> ProfileReader =
+      std::move(*ReaderOrErr);
+  auto ProfileReaderRef = std::make_optional(
+      std::reference_wrapper<IndexedInstrProfReader>(*ProfileReader));
+
+  auto MappingReader =
+      std::make_unique<FilteringCoverageMappingReaderMock>(Functions);
+  FilteringCoverageMappingReaderMock *MappingReaderPtr = MappingReader.get();
+  std::vector<std::unique_ptr<CoverageMappingReader>> MappingReaders;
+  MappingReaders.push_back(std::move(MappingReader));
+
+  RecordingFunctionConsumer Consumer;
+  CoverageMappingLoadOptions Options;
+  Options.LoadExecutedFunctionsOnly = true;
+  Options.KeepFunctionRecords = false;
+  Options.LoadBranchAndMCDCRecords = false;
+  Options.FunctionRecordConsumer = &Consumer;
+  auto CoverageOrErr =
+      CoverageMapping::load(MappingReaders, ProfileReaderRef, Options);
+  ASSERT_THAT_EXPECTED(CoverageOrErr, Succeeded());
+  std::unique_ptr<CoverageMapping> Coverage = std::move(*CoverageOrErr);
+
+  EXPECT_EQ(MappingReaderPtr->InspectedRecords, 6u);
+  // The duplicate hit record is rejected from metadata, before raw mapping
+  // decode, just like the zero, mismatched, and missing profile records.
+  EXPECT_EQ(MappingReaderPtr->DecodedRecords, 2u);
+  ASSERT_EQ(Consumer.Functions.size(), 2u);
+  EXPECT_EQ(Consumer.RawNames.front(), "hit");
+  EXPECT_EQ(Consumer.Hashes.front(), 1u);
+  EXPECT_EQ(Consumer.Functions.front().ExecutionCount, 7u);
+  EXPECT_TRUE(Consumer.Functions.front().CountedBranchRegions.empty());
+  EXPECT_EQ(Coverage->getMismatchedCount(), 1u);
+  EXPECT_TRUE(Coverage->getCoveredFunctions().empty());
+}
+
+TEST(CoverageMappingTest, SparseStreamingDoesNotRetainDecodedFunctions) {
+  constexpr unsigned NumFunctions = 4096;
+  constexpr unsigned HitFunction = NumFunctions / 2;
+  std::vector<std::string> Names;
+  std::vector<OutputFunctionCoverageData> Functions;
+  Names.reserve(NumFunctions);
+  Functions.reserve(NumFunctions);
+
+  InstrProfWriter Writer;
+  for (unsigned I = 0; I != NumFunctions; ++I) {
+    Names.push_back((Twine("function_") + Twine(I)).str());
+    OutputFunctionCoverageData &Function = Functions.emplace_back();
+    Function.Name = Names.back();
+    Function.Hash = I + 1;
+    Function.FilenamesStorage.push_back("source.c");
+    Function.Filenames.push_back(Function.FilenamesStorage.front());
+    Function.Regions.push_back(CounterMappingRegion::makeRegion(
+        Counter::getCounter(0), 0, 1, 1, 1, 2));
+    Writer.addRecord(
+        {Function.Name, Function.Hash, {I == HitFunction ? 1u : 0u}}, Err);
+  }
+
+  auto ProfileOrErr = IndexedInstrProfReader::create(Writer.writeBuffer());
+  ASSERT_THAT_EXPECTED(ProfileOrErr, Succeeded());
+  std::unique_ptr<IndexedInstrProfReader> Profile = std::move(*ProfileOrErr);
+  auto ProfileRef = std::make_optional(
+      std::reference_wrapper<IndexedInstrProfReader>(*Profile));
+
+  auto MappingReader =
+      std::make_unique<FilteringCoverageMappingReaderMock>(Functions);
+  FilteringCoverageMappingReaderMock *MappingReaderPtr = MappingReader.get();
+  std::vector<std::unique_ptr<CoverageMappingReader>> MappingReaders;
+  MappingReaders.push_back(std::move(MappingReader));
+
+  CountingFunctionConsumer Consumer;
+  CoverageMappingLoadOptions Options;
+  Options.LoadExecutedFunctionsOnly = true;
+  Options.KeepFunctionRecords = false;
+  Options.FunctionRecordConsumer = &Consumer;
+  auto CoverageOrErr =
+      CoverageMapping::load(MappingReaders, ProfileRef, Options);
+  ASSERT_THAT_EXPECTED(CoverageOrErr, Succeeded());
+
+  EXPECT_EQ(MappingReaderPtr->InspectedRecords, NumFunctions);
+  EXPECT_EQ(MappingReaderPtr->DecodedRecords, 1u);
+  EXPECT_EQ(Consumer.Count, 1u);
+  EXPECT_TRUE((*CoverageOrErr)->getCoveredFunctions().empty());
 }
 
 TEST(CoverageMappingTest, TVIdxBuilder) {

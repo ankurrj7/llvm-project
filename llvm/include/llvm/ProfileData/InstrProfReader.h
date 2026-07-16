@@ -778,6 +778,11 @@ private:
   const unsigned char *readSummary(IndexedInstrProf::ProfVersion Version,
                                    const unsigned char *Cur, bool UseCS);
 
+  Expected<const NamedInstrProfRecord *>
+  getInstrProfRecordRef(StringRef FuncName, uint64_t FuncHash,
+                        StringRef DeprecatedFuncName,
+                        uint64_t *MismatchedFuncSum);
+
 public:
   IndexedInstrProfReader(
       std::unique_ptr<MemoryBuffer> DataBuffer,
@@ -858,6 +863,12 @@ public:
   /// Fill Counts with the profile data for the given function name.
   Error getFunctionCounts(StringRef FuncName, uint64_t FuncHash,
                           std::vector<uint64_t> &Counts);
+
+  /// Fill Counts and BitmapBytes without copying value-profile data from the
+  /// indexed record.
+  Error getFunctionCountsAndBitmapBytes(StringRef FuncName, uint64_t FuncHash,
+                                        std::vector<uint64_t> &Counts,
+                                        std::vector<uint8_t> &BitmapBytes);
 
   /// Fill Bitmap with the profile data for the given function name.
   Error getFunctionBitmap(StringRef FuncName, uint64_t FuncHash,

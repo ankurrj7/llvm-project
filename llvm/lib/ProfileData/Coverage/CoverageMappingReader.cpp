@@ -62,6 +62,20 @@ void CoverageMappingIterator::increment() {
     });
 }
 
+Error CoverageMappingReader::readNextRecord(
+    CoverageMappingRecord &Record,
+    function_ref<Expected<bool>(StringRef, uint64_t)> ShouldRead) {
+  for (;;) {
+    if (Error E = readNextRecord(Record))
+      return E;
+    Expected<bool> Read = ShouldRead(Record.FunctionName, Record.FunctionHash);
+    if (!Read)
+      return Read.takeError();
+    if (*Read)
+      return Error::success();
+  }
+}
+
 Error RawCoverageReader::readULEB128(uint64_t &Result) {
   if (Data.empty())
     return make_error<CoverageMapError>(coveragemap_error::truncated);
@@ -870,8 +884,7 @@ static Error readCoverageMappingData(
   using namespace coverage;
 
   // Read the records in the coverage data section.
-  auto CovHeader =
-      reinterpret_cast<const CovMapHeader *>(CovMap.data());
+  auto CovHeader = reinterpret_cast<const CovMapHeader *>(CovMap.data());
   CovMapVersion Version = (CovMapVersion)CovHeader->getVersion<Endian>();
   if (Version > CovMapVersion::CurrentVersion)
     return make_error<CoverageMapError>(coveragemap_error::unsupported_version);
@@ -1365,26 +1378,38 @@ BinaryCoverageReader::create(
   return std::move(Readers);
 }
 
+Error BinaryCoverageReader::readNextRecord(
+    CoverageMappingRecord &Record,
+    function_ref<Expected<bool>(StringRef, uint64_t)> ShouldRead) {
+  while (CurrentRecord < MappingRecords.size()) {
+    auto &R = MappingRecords[CurrentRecord++];
+    Expected<bool> Read = ShouldRead(R.FunctionName, R.FunctionHash);
+    if (!Read)
+      return Read.takeError();
+    if (!*Read)
+      continue;
+
+    FunctionsFilenames.clear();
+    Expressions.clear();
+    MappingRegions.clear();
+    auto F = ArrayRef(Filenames).slice(R.FilenamesBegin, R.FilenamesSize);
+    RawCoverageMappingReader Reader(R.CoverageMapping, F, FunctionsFilenames,
+                                    Expressions, MappingRegions);
+    if (auto Err = Reader.read())
+      return Err;
+
+    Record.FunctionName = R.FunctionName;
+    Record.FunctionHash = R.FunctionHash;
+    Record.Filenames = FunctionsFilenames;
+    Record.Expressions = Expressions;
+    Record.MappingRegions = MappingRegions;
+    return Error::success();
+  }
+
+  return make_error<CoverageMapError>(coveragemap_error::eof);
+}
+
 Error BinaryCoverageReader::readNextRecord(CoverageMappingRecord &Record) {
-  if (CurrentRecord >= MappingRecords.size())
-    return make_error<CoverageMapError>(coveragemap_error::eof);
-
-  FunctionsFilenames.clear();
-  Expressions.clear();
-  MappingRegions.clear();
-  auto &R = MappingRecords[CurrentRecord];
-  auto F = ArrayRef(Filenames).slice(R.FilenamesBegin, R.FilenamesSize);
-  RawCoverageMappingReader Reader(R.CoverageMapping, F, FunctionsFilenames,
-                                  Expressions, MappingRegions);
-  if (auto Err = Reader.read())
-    return Err;
-
-  Record.FunctionName = R.FunctionName;
-  Record.FunctionHash = R.FunctionHash;
-  Record.Filenames = FunctionsFilenames;
-  Record.Expressions = Expressions;
-  Record.MappingRegions = MappingRegions;
-
-  ++CurrentRecord;
-  return Error::success();
+  return readNextRecord(
+      Record, [](StringRef, uint64_t) -> Expected<bool> { return true; });
 }
