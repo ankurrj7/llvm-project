@@ -104,6 +104,8 @@ CoveragePrinter::create(const CoverageViewOptions &Opts) {
     // Unreachable because CodeCoverage.cpp should terminate with an error
     // before we get here.
     llvm_unreachable("Lcov format is not supported!");
+  case CoverageViewOptions::OutputFormat::CoveredFunctions:
+    llvm_unreachable("Covered-functions format is not supported!");
   }
   llvm_unreachable("Unknown coverage output format!");
 }
@@ -174,6 +176,8 @@ SourceCoverageView::create(StringRef SourceName, const MemoryBuffer &File,
     // Unreachable because CodeCoverage.cpp should terminate with an error
     // before we get here.
     llvm_unreachable("Lcov format is not supported!");
+  case CoverageViewOptions::OutputFormat::CoveredFunctions:
+    llvm_unreachable("Covered-functions format is not supported!");
   }
   llvm_unreachable("Unknown coverage output format!");
 }

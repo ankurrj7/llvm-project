@@ -15,6 +15,7 @@
 #define LLVM_PROFILEDATA_COVERAGE_COVERAGEMAPPINGREADER_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ProfileData/Coverage/CoverageMapping.h"
 #include "llvm/ProfileData/InstrProf.h"
@@ -102,6 +103,13 @@ public:
   virtual ~CoverageMappingReader() = default;
 
   virtual Error readNextRecord(CoverageMappingRecord &Record) = 0;
+  /// Read the next record accepted by \p ShouldRead.
+  ///
+  /// Readers which can inspect function metadata without decoding the raw
+  /// mapping should override this method so rejected records remain encoded.
+  virtual Error
+  readNextRecord(CoverageMappingRecord &Record,
+                 function_ref<Expected<bool>(StringRef, uint64_t)> ShouldRead);
   CoverageMappingIterator begin() { return CoverageMappingIterator(this); }
   CoverageMappingIterator end() { return CoverageMappingIterator(); }
 };
@@ -226,6 +234,9 @@ public:
       llvm::endianness Endian, StringRef CompilationDir = "");
 
   Error readNextRecord(CoverageMappingRecord &Record) override;
+  Error readNextRecord(
+      CoverageMappingRecord &Record,
+      function_ref<Expected<bool>(StringRef, uint64_t)> ShouldRead) override;
 };
 
 /// Reader for the raw coverage filenames.

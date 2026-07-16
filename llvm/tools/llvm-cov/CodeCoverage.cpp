@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "CoverageExporterCoveredFunctions.h"
 #include "CoverageExporterJson.h"
 #include "CoverageExporterLcov.h"
 #include "CoverageFilters.h"
@@ -701,7 +702,10 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
                  clEnumValN(CoverageViewOptions::OutputFormat::HTML, "html",
                             "HTML output"),
                  clEnumValN(CoverageViewOptions::OutputFormat::Lcov, "lcov",
-                            "lcov tracefile output")),
+                            "lcov tracefile output"),
+                 clEnumValN(CoverageViewOptions::OutputFormat::CoveredFunctions,
+                            "covered-functions",
+                            "Covered functions and regions output")),
       cl::init(CoverageViewOptions::OutputFormat::Text));
 
   cl::list<std::string> PathRemaps(
@@ -804,6 +808,33 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
   auto commandLineParser = [&, this](int argc, const char **argv) -> int {
     cl::ParseCommandLineOptions(argc, argv, "LLVM code coverage tool\n");
     ViewOpts.Debug = DebugDump;
+    // Initialize `Format` and `Colors` before any call to `error()` or
+    // `warning()`, which use `ViewOpts.colored_ostream()` and would read
+    // uninitialized `Colors`.
+    ViewOpts.Format = Format;
+    switch (ViewOpts.Format) {
+    case CoverageViewOptions::OutputFormat::Text:
+      ViewOpts.Colors = UseColor == cl::boolOrDefault::BOU_UNSET
+                            ? sys::Process::StandardOutHasColors()
+                            : UseColor == cl::boolOrDefault::BOU_TRUE;
+      break;
+    case CoverageViewOptions::OutputFormat::HTML:
+      if (UseColor == cl::boolOrDefault::BOU_FALSE)
+        errs() << "Color output cannot be disabled when generating html.\n";
+      ViewOpts.Colors = true;
+      break;
+    case CoverageViewOptions::OutputFormat::Lcov:
+      if (UseColor == cl::boolOrDefault::BOU_TRUE)
+        errs() << "Color output cannot be enabled when generating lcov.\n";
+      ViewOpts.Colors = false;
+      break;
+    case CoverageViewOptions::OutputFormat::CoveredFunctions:
+      if (UseColor == cl::boolOrDefault::BOU_TRUE)
+        errs() << "Color output cannot be enabled when generating covered "
+                  "functions.\n";
+      ViewOpts.Colors = false;
+      break;
+    }
     if (Debuginfod) {
       HTTPClient::initialize();
       BIDFetcher = std::make_unique<DebuginfodFetcher>(DebugFileDirectory);
@@ -834,25 +865,6 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
       for (StringRef OF : ObjectFilenames)
         outs() << OF << '\n';
       ::exit(0);
-    }
-
-    ViewOpts.Format = Format;
-    switch (ViewOpts.Format) {
-    case CoverageViewOptions::OutputFormat::Text:
-      ViewOpts.Colors = UseColor == cl::BOU_UNSET
-                            ? sys::Process::StandardOutHasColors()
-                            : UseColor == cl::BOU_TRUE;
-      break;
-    case CoverageViewOptions::OutputFormat::HTML:
-      if (UseColor == cl::BOU_FALSE)
-        errs() << "Color output cannot be disabled when generating html.\n";
-      ViewOpts.Colors = true;
-      break;
-    case CoverageViewOptions::OutputFormat::Lcov:
-      if (UseColor == cl::BOU_TRUE)
-        errs() << "Color output cannot be enabled when generating lcov.\n";
-      ViewOpts.Colors = false;
-      break;
     }
 
     if (!PathRemaps.empty()) {
@@ -1062,8 +1074,10 @@ int CodeCoverageTool::doShow(int argc, const char **argv,
   if (Err)
     return Err;
 
-  if (ViewOpts.Format == CoverageViewOptions::OutputFormat::Lcov) {
-    error("lcov format should be used with 'llvm-cov export'.");
+  if (ViewOpts.Format == CoverageViewOptions::OutputFormat::Lcov ||
+      ViewOpts.Format == CoverageViewOptions::OutputFormat::CoveredFunctions) {
+    error("lcov and covered-functions formats should be used with "
+          "'llvm-cov export'.");
     return 1;
   }
 
@@ -1254,6 +1268,10 @@ int CodeCoverageTool::doReport(int argc, const char **argv,
   } else if (ViewOpts.Format == CoverageViewOptions::OutputFormat::Lcov) {
     error("lcov format should be used with 'llvm-cov export'.");
     return 1;
+  } else if (ViewOpts.Format ==
+             CoverageViewOptions::OutputFormat::CoveredFunctions) {
+    error("covered-functions format should be used with 'llvm-cov export'.");
+    return 1;
   }
 
   if (PGOFilename) {
@@ -1307,6 +1325,17 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
                                     cl::desc("Unify function instantiations"),
                                     cl::init(true), cl::cat(ExportCategory));
 
+  cl::opt<bool> ShowMCDCNonExecutedVectors(
+      "show-mcdc-non-executed-vectors", cl::Optional,
+      cl::desc("Include MC/DC test vectors that were not executed in the "
+               "export"),
+      cl::cat(ExportCategory));
+
+  cl::opt<bool> CoverageOnly(
+      "coverage-only", cl::Optional,
+      cl::desc("Export only functions with executed coverage data"),
+      cl::cat(ExportCategory));
+
   auto Err = commandLineParser(argc, argv);
   if (Err)
     return Err;
@@ -1316,10 +1345,18 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
   ViewOpts.SkipBranches = SkipBranches;
   ViewOpts.UnifyFunctionInstantiations = UnifyInstantiations;
 
+  bool IsCoveredFunctions =
+      ViewOpts.Format == CoverageViewOptions::OutputFormat::CoveredFunctions;
+  if (CoverageOnly != IsCoveredFunctions) {
+    error("--coverage-only must be used with --format=covered-functions");
+    return 1;
+  }
+
   if (ViewOpts.Format != CoverageViewOptions::OutputFormat::Text &&
-      ViewOpts.Format != CoverageViewOptions::OutputFormat::Lcov) {
-    error("coverage data can only be exported as textual JSON or an "
-          "lcov tracefile.");
+      ViewOpts.Format != CoverageViewOptions::OutputFormat::Lcov &&
+      !IsCoveredFunctions) {
+    error("coverage data can only be exported as textual JSON, an lcov "
+          "tracefile, or covered-functions text.");
     return 1;
   }
 
@@ -1329,6 +1366,56 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
       error("could not read profile data!" + EC.message(), PGOFilename.value());
       return 1;
     }
+  }
+
+  if (CoverageOnly) {
+    if (!PGOFilename) {
+      error("--coverage-only requires --instr-profile");
+      return 1;
+    }
+    if (!SourceFiles.empty() || !Filters.empty() || ViewOpts.hasDemangler() ||
+        ViewOpts.ExportSummaryOnly || SkipExpansions || SkipFunctions ||
+        SkipBranches || ShowMCDCNonExecutedVectors) {
+      error("--coverage-only does not support source, function, summary, "
+            "demangler, or skip filters");
+      return 1;
+    }
+
+    ArrayRef<std::pair<std::string, std::string>> Remappings;
+    if (PathRemappings)
+      Remappings = *PathRemappings;
+    CoverageExporterCoveredFunctions Exporter(outs(), Remappings,
+                                              FilenameFilters);
+    CoverageMappingLoadOptions LoadOptions;
+    LoadOptions.LoadExecutedFunctionsOnly = true;
+    LoadOptions.KeepFunctionRecords = false;
+    LoadOptions.LoadBranchAndMCDCRecords = false;
+    LoadOptions.FunctionRecordConsumer = &Exporter;
+
+    auto FS = vfs::getRealFileSystem();
+    auto CoverageOrErr =
+        CoverageMapping::load(ObjectFilenames, PGOFilename, *FS, CoverageArches,
+                              ViewOpts.CompilationDirectory, BIDFetcher.get(),
+                              CheckBinaryIDs, LoadOptions);
+    if (Error E = CoverageOrErr.takeError()) {
+      error("failed to load coverage: " + toString(std::move(E)));
+      return 1;
+    }
+    std::unique_ptr<CoverageMapping> Coverage = std::move(*CoverageOrErr);
+    unsigned Mismatched = Coverage->getMismatchedCount();
+    if (Mismatched) {
+      warning(Twine(Mismatched) + " functions have mismatched data");
+      if (ViewOpts.Debug)
+        for (const auto &HashMismatch : Coverage->getHashMismatches())
+          errs() << "hash-mismatch: No profile record found for '"
+                 << HashMismatch.first << "' with hash = 0x"
+                 << Twine::utohexstr(HashMismatch.second) << '\n';
+    }
+    if (Error E = Exporter.finish()) {
+      error("failed to export covered functions: " + toString(std::move(E)));
+      return 1;
+    }
+    return 0;
   }
 
   auto Coverage = load();
@@ -1352,6 +1439,8 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
     Exporter =
         std::make_unique<CoverageExporterLcov>(*Coverage, ViewOpts, outs());
     break;
+  case CoverageViewOptions::OutputFormat::CoveredFunctions:
+    llvm_unreachable("covered-functions export handled by streaming path");
   }
 
   if (SourceFiles.empty())
