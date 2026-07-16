@@ -1369,9 +1369,11 @@ InstrProfSymtab &IndexedInstrProfReader::getSymtab() {
   return *Symtab;
 }
 
-Expected<NamedInstrProfRecord> IndexedInstrProfReader::getInstrProfRecord(
-    StringRef FuncName, uint64_t FuncHash, StringRef DeprecatedFuncName,
-    uint64_t *MismatchedFuncSum) {
+Expected<const NamedInstrProfRecord *>
+IndexedInstrProfReader::getInstrProfRecordRef(StringRef FuncName,
+                                              uint64_t FuncHash,
+                                              StringRef DeprecatedFuncName,
+                                              uint64_t *MismatchedFuncSum) {
   ArrayRef<NamedInstrProfRecord> Data;
   uint64_t FuncSum = 0;
   auto Err = Remapper->getRecords(FuncName, Data);
@@ -1410,7 +1412,7 @@ Expected<NamedInstrProfRecord> IndexedInstrProfReader::getInstrProfRecord(
   for (const NamedInstrProfRecord &I : Data) {
     // Check for a match and fill the vector if there is one.
     if (I.Hash == FuncHash)
-      return std::move(I);
+      return &I;
     if (NamedInstrProfRecord::hasCSFlagInHash(I.Hash) ==
         NamedInstrProfRecord::hasCSFlagInHash(FuncHash)) {
       CSBitMatch = true;
@@ -1425,6 +1427,16 @@ Expected<NamedInstrProfRecord> IndexedInstrProfReader::getInstrProfRecord(
     return error(instrprof_error::hash_mismatch);
   }
   return error(instrprof_error::unknown_function);
+}
+
+Expected<NamedInstrProfRecord> IndexedInstrProfReader::getInstrProfRecord(
+    StringRef FuncName, uint64_t FuncHash, StringRef DeprecatedFuncName,
+    uint64_t *MismatchedFuncSum) {
+  auto Record = getInstrProfRecordRef(FuncName, FuncHash, DeprecatedFuncName,
+                                      MismatchedFuncSum);
+  if (!Record)
+    return Record.takeError();
+  return **Record;
 }
 
 static Expected<memprof::MemProfRecord>
@@ -1596,6 +1608,18 @@ Error IndexedInstrProfReader::getFunctionCounts(StringRef FuncName,
     return error(std::move(E));
 
   Counts = Record.get().Counts;
+  return success();
+}
+
+Error IndexedInstrProfReader::getFunctionCountsAndBitmapBytes(
+    StringRef FuncName, uint64_t FuncHash, std::vector<uint64_t> &Counts,
+    std::vector<uint8_t> &BitmapBytes) {
+  auto Record = getInstrProfRecordRef(FuncName, FuncHash, "", nullptr);
+  if (Error E = Record.takeError())
+    return error(std::move(E));
+
+  Counts = (*Record)->Counts;
+  BitmapBytes = (*Record)->BitmapBytes;
   return success();
 }
 

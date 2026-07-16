@@ -1,0 +1,148 @@
+// RUN: llvm-profdata merge %S/Inputs/multiple-files.proftext -o %t.profdata
+// RUN: llvm-profdata merge %S/Inputs/prefer_used_to_unused.proftext \
+// RUN:   -o %t.header.profdata
+// RUN: llvm-profdata merge %S/Inputs/combine_expansions.proftext \
+// RUN:   -o %t.expansions.profdata
+// RUN: llvm-profdata merge %S/Inputs/covered-functions-fragments.proftext \
+// RUN:   -o %t.fragments.profdata
+// RUN: yaml2obj %S/Inputs/covered-functions-fragments.yaml \
+// RUN:   -o %t.fragments.o
+// RUN: llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --instr-profile=%t.profdata \
+// RUN:   --path-equivalence=/tmp/coverage,/mapped \
+// RUN:   %S/Inputs/multiple-files.covmapping | FileCheck %s
+// RUN: llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --instr-profile=%t.profdata --ignore-filename-regex='.*' \
+// RUN:   %S/Inputs/multiple-files.covmapping | FileCheck %s \
+// RUN:   --check-prefix=EMPTY
+// RUN: llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --instr-profile=%S/Inputs/highlightedRanges.profdata \
+// RUN:   --path-equivalence=/tmp,/mapped \
+// RUN:   %S/Inputs/highlightedRanges.covmapping | FileCheck %s \
+// RUN:   --check-prefix=PARTIAL
+// RUN: llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --instr-profile=%t.header.profdata --path-equivalence=/tmp,/mapped \
+// RUN:   %S/Inputs/prefer_used_to_unused.covmapping | FileCheck %s \
+// RUN:   --check-prefix=HEADER
+// RUN: llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --instr-profile=%t.expansions.profdata \
+// RUN:   %S/Inputs/combine_expansions.covmapping | FileCheck %s \
+// RUN:   --check-prefix=OVERLAP
+// RUN: llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --instr-profile=%S/Inputs/multiple_objects/merged.profdata \
+// RUN:   --path-equivalence=/tmp,/mapped \
+// RUN:   %S/Inputs/multiple_objects/use_2.covmapping \
+// RUN:   -object %S/Inputs/multiple_objects/use_1.covmapping | FileCheck %s \
+// RUN:   --check-prefix=IDENTITY
+// RUN: llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --instr-profile=%t.fragments.profdata %t.fragments.o | FileCheck %s \
+// RUN:   --check-prefix=FRAGMENTS
+// RUN: llvm-cov report --show-functions --instr-profile=%t.fragments.profdata \
+// RUN:   --path-equivalence=/tmp/covered-functions-fragment,%S/Inputs \
+// RUN:   %t.fragments.o %S/Inputs/covered-functions-fragment.c 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=REPORT
+// RUN: not llvm-cov export --coverage-only --instr-profile=%t.profdata \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s --check-prefix=PAIR
+// RUN: not llvm-cov export --format=covered-functions \
+// RUN:   --instr-profile=%t.profdata %S/Inputs/multiple-files.covmapping 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=PAIR
+// RUN: not llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --empty-profile %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=PROFILE
+// RUN: not llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --instr-profile=%t.profdata -name=f2 \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-FILTER
+
+// CHECK:      covered-functions-format 2
+// CHECK:      function - "f2"
+// CHECK-NEXT: function-id - "f2" 0x0000000000000000
+// CHECK-NEXT: entry-count - 1
+// CHECK-NEXT: overall-coverage - 1 1 100.00
+// CHECK-NEXT: coverage-body-at - "/mapped/a/f2.c" 1 11
+// CHECK-NEXT: fragment - root "/mapped/a/f2.c" 1 1 100.00
+// CHECK-NEXT: region - 1 1 11 1
+// CHECK-NEXT: end-fragment
+// CHECK-NEXT: end-function
+// CHECK:      function - "f4"
+// CHECK-NEXT: function-id - "f4" 0x0000000000000000
+// CHECK:      coverage-body-at - "/mapped/b/c/f4.c" 1 11
+// CHECK:      fragment - root "/mapped/b/c/f4.c" 1 1 100.00
+// CHECK:      function - "f3"
+// CHECK-NEXT: function-id - "f3" 0x0000000000000000
+// CHECK:      coverage-body-at - "/mapped/b/f3.c" 1 11
+// CHECK:      fragment - root "/mapped/b/f3.c" 1 1 100.00
+// CHECK:      function - "f1"
+// CHECK-NEXT: function-id - "f1" 0x0000000000000000
+// CHECK:      coverage-body-at - "/mapped/f1.c" 1 11
+// CHECK:      fragment - root "/mapped/f1.c" 1 1 100.00
+
+// EMPTY:      covered-functions-format 2
+// EMPTY-NOT:  function -
+
+// PARTIAL:      function - "_Z4funcv"
+// PARTIAL-NEXT: function-id - "_Z4funcv" 0x0000000000000000
+// PARTIAL-NEXT: entry-count - 1
+// PARTIAL-NEXT: overall-coverage - 2 1 50.00
+// PARTIAL-NEXT: coverage-body-at - "/mapped/showHighlightedRanges.cpp" 3 13
+// PARTIAL-NEXT: fragment - root "/mapped/showHighlightedRanges.cpp" 2 1 50.00
+// PARTIAL-NEXT: region - 1 3 13 1
+// PARTIAL-NEXT: region - 1 5 3 0
+
+// HEADER:      function - "_Z10sampleFunci"
+// HEADER-NEXT: function-id - "_Z10sampleFunci" 0x000000000000000a
+// HEADER-NEXT: entry-count - 1
+// HEADER-NEXT: overall-coverage - 4 3 75.00
+// HEADER-NEXT: coverage-body-at - "/mapped/prefer_used_to_unused.h" 15 30
+// HEADER-NEXT: fragment - root "/mapped/prefer_used_to_unused.h" 4 3 75.00
+
+// OVERLAP:      function - "main"
+// OVERLAP-NEXT: function-id - "main" 0x0000000000000000
+// OVERLAP-NEXT: entry-count - 1
+// OVERLAP-NEXT: overall-coverage - 5 5 100.00
+// OVERLAP-NEXT: coverage-body-at - "/tmp/ec/combine_expansions.cpp" 22 12
+// OVERLAP-NEXT: fragment - root "/tmp/ec/combine_expansions.cpp" 1 1 100.00
+// OVERLAP:      fragment - expansion "/tmp/ec/combine_expansions.cpp" 4 4 100.00
+// OVERLAP-NEXT: expansion-at - "/tmp/ec/combine_expansions.cpp" 14 5 1 1 100.00
+// OVERLAP-NEXT: region - 1 7 3 1
+// OVERLAP-NEXT: end-expansion
+// OVERLAP-NEXT: expansion-at - "/tmp/ec/combine_expansions.cpp" 14 5 1 1 100.00
+// OVERLAP-NEXT: region - 1 7 3 1
+
+// IDENTITY-NOT:   function - "use_
+// IDENTITY:       function - "_ZL2f1v"
+// IDENTITY-NEXT:  function-id - "use_1.cc:_ZL2f1v" 0x000000a38a3cf28e
+// IDENTITY:       coverage-body-at - "/mapped/multiple_objects/header.h" 1 25
+// IDENTITY:       fragment - root "/mapped/multiple_objects/header.h" 13 5 38.46
+// IDENTITY-NOT:   function - "use_
+// IDENTITY:       function - "_ZL2f1v"
+// IDENTITY-NEXT:  function-id - "use_2.cc:_ZL2f1v" 0x0000000000000000
+// IDENTITY:       coverage-body-at - "/mapped/multiple_objects/header.h" 1 25
+// IDENTITY:       fragment - root "/mapped/multiple_objects/header.h" 1 1 100.00
+// IDENTITY-NOT:   function - "use_
+
+// FRAGMENTS:      function - "covered"
+// FRAGMENTS-NEXT: function-id - "covered" 0x000000000001835c
+// FRAGMENTS-NEXT: entry-count - 1
+// FRAGMENTS-NEXT: overall-coverage - 5 4 80.00
+// FRAGMENTS-NEXT: coverage-body-at - "/tmp/covered-functions-fragment/covered-functions-fragment.c" 3 20
+// FRAGMENTS-NEXT: fragment - root "/tmp/covered-functions-fragment/covered-functions-fragment.c" 1 1 100.00
+// FRAGMENTS-NEXT: region - 1 3 20 1
+// FRAGMENTS-NEXT: region - 2 3 29 1
+// FRAGMENTS-NEXT: end-fragment
+// FRAGMENTS-NEXT: fragment - expansion "/tmp/covered-functions-fragment/covered-functions-fragment.h" 4 3 75.00
+// FRAGMENTS-NEXT: expansion-at - "/tmp/covered-functions-fragment/covered-functions-fragment.c" 3 29 4 3 75.00
+// FRAGMENTS-NEXT: region - 1 1 28 1
+// FRAGMENTS-NEXT: region - 1 1 29 1
+// FRAGMENTS-NEXT: region - 1 1 39 1
+// FRAGMENTS-NEXT: region - 1 1 49 0
+// FRAGMENTS-NEXT: end-expansion
+// FRAGMENTS-NEXT: end-fragment
+// FRAGMENTS-NEXT: end-function
+// FRAGMENTS-NOT:  function - "covered"
+
+// REPORT: covered{{ +}}5{{ +}}1{{ +}}80.00%
+
+// PAIR: error: --coverage-only must be used with --format=covered-functions
+// PROFILE: error: --coverage-only requires --instr-profile
+// BAD-FILTER: error: --coverage-only does not support source, function, summary, demangler, or skip filters

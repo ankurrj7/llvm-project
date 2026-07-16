@@ -31,8 +31,10 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -191,6 +193,7 @@ void CounterMappingContext::dump(const Counter &C, raw_ostream &OS) const {
 }
 
 Expected<int64_t> CounterMappingContext::evaluate(const Counter &C) const {
+  enum : uint8_t { Unvisited, Visiting, Visited };
   struct StackElem {
     Counter ICounter;
     int64_t LHS = 0;
@@ -199,6 +202,18 @@ Expected<int64_t> CounterMappingContext::evaluate(const Counter &C) const {
       KVisitedOnce = 1,
       KVisitedTwice = 2,
     } VisitCount = KNeverVisited;
+  };
+
+  if (ExpressionValues.size() != Expressions.size()) {
+    ExpressionValues.assign(Expressions.size(), 0);
+    ExpressionValueStates.assign(Expressions.size(), Unvisited);
+  }
+
+  auto InvalidExpression = [&]() -> Expected<int64_t> {
+    // Do not leave partially evaluated entries in the cache after an error.
+    ExpressionValues.clear();
+    ExpressionValueStates.clear();
+    return errorCodeToError(errc::argument_out_of_domain);
   };
 
   std::stack<StackElem> CounterStack;
@@ -216,26 +231,42 @@ Expected<int64_t> CounterMappingContext::evaluate(const Counter &C) const {
       break;
     case Counter::CounterValueReference:
       if (Current.ICounter.getCounterID() >= CounterValues.size())
-        return errorCodeToError(errc::argument_out_of_domain);
+        return InvalidExpression();
       LastPoppedValue = CounterValues[Current.ICounter.getCounterID()];
       CounterStack.pop();
       break;
     case Counter::Expression: {
-      if (Current.ICounter.getExpressionID() >= Expressions.size())
-        return errorCodeToError(errc::argument_out_of_domain);
-      const auto &E = Expressions[Current.ICounter.getExpressionID()];
+      unsigned ExpressionID = Current.ICounter.getExpressionID();
+      if (ExpressionID >= Expressions.size())
+        return InvalidExpression();
+      uint8_t &State = ExpressionValueStates[ExpressionID];
       if (Current.VisitCount == StackElem::KNeverVisited) {
+        if (State == Visited) {
+          LastPoppedValue = ExpressionValues[ExpressionID];
+          CounterStack.pop();
+          break;
+        }
+        // Counter expressions are a DAG. Reject malformed cyclic input rather
+        // than looping indefinitely.
+        if (State == Visiting)
+          return InvalidExpression();
+        State = Visiting;
+        const auto &E = Expressions[ExpressionID];
         CounterStack.push(StackElem{E.LHS});
         Current.VisitCount = StackElem::KVisitedOnce;
       } else if (Current.VisitCount == StackElem::KVisitedOnce) {
         Current.LHS = LastPoppedValue;
+        const auto &E = Expressions[ExpressionID];
         CounterStack.push(StackElem{E.RHS});
         Current.VisitCount = StackElem::KVisitedTwice;
       } else {
         int64_t LHS = Current.LHS;
         int64_t RHS = LastPoppedValue;
+        const auto &E = Expressions[ExpressionID];
         LastPoppedValue =
             E.Kind == CounterExpression::Subtract ? LHS - RHS : LHS + RHS;
+        ExpressionValues[ExpressionID] = LastPoppedValue;
+        State = Visited;
         CounterStack.pop();
       }
       break;
@@ -574,6 +605,7 @@ Expected<MCDCRecord> CounterMappingContext::evaluateMCDCRegion(
 }
 
 unsigned CounterMappingContext::getMaxCounterID(const Counter &C) const {
+  enum : uint8_t { Unvisited, Visiting, Visited };
   struct StackElem {
     Counter ICounter;
     int64_t LHS = 0;
@@ -583,6 +615,11 @@ unsigned CounterMappingContext::getMaxCounterID(const Counter &C) const {
       KVisitedTwice = 2,
     } VisitCount = KNeverVisited;
   };
+
+  if (ExpressionMaxCounterIDs.size() != Expressions.size()) {
+    ExpressionMaxCounterIDs.assign(Expressions.size(), 0);
+    ExpressionMaxCounterIDStates.assign(Expressions.size(), Unvisited);
+  }
 
   std::stack<StackElem> CounterStack;
   CounterStack.push({C});
@@ -602,22 +639,40 @@ unsigned CounterMappingContext::getMaxCounterID(const Counter &C) const {
       CounterStack.pop();
       break;
     case Counter::Expression: {
-      if (Current.ICounter.getExpressionID() >= Expressions.size()) {
+      unsigned ExpressionID = Current.ICounter.getExpressionID();
+      if (ExpressionID >= Expressions.size()) {
         LastPoppedValue = 0;
         CounterStack.pop();
       } else {
-        const auto &E = Expressions[Current.ICounter.getExpressionID()];
+        uint8_t &State = ExpressionMaxCounterIDStates[ExpressionID];
         if (Current.VisitCount == StackElem::KNeverVisited) {
+          if (State == Visited) {
+            LastPoppedValue = ExpressionMaxCounterIDs[ExpressionID];
+            CounterStack.pop();
+            break;
+          }
+          if (State == Visiting) {
+            // evaluate() diagnoses cyclic expressions. Avoid unbounded work
+            // here while sizing synthetic counts for an uncovered function.
+            ExpressionMaxCounterIDs.clear();
+            ExpressionMaxCounterIDStates.clear();
+            return 0;
+          }
+          State = Visiting;
+          const auto &E = Expressions[ExpressionID];
           CounterStack.push(StackElem{E.LHS});
           Current.VisitCount = StackElem::KVisitedOnce;
         } else if (Current.VisitCount == StackElem::KVisitedOnce) {
           Current.LHS = LastPoppedValue;
+          const auto &E = Expressions[ExpressionID];
           CounterStack.push(StackElem{E.RHS});
           Current.VisitCount = StackElem::KVisitedTwice;
         } else {
           int64_t LHS = Current.LHS;
           int64_t RHS = LastPoppedValue;
           LastPoppedValue = std::max(LHS, RHS);
+          ExpressionMaxCounterIDs[ExpressionID] = LastPoppedValue;
+          State = Visited;
           CounterStack.pop();
         }
       }
@@ -685,177 +740,234 @@ static unsigned getMaxBitmapSize(const CoverageMappingRecord &Record,
 
 namespace {
 
-/// Collect Decisions, Branchs, and Expansions and associate them.
-class MCDCDecisionRecorder {
-private:
-  /// This holds the DecisionRegion and MCDCBranches under it.
-  /// Also traverses Expansion(s).
-  /// The Decision has the number of MCDCBranches and will complete
-  /// when it is filled with unique ConditionID of MCDCBranches.
+/// Walk MappingRegions along Expansions and emit CountedRegions.
+struct CountedRegionEmitter {
+  /// A nestable Decision.
   struct DecisionRecord {
     const CounterMappingRegion *DecisionRegion;
-
-    /// They are reflected from DecisionRegion for convenience.
-    mcdc::DecisionParameters DecisionParams;
-    LineColPair DecisionStartLoc;
-    LineColPair DecisionEndLoc;
-
-    /// This is passed to `MCDCRecordProcessor`, so this should be compatible
-    /// to`ArrayRef<const CounterMappingRegion *>`.
+    unsigned NumConditions; ///< Copy of DecisionRegion.NumConditions
+    /// Pushed by traversal order.
     SmallVector<const CounterMappingRegion *> MCDCBranches;
-
-    /// IDs that are stored in MCDCBranches
-    /// Complete when all IDs (1 to NumConditions) are met.
+#ifndef NDEBUG
     DenseSet<mcdc::ConditionID> ConditionIDs;
-
-    /// Set of IDs of Expansion(s) that are relevant to DecisionRegion
-    /// and its children (via expansions).
-    /// FileID  pointed by ExpandedFileID is dedicated to the expansion, so
-    /// the location in the expansion doesn't matter.
-    DenseSet<unsigned> ExpandedFileIDs;
+#endif
 
     DecisionRecord(const CounterMappingRegion &Decision)
         : DecisionRegion(&Decision),
-          DecisionParams(Decision.getDecisionParams()),
-          DecisionStartLoc(Decision.startLoc()),
-          DecisionEndLoc(Decision.endLoc()) {
+          NumConditions(Decision.getDecisionParams().NumConditions) {
       assert(Decision.Kind == CounterMappingRegion::MCDCDecisionRegion);
     }
 
-    /// Determine whether DecisionRecord dominates `R`.
-    bool dominates(const CounterMappingRegion &R) const {
-      // Determine whether `R` is included in `DecisionRegion`.
-      if (R.FileID == DecisionRegion->FileID &&
-          R.startLoc() >= DecisionStartLoc && R.endLoc() <= DecisionEndLoc)
-        return true;
-
-      // Determine whether `R` is pointed by any of Expansions.
-      return ExpandedFileIDs.contains(R.FileID);
-    }
-
-    enum Result {
-      NotProcessed = 0, /// Irrelevant to this Decision
-      Processed,        /// Added to this Decision
-      Completed,        /// Added and filled this Decision
-    };
-
-    /// Add Branch into the Decision
-    /// \param Branch expects MCDCBranchRegion
-    /// \returns NotProcessed/Processed/Completed
-    Result addBranch(const CounterMappingRegion &Branch) {
-      assert(Branch.Kind == CounterMappingRegion::MCDCBranchRegion);
-
-      auto ConditionID = Branch.getBranchParams().ID;
-
-      if (ConditionIDs.contains(ConditionID) ||
-          ConditionID >= DecisionParams.NumConditions)
-        return NotProcessed;
-
-      if (!this->dominates(Branch))
-        return NotProcessed;
-
-      assert(MCDCBranches.size() < DecisionParams.NumConditions);
-
-      // Put `ID=0` in front of `MCDCBranches` for convenience
-      // even if `MCDCBranches` is not topological.
-      if (ConditionID == 0)
-        MCDCBranches.insert(MCDCBranches.begin(), &Branch);
-      else
-        MCDCBranches.push_back(&Branch);
-
-      // Mark `ID` as `assigned`.
-      ConditionIDs.insert(ConditionID);
-
-      // `Completed` when `MCDCBranches` is full
-      return (MCDCBranches.size() == DecisionParams.NumConditions ? Completed
-                                                                  : Processed);
-    }
-
-    /// Record Expansion if it is relevant to this Decision.
-    /// Each `Expansion` may nest.
-    /// \returns true if recorded.
-    bool recordExpansion(const CounterMappingRegion &Expansion) {
-      if (!this->dominates(Expansion))
-        return false;
-
-      ExpandedFileIDs.insert(Expansion.ExpandedFileID);
-      return true;
+    bool pushBranch(const CounterMappingRegion &B) {
+      assert(B.Kind == CounterMappingRegion::MCDCBranchRegion);
+      assert(ConditionIDs.insert(B.getBranchParams().ID).second &&
+             "Duplicate CondID");
+      MCDCBranches.push_back(&B);
+      assert(MCDCBranches.size() <= NumConditions &&
+             "MCDCBranch exceeds NumConds");
+      return MCDCBranches.size() == NumConditions;
     }
   };
 
-private:
-  /// Decisions in progress
-  /// DecisionRecord is added for each MCDCDecisionRegion.
-  /// DecisionRecord is removed when Decision is completed.
-  SmallVector<DecisionRecord> Decisions;
+  const CoverageMappingRecord &Record;
+  CounterMappingContext &Ctx;
+  FunctionRecord &Function;
+  bool IsVersion11;
+  bool LoadBranchAndMCDCRecords;
 
-public:
-  ~MCDCDecisionRecorder() {
-    assert(Decisions.empty() && "All Decisions have not been resolved");
+  /// Evaluated Counters.
+  std::map<Counter, uint64_t> CounterValues;
+
+  /// Decisions are nestable.
+  SmallVector<DecisionRecord, 1> DecisionStack;
+
+  /// A File pointed by Expansion
+  struct FileInfo {
+    /// The last index(+1) for each FileID in MappingRegions.
+    unsigned LastIndex = 0;
+    /// Mark Files pointed by Expansions.
+    /// Non-marked Files are root Files.
+    bool IsExpanded = false;
+  };
+
+  /// The last element is a sentinel with Index=NumRegions.
+  std::vector<FileInfo> Files;
+#ifndef NDEBUG
+  DenseSet<unsigned> Visited;
+#endif
+
+  CountedRegionEmitter(const CoverageMappingRecord &Record,
+                       CounterMappingContext &Ctx, FunctionRecord &Function,
+                       bool IsVersion11, bool LoadBranchAndMCDCRecords)
+      : Record(Record), Ctx(Ctx), Function(Function), IsVersion11(IsVersion11),
+        LoadBranchAndMCDCRecords(LoadBranchAndMCDCRecords),
+        Files(Record.Filenames.size()) {
+    // Scan MappingRegions and mark each last index by FileID.
+    for (auto [I, Region] : enumerate(Record.MappingRegions)) {
+      if (Region.FileID >= Files.size()) {
+        // Extend (only possible in CoverageMappingTests)
+        Files.resize(Region.FileID + 1);
+      }
+      Files[Region.FileID].LastIndex = I + 1;
+      if (Region.Kind == CounterMappingRegion::ExpansionRegion) {
+        if (Region.ExpandedFileID >= Files.size()) {
+          // Extend (only possible in CoverageMappingTests)
+          Files.resize(Region.ExpandedFileID + 1);
+        }
+        Files[Region.ExpandedFileID].IsExpanded = true;
+      }
+    }
   }
 
-  /// Register Region and start recording.
-  void registerDecision(const CounterMappingRegion &Decision) {
-    Decisions.emplace_back(Decision);
+  Error evaluateAndCacheCounter(Counter C) {
+    if (CounterValues.count(C))
+      return Error::success();
+    auto ValueOrErr = Ctx.evaluate(C);
+    if (!ValueOrErr)
+      return ValueOrErr.takeError();
+    CounterValues[C] = *ValueOrErr;
+    return Error::success();
   }
 
-  void recordExpansion(const CounterMappingRegion &Expansion) {
-    any_of(Decisions, [&Expansion](auto &Decision) {
-      return Decision.recordExpansion(Expansion);
-    });
-  }
+  Error walk(unsigned Idx) {
+    assert(Idx < Files.size());
+    unsigned B = Idx == 0 ? 0 : Files[Idx - 1].LastIndex;
+    unsigned E = Files[Idx].LastIndex;
+    assert(B != E && "Empty FileID");
+    assert(Visited.insert(Idx).second && "Duplicate Expansions");
+    for (unsigned I = B; I != E; ++I) {
+      const auto &Region = Record.MappingRegions[I];
+      if (Region.FileID != Idx)
+        break;
+      if (Region.Kind == CounterMappingRegion::ExpansionRegion)
+        if (auto Err = walk(Region.ExpandedFileID))
+          return Err;
+      if (LoadBranchAndMCDCRecords || !Region.isBranch())
+        if (auto E = evaluateAndCacheCounter(Region.Count))
+          return E;
 
-  using DecisionAndBranches =
-      std::pair<const CounterMappingRegion *,             /// Decision
-                SmallVector<const CounterMappingRegion *> /// Branches
-                >;
+      if (LoadBranchAndMCDCRecords) {
+        if (Region.Kind == CounterMappingRegion::MCDCDecisionRegion) {
+          // Start the new Decision on the stack.
+          DecisionStack.emplace_back(Region);
+        } else if (Region.Kind == CounterMappingRegion::MCDCBranchRegion) {
+          assert(!DecisionStack.empty() && "Orphan MCDCBranch");
+          auto &D = DecisionStack.back();
 
-  /// Add MCDCBranchRegion to DecisionRecord.
-  /// \param Branch to be processed
-  /// \returns DecisionsAndBranches if DecisionRecord completed.
-  ///     Or returns nullopt.
-  std::optional<DecisionAndBranches>
-  processBranch(const CounterMappingRegion &Branch) {
-    // Seek each Decision and apply Region to it.
-    for (auto DecisionIter = Decisions.begin(), DecisionEnd = Decisions.end();
-         DecisionIter != DecisionEnd; ++DecisionIter)
-      switch (DecisionIter->addBranch(Branch)) {
-      case DecisionRecord::NotProcessed:
-        continue;
-      case DecisionRecord::Processed:
-        return std::nullopt;
-      case DecisionRecord::Completed:
-        DecisionAndBranches Result =
-            std::make_pair(DecisionIter->DecisionRegion,
-                           std::move(DecisionIter->MCDCBranches));
-        Decisions.erase(DecisionIter); // No longer used.
-        return Result;
+          if (D.pushBranch(Region)) {
+            // All Branches have been found in the Decision.
+            auto RecordOrErr = Ctx.evaluateMCDCRegion(
+                *D.DecisionRegion, D.MCDCBranches, IsVersion11);
+            if (!RecordOrErr)
+              return RecordOrErr.takeError();
+
+            // Finish the stack.
+            Function.pushMCDCRecord(std::move(*RecordOrErr));
+            DecisionStack.pop_back();
+          }
+        }
       }
 
-    llvm_unreachable("Branch not found in Decisions");
+      // Evaluate FalseCount
+      // It may have the Counter in Branches, or Zero.
+      if (LoadBranchAndMCDCRecords)
+        if (auto E = evaluateAndCacheCounter(Region.FalseCount))
+          return E;
+    }
+
+    assert((Idx != 0 || DecisionStack.empty()) && "Decision wasn't closed");
+
+    return Error::success();
+  }
+
+  Error emitCountedRegions() {
+    // Walk MappingRegions along Expansions.
+    // - Evaluate Counters
+    // - Emit MCDCRecords
+    for (auto [I, F] : enumerate(Files)) {
+      if (!F.IsExpanded)
+        if (auto E = walk(I))
+          return E;
+    }
+    assert(Visited.size() == Files.size() && "Dangling FileID");
+
+    // Emit CountedRegions in the same order as MappingRegions.
+    for (const auto &Region : Record.MappingRegions) {
+      if (Region.Kind == CounterMappingRegion::MCDCDecisionRegion)
+        continue; // Don't emit.
+      if (!LoadBranchAndMCDCRecords && Region.isBranch())
+        continue;
+      // Adopt values from the CounterValues.
+      // FalseCount may be Zero unless Branches.
+      Function.pushRegion(Region, CounterValues[Region.Count],
+                          CounterValues[Region.FalseCount]);
+    }
+
+    return Error::success();
   }
 };
 
 } // namespace
 
+static StringRef getCoverageFunctionDisplayName(StringRef RawFunctionName,
+                                                ArrayRef<StringRef> Filenames) {
+  for (StringRef Filename : Filenames) {
+    StringRef DisplayName = getFuncNameWithoutPrefix(RawFunctionName, Filename);
+    if (DisplayName != RawFunctionName)
+      return DisplayName;
+  }
+
+  // Current IR PGO names use an unambiguous semicolon delimiter.
+  if (size_t Separator = RawFunctionName.find(';');
+      Separator != StringRef::npos)
+    return RawFunctionName.drop_front(Separator + 1);
+
+  // Older names use a colon delimiter. Profile names commonly contain only
+  // the compile unit's basename while coverage regions may belong exclusively
+  // to an included header, so the compile unit need not occur in Filenames.
+  // Locate the first prefix which looks like a source filename. This also
+  // avoids mistaking a Windows drive colon or an Objective-C method colon for
+  // the compile-unit delimiter.
+  for (size_t Separator = RawFunctionName.find(':');
+       Separator != StringRef::npos;
+       Separator = RawFunctionName.find(':', Separator + 1)) {
+    StringRef Prefix = RawFunctionName.take_front(Separator);
+    StringRef Basename = sys::path::filename(Prefix);
+    if (Prefix == "<unknown>" || !sys::path::extension(Basename).empty())
+      return RawFunctionName.drop_front(Separator + 1);
+
+    for (StringRef Filename : Filenames)
+      if (Basename == sys::path::filename(Filename))
+        return RawFunctionName.drop_front(Separator + 1);
+  }
+  return RawFunctionName;
+}
+
 Error CoverageMapping::loadFunctionRecord(
     const CoverageMappingRecord &Record,
     const std::optional<std::reference_wrapper<IndexedInstrProfReader>>
-        &ProfileReader) {
-  StringRef OrigFuncName = Record.FunctionName;
-  if (OrigFuncName.empty())
+        &ProfileReader,
+    const CoverageMappingLoadOptions &Options,
+    std::optional<InstrProfRecord> ProfileRecord) {
+  if (Record.FunctionName.empty())
     return make_error<CoverageMapError>(coveragemap_error::malformed,
                                         "record function name is empty");
-
-  if (Record.Filenames.empty())
+  StringRef OrigFuncName = Record.FunctionName;
+  if (!Options.KeepFunctionRecords) {
+    OrigFuncName =
+        getCoverageFunctionDisplayName(Record.FunctionName, Record.Filenames);
+  } else if (Record.Filenames.empty()) {
     OrigFuncName = getFuncNameWithoutPrefix(OrigFuncName);
-  else
+  } else {
     OrigFuncName = getFuncNameWithoutPrefix(OrigFuncName, Record.Filenames[0]);
+  }
 
   CounterMappingContext Ctx(Record.Expressions);
 
   std::vector<uint64_t> Counts;
-  if (ProfileReader) {
+  if (ProfileRecord) {
+    Counts = std::move(ProfileRecord->Counts);
+  } else if (ProfileReader) {
     if (Error E = ProfileReader.value().get().getFunctionCounts(
             Record.FunctionName, Record.FunctionHash, Counts)) {
       instrprof_error IPE = std::get<0>(InstrProfError::take(std::move(E)));
@@ -878,7 +990,24 @@ Error CoverageMapping::loadFunctionRecord(
                            IndexedInstrProf::ProfVersion::Version12;
 
   BitVector Bitmap;
-  if (ProfileReader) {
+  if (ProfileRecord) {
+    ArrayRef<uint8_t> BitmapBytes = ProfileRecord->BitmapBytes;
+    size_t I = 0, E = BitmapBytes.size();
+    Bitmap.resize(E * CHAR_BIT);
+    BitVector::apply(
+        [&](auto X) {
+          using XTy = decltype(X);
+          alignas(XTy) uint8_t W[sizeof(XTy)];
+          size_t N = std::min(E - I, sizeof(W));
+          std::memset(W, 0, sizeof(W));
+          std::memcpy(W, &BitmapBytes[I], N);
+          I += N;
+          return support::endian::read<XTy, support::aligned>(
+              W, llvm::endianness::little);
+        },
+        Bitmap, Bitmap);
+    assert(I == E);
+  } else if (ProfileReader) {
     if (Error E = ProfileReader.value().get().getFunctionBitmap(
             Record.FunctionName, Record.FunctionHash, Bitmap)) {
       instrprof_error IPE = std::get<0>(InstrProfError::take(std::move(E)));
@@ -907,56 +1036,23 @@ Error CoverageMapping::loadFunctionRecord(
       Record.MappingRegions[0].Count.isZero() && Counts[0] > 0)
     return Error::success();
 
-  MCDCDecisionRecorder MCDCDecisions;
   FunctionRecord Function(OrigFuncName, Record.Filenames);
-  for (const auto &Region : Record.MappingRegions) {
-    // MCDCDecisionRegion should be handled first since it overlaps with
-    // others inside.
-    if (Region.Kind == CounterMappingRegion::MCDCDecisionRegion) {
-      MCDCDecisions.registerDecision(Region);
-      continue;
-    }
-    Expected<int64_t> ExecutionCount = Ctx.evaluate(Region.Count);
-    if (auto E = ExecutionCount.takeError()) {
-      consumeError(std::move(E));
+  // Emit CountedRegions into FunctionRecord.
+  if (auto E = CountedRegionEmitter(Record, Ctx, Function, IsVersion11,
+                                    Options.LoadBranchAndMCDCRecords)
+                   .emitCountedRegions()) {
+    errs() << "warning: " << Record.FunctionName << ": ";
+    logAllUnhandledErrors(std::move(E), errs());
+    return Error::success();
+  }
+
+  if (!Options.KeepFunctionRecords) {
+    if (!StreamedRecordProvenance[Record.FunctionName]
+             .insert(Record.FunctionHash)
+             .second)
       return Error::success();
-    }
-    Expected<int64_t> AltExecutionCount = Ctx.evaluate(Region.FalseCount);
-    if (auto E = AltExecutionCount.takeError()) {
-      consumeError(std::move(E));
-      return Error::success();
-    }
-    Function.pushRegion(Region, *ExecutionCount, *AltExecutionCount);
-
-    // Record ExpansionRegion.
-    if (Region.Kind == CounterMappingRegion::ExpansionRegion) {
-      MCDCDecisions.recordExpansion(Region);
-      continue;
-    }
-
-    // Do nothing unless MCDCBranchRegion.
-    if (Region.Kind != CounterMappingRegion::MCDCBranchRegion)
-      continue;
-
-    auto Result = MCDCDecisions.processBranch(Region);
-    if (!Result) // Any Decision doesn't complete.
-      continue;
-
-    auto MCDCDecision = Result->first;
-    auto &MCDCBranches = Result->second;
-
-    // Since the bitmap identifies the executed test vectors for an MC/DC
-    // DecisionRegion, all of the information is now available to process.
-    // This is where the bulk of the MC/DC progressing takes place.
-    Expected<MCDCRecord> Record =
-        Ctx.evaluateMCDCRegion(*MCDCDecision, MCDCBranches, IsVersion11);
-    if (auto E = Record.takeError()) {
-      consumeError(std::move(E));
-      return Error::success();
-    }
-
-    // Save the MC/DC Record so that it can be visualized later.
-    Function.pushMCDCRecord(std::move(*Record));
+    return Options.FunctionRecordConsumer->consume(
+        Record.FunctionName, Record.FunctionHash, std::move(Function));
   }
 
   // Don't create records for (filenames, function) pairs we've already seen.
@@ -988,18 +1084,84 @@ Error CoverageMapping::loadFromReaders(
     ArrayRef<std::unique_ptr<CoverageMappingReader>> CoverageReaders,
     std::optional<std::reference_wrapper<IndexedInstrProfReader>>
         &ProfileReader,
-    CoverageMapping &Coverage) {
+    CoverageMapping &Coverage, const CoverageMappingLoadOptions &Options) {
   assert(!Coverage.SingleByteCoverage || !ProfileReader ||
          *Coverage.SingleByteCoverage ==
              ProfileReader.value().get().hasSingleByteCoverage());
   Coverage.SingleByteCoverage =
       !ProfileReader || ProfileReader.value().get().hasSingleByteCoverage();
   for (const auto &CoverageReader : CoverageReaders) {
+    if (Options.LoadExecutedFunctionsOnly) {
+      std::optional<InstrProfRecord> ProfileRecord;
+      auto ShouldRead = [&](StringRef FunctionName,
+                            uint64_t FunctionHash) -> Expected<bool> {
+        if (!Options.KeepFunctionRecords) {
+          auto FunctionIt =
+              Coverage.StreamedRecordProvenance.find(FunctionName);
+          if (FunctionIt != Coverage.StreamedRecordProvenance.end() &&
+              FunctionIt->second.contains(FunctionHash))
+            return false;
+        }
+
+        ProfileRecord.emplace();
+        if (Error E = ProfileReader->get().getFunctionCountsAndBitmapBytes(
+                FunctionName, FunctionHash, ProfileRecord->Counts,
+                ProfileRecord->BitmapBytes)) {
+          instrprof_error IPE = std::get<0>(InstrProfError::take(std::move(E)));
+          ProfileRecord.reset();
+          if (IPE == instrprof_error::hash_mismatch) {
+            Coverage.FuncHashMismatches.emplace_back(std::string(FunctionName),
+                                                     FunctionHash);
+            return false;
+          }
+          if (IPE == instrprof_error::unknown_function)
+            return false;
+          return make_error<InstrProfError>(IPE);
+        }
+
+        bool HasExecutedData = llvm::any_of(
+            ProfileRecord->Counts, [](uint64_t Count) { return Count != 0; });
+        HasExecutedData |= llvm::any_of(ProfileRecord->BitmapBytes,
+                                        [](uint8_t Byte) { return Byte != 0; });
+        if (!HasExecutedData) {
+          ProfileRecord.reset();
+          return false;
+        }
+        return true;
+      };
+
+      for (;;) {
+        CoverageMappingRecord Record;
+        Error E = CoverageReader->readNextRecord(Record, ShouldRead);
+        if (E) {
+          bool IsEOF = false;
+          E = handleErrors(std::move(E),
+                           [&](const CoverageMapError &CME) -> Error {
+                             if (CME.get() == coveragemap_error::eof) {
+                               IsEOF = true;
+                               return Error::success();
+                             }
+                             return make_error<CoverageMapError>(
+                                 CME.get(), CME.getMessage());
+                           });
+          if (E)
+            return E;
+          if (IsEOF)
+            break;
+        }
+        assert(ProfileRecord && "accepted record has no profile data");
+        if (Error E = Coverage.loadFunctionRecord(
+                Record, ProfileReader, Options, std::move(ProfileRecord)))
+          return E;
+      }
+      continue;
+    }
+
     for (auto RecordOrErr : *CoverageReader) {
       if (Error E = RecordOrErr.takeError())
         return E;
       const auto &Record = *RecordOrErr;
-      if (Error E = Coverage.loadFunctionRecord(Record, ProfileReader))
+      if (Error E = Coverage.loadFunctionRecord(Record, ProfileReader, Options))
         return E;
     }
   }
@@ -1010,8 +1172,25 @@ Expected<std::unique_ptr<CoverageMapping>> CoverageMapping::load(
     ArrayRef<std::unique_ptr<CoverageMappingReader>> CoverageReaders,
     std::optional<std::reference_wrapper<IndexedInstrProfReader>>
         &ProfileReader) {
+  return load(CoverageReaders, ProfileReader, CoverageMappingLoadOptions());
+}
+
+Expected<std::unique_ptr<CoverageMapping>> CoverageMapping::load(
+    ArrayRef<std::unique_ptr<CoverageMappingReader>> CoverageReaders,
+    std::optional<std::reference_wrapper<IndexedInstrProfReader>>
+        &ProfileReader,
+    CoverageMappingLoadOptions Options) {
+  if (Options.LoadExecutedFunctionsOnly && !ProfileReader)
+    return createStringError(
+        errc::invalid_argument,
+        "executed-functions-only coverage loading requires a profile");
+  if (!Options.KeepFunctionRecords && !Options.FunctionRecordConsumer)
+    return createStringError(errc::invalid_argument,
+                             "streaming coverage loading requires a consumer");
+
   auto Coverage = std::unique_ptr<CoverageMapping>(new CoverageMapping());
-  if (Error E = loadFromReaders(CoverageReaders, ProfileReader, *Coverage))
+  if (Error E =
+          loadFromReaders(CoverageReaders, ProfileReader, *Coverage, Options))
     return std::move(E);
   return std::move(Coverage);
 }
@@ -1030,7 +1209,8 @@ Error CoverageMapping::loadFromFile(
     std::optional<std::reference_wrapper<IndexedInstrProfReader>>
         &ProfileReader,
     CoverageMapping &Coverage, bool &DataFound,
-    SmallVectorImpl<object::BuildID> *FoundBinaryIDs) {
+    SmallVectorImpl<object::BuildID> *FoundBinaryIDs,
+    const CoverageMappingLoadOptions &Options) {
   auto CovMappingBufOrErr = MemoryBuffer::getFileOrSTDIN(
       Filename, /*IsText=*/false, /*RequiresNullTerminator=*/false);
   if (std::error_code EC = CovMappingBufOrErr.getError())
@@ -1060,7 +1240,7 @@ Error CoverageMapping::loadFromFile(
                        }));
   }
   DataFound |= !Readers.empty();
-  if (Error E = loadFromReaders(Readers, ProfileReader, Coverage))
+  if (Error E = loadFromReaders(Readers, ProfileReader, Coverage, Options))
     return createFileError(Filename, std::move(E));
   return Error::success();
 }
@@ -1070,6 +1250,25 @@ Expected<std::unique_ptr<CoverageMapping>> CoverageMapping::load(
     std::optional<StringRef> ProfileFilename, vfs::FileSystem &FS,
     ArrayRef<StringRef> Arches, StringRef CompilationDir,
     const object::BuildIDFetcher *BIDFetcher, bool CheckBinaryIDs) {
+  return load(ObjectFilenames, ProfileFilename, FS, Arches, CompilationDir,
+              BIDFetcher, CheckBinaryIDs, CoverageMappingLoadOptions());
+}
+
+Expected<std::unique_ptr<CoverageMapping>>
+CoverageMapping::load(ArrayRef<StringRef> ObjectFilenames,
+                      std::optional<StringRef> ProfileFilename,
+                      vfs::FileSystem &FS, ArrayRef<StringRef> Arches,
+                      StringRef CompilationDir,
+                      const object::BuildIDFetcher *BIDFetcher,
+                      bool CheckBinaryIDs, CoverageMappingLoadOptions Options) {
+  if (Options.LoadExecutedFunctionsOnly && !ProfileFilename)
+    return createStringError(
+        errc::invalid_argument,
+        "executed-functions-only coverage loading requires a profile");
+  if (!Options.KeepFunctionRecords && !Options.FunctionRecordConsumer)
+    return createStringError(errc::invalid_argument,
+                             "streaming coverage loading requires a consumer");
+
   std::unique_ptr<IndexedInstrProfReader> ProfileReader;
   if (ProfileFilename) {
     auto ProfileReaderOrErr =
@@ -1098,7 +1297,7 @@ Expected<std::unique_ptr<CoverageMapping>> CoverageMapping::load(
   for (const auto &File : llvm::enumerate(ObjectFilenames)) {
     if (Error E = loadFromFile(File.value(), GetArch(File.index()),
                                CompilationDir, ProfileReaderRef, *Coverage,
-                               DataFound, &FoundBinaryIDs))
+                               DataFound, &FoundBinaryIDs, Options))
       return std::move(E);
   }
 
@@ -1127,7 +1326,7 @@ Expected<std::unique_ptr<CoverageMapping>> CoverageMapping::load(
         std::string Path = std::move(*PathOpt);
         StringRef Arch = Arches.size() == 1 ? Arches.front() : StringRef();
         if (Error E = loadFromFile(Path, Arch, CompilationDir, ProfileReaderRef,
-                                   *Coverage, DataFound))
+                                   *Coverage, DataFound, nullptr, Options))
           return std::move(E);
       } else if (CheckBinaryIDs) {
         return createFileError(

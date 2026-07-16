@@ -19,6 +19,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/iterator.h"
 #include "llvm/ADT/iterator_range.h"
@@ -686,13 +687,21 @@ class CounterMappingContext {
   ArrayRef<CounterExpression> Expressions;
   ArrayRef<uint64_t> CounterValues;
   BitVector Bitmap;
+  mutable std::vector<int64_t> ExpressionValues;
+  mutable std::vector<uint8_t> ExpressionValueStates;
+  mutable std::vector<unsigned> ExpressionMaxCounterIDs;
+  mutable std::vector<uint8_t> ExpressionMaxCounterIDStates;
 
 public:
   CounterMappingContext(ArrayRef<CounterExpression> Expressions,
                         ArrayRef<uint64_t> CounterValues = {})
       : Expressions(Expressions), CounterValues(CounterValues) {}
 
-  void setCounts(ArrayRef<uint64_t> Counts) { CounterValues = Counts; }
+  void setCounts(ArrayRef<uint64_t> Counts) {
+    CounterValues = Counts;
+    ExpressionValues.clear();
+    ExpressionValueStates.clear();
+  }
   void setBitmap(BitVector &&Bitmap_) { Bitmap = std::move(Bitmap_); }
 
   LLVM_ABI void dump(const Counter &C, raw_ostream &OS) const;
@@ -756,6 +765,37 @@ struct FunctionRecord {
       ExecutionCount = Count;
     CountedRegions.emplace_back(Region, Count, FalseCount);
   }
+};
+
+/// Receives evaluated function records while coverage mappings are loaded.
+///
+/// The consumer owns each function after consume() returns successfully. This
+/// supports clients which must process coverage records without retaining a
+/// program-wide FunctionRecord vector.
+class LLVM_ABI CoverageMappingFunctionRecordConsumer {
+public:
+  virtual ~CoverageMappingFunctionRecordConsumer() = default;
+
+  virtual Error consume(StringRef RawFunctionName, uint64_t FunctionHash,
+                        FunctionRecord &&Function) = 0;
+};
+
+/// Options controlling coverage mapping loading.
+struct CoverageMappingLoadOptions {
+  /// Query the indexed profile before decoding each raw mapping and reject
+  /// functions whose counters and bitmap data are all zero.
+  bool LoadExecutedFunctionsOnly = false;
+
+  /// Retain evaluated functions in CoverageMapping::Functions.
+  bool KeepFunctionRecords = true;
+
+  /// Materialize branch and MC/DC records in each FunctionRecord. Clients
+  /// interested only in code regions can disable this to reduce peak memory.
+  bool LoadBranchAndMCDCRecords = true;
+
+  /// Optional streaming destination for evaluated functions. A consumer is
+  /// required when KeepFunctionRecords is false.
+  CoverageMappingFunctionRecordConsumer *FunctionRecordConsumer = nullptr;
 };
 
 /// Iterator over Functions, optionally filtered to a single file.
@@ -996,6 +1036,7 @@ class CoverageMapping {
   std::vector<FunctionRecord> Functions;
   DenseMap<size_t, SmallVector<unsigned, 0>> FilenameHash2RecordIndices;
   std::vector<std::pair<std::string, uint64_t>> FuncHashMismatches;
+  StringMap<DenseSet<uint64_t>> StreamedRecordProvenance;
 
   std::optional<bool> SingleByteCoverage;
 
@@ -1006,7 +1047,7 @@ class CoverageMapping {
       ArrayRef<std::unique_ptr<CoverageMappingReader>> CoverageReaders,
       std::optional<std::reference_wrapper<IndexedInstrProfReader>>
           &ProfileReader,
-      CoverageMapping &Coverage);
+      CoverageMapping &Coverage, const CoverageMappingLoadOptions &Options);
 
   // Load coverage records from file.
   static Error
@@ -1014,13 +1055,16 @@ class CoverageMapping {
                std::optional<std::reference_wrapper<IndexedInstrProfReader>>
                    &ProfileReader,
                CoverageMapping &Coverage, bool &DataFound,
-               SmallVectorImpl<object::BuildID> *FoundBinaryIDs = nullptr);
+               SmallVectorImpl<object::BuildID> *FoundBinaryIDs,
+               const CoverageMappingLoadOptions &Options);
 
   /// Add a function record corresponding to \p Record.
   Error loadFunctionRecord(
       const CoverageMappingRecord &Record,
       const std::optional<std::reference_wrapper<IndexedInstrProfReader>>
-          &ProfileReader);
+          &ProfileReader,
+      const CoverageMappingLoadOptions &Options,
+      std::optional<InstrProfRecord> ProfileRecord = std::nullopt);
 
   /// Look up the indices for function records which are at least partially
   /// defined in the specified file. This is guaranteed to return a superset of
@@ -1038,6 +1082,11 @@ public:
   load(ArrayRef<std::unique_ptr<CoverageMappingReader>> CoverageReaders,
        std::optional<std::reference_wrapper<IndexedInstrProfReader>>
            &ProfileReader);
+  LLVM_ABI static Expected<std::unique_ptr<CoverageMapping>>
+  load(ArrayRef<std::unique_ptr<CoverageMappingReader>> CoverageReaders,
+       std::optional<std::reference_wrapper<IndexedInstrProfReader>>
+           &ProfileReader,
+       CoverageMappingLoadOptions Options);
 
   /// Load the coverage mapping from the given object files and profile. If
   /// \p Arches is non-empty, it must specify an architecture for each object.
@@ -1048,6 +1097,12 @@ public:
        ArrayRef<StringRef> Arches = {}, StringRef CompilationDir = "",
        const object::BuildIDFetcher *BIDFetcher = nullptr,
        bool CheckBinaryIDs = false);
+  LLVM_ABI static Expected<std::unique_ptr<CoverageMapping>>
+  load(ArrayRef<StringRef> ObjectFilenames,
+       std::optional<StringRef> ProfileFilename, vfs::FileSystem &FS,
+       ArrayRef<StringRef> Arches, StringRef CompilationDir,
+       const object::BuildIDFetcher *BIDFetcher, bool CheckBinaryIDs,
+       CoverageMappingLoadOptions Options);
 
   /// The number of functions that couldn't have their profiles mapped.
   ///
