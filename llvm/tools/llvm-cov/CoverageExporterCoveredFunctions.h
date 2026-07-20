@@ -21,6 +21,12 @@ namespace llvm {
 
 class raw_ostream;
 
+struct CoveredFunctionsExportOptions {
+  enum class Mode { Execution, Baseline } ExportMode = Mode::Execution;
+  bool IncludeBranches = false;
+  bool IncludeMCDC = false;
+};
+
 /// Streams evaluated coverage functions into a bounded external sort and
 /// renders the versioned, function-centric covered-functions text format.
 ///
@@ -40,7 +46,8 @@ public:
   CoverageExporterCoveredFunctions(
       raw_ostream &OS,
       ArrayRef<std::pair<std::string, std::string>> PathRemappings,
-      const CoverageFilters &FilenameFilters);
+      const CoverageFilters &FilenameFilters,
+      CoveredFunctionsExportOptions Options = {});
   ~CoverageExporterCoveredFunctions() override;
 
   Error consume(StringRef RawFunctionName, uint64_t FunctionHash,
