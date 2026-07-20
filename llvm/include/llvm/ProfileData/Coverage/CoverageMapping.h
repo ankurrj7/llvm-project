@@ -789,9 +789,14 @@ struct CoverageMappingLoadOptions {
   /// Retain evaluated functions in CoverageMapping::Functions.
   bool KeepFunctionRecords = true;
 
-  /// Materialize branch and MC/DC records in each FunctionRecord. Clients
-  /// interested only in code regions can disable this to reduce peak memory.
-  bool LoadBranchAndMCDCRecords = true;
+  /// Materialize branch records, including MC/DC branch regions, without
+  /// evaluating MC/DC decisions.
+  bool LoadBranchRecords = true;
+
+  /// Evaluate and materialize MC/DC branch and decision records. Clients
+  /// interested only in code regions can disable this to avoid the additional
+  /// bitmap evaluation and independence-pair processing.
+  bool LoadMCDCRecords = true;
 
   /// Optional streaming destination for evaluated functions. A consumer is
   /// required when KeepFunctionRecords is false.

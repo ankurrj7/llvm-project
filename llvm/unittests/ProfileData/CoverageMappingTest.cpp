@@ -1276,7 +1276,8 @@ TEST(CoverageMappingTest, ExecutedFunctionsAreFilteredBeforeDecode) {
   CoverageMappingLoadOptions Options;
   Options.LoadExecutedFunctionsOnly = true;
   Options.KeepFunctionRecords = false;
-  Options.LoadBranchAndMCDCRecords = false;
+  Options.LoadBranchRecords = false;
+  Options.LoadMCDCRecords = false;
   Options.FunctionRecordConsumer = &Consumer;
   auto CoverageOrErr =
       CoverageMapping::load(MappingReaders, ProfileReaderRef, Options);

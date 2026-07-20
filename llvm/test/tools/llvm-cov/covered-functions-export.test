@@ -5,6 +5,10 @@
 // RUN:   -o %t.expansions.profdata
 // RUN: llvm-profdata merge %S/Inputs/covered-functions-fragments.proftext \
 // RUN:   -o %t.fragments.profdata
+// RUN: llvm-profdata merge %S/Inputs/branch-c-general.proftext \
+// RUN:   -o %t.branches.profdata
+// RUN: llvm-profdata merge %S/Inputs/mcdc-general.proftext \
+// RUN:   -o %t.mcdc.profdata
 // RUN: yaml2obj %S/Inputs/covered-functions-fragments.yaml \
 // RUN:   -o %t.fragments.o
 // RUN: llvm-cov export --coverage-only --format=covered-functions \
@@ -41,11 +45,30 @@
 // RUN:   --path-equivalence=/tmp/covered-functions-fragment,%S/Inputs \
 // RUN:   %t.fragments.o %S/Inputs/covered-functions-fragment.c 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=REPORT
+// RUN: llvm-cov export --empty-profile --format=covered-functions \
+// RUN:   --path-equivalence=/tmp/coverage,/mapped \
+// RUN:   %S/Inputs/multiple-files.covmapping | FileCheck %s \
+// RUN:   --check-prefix=BASELINE
+// RUN: llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --include-branches --instr-profile=%t.branches.profdata \
+// RUN:   %S/Inputs/branch-c-general.o32l | FileCheck %s \
+// RUN:   --check-prefix=BRANCHES
+// RUN: llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --include-mcdc --instr-profile=%t.mcdc.profdata \
+// RUN:   %S/Inputs/mcdc-general.o | FileCheck %s --check-prefix=MCDC
+// RUN: llvm-cov export --coverage-only --format=covered-functions \
+// RUN:   --include-branches --instr-profile=%t.mcdc.profdata \
+// RUN:   %S/Inputs/mcdc-general.o | FileCheck %s \
+// RUN:   --check-prefix=MCDC-AS-BRANCH
+// RUN: llvm-cov export --empty-profile --format=covered-functions \
+// RUN:   --include-mcdc %S/Inputs/mcdc-general.o | FileCheck %s \
+// RUN:   --check-prefix=MCDC-BASELINE
 // RUN: not llvm-cov export --coverage-only --instr-profile=%t.profdata \
-// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s --check-prefix=PAIR
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=PAIR-COVERAGE
 // RUN: not llvm-cov export --format=covered-functions \
 // RUN:   --instr-profile=%t.profdata %S/Inputs/multiple-files.covmapping 2>&1 \
-// RUN:   | FileCheck %s --check-prefix=PAIR
+// RUN:   | FileCheck %s --check-prefix=PAIR-FORMAT
 // RUN: not llvm-cov export --coverage-only --format=covered-functions \
 // RUN:   --empty-profile %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
 // RUN:   --check-prefix=PROFILE
@@ -53,15 +76,20 @@
 // RUN:   --instr-profile=%t.profdata -name=f2 \
 // RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
 // RUN:   --check-prefix=BAD-FILTER
+// RUN: not llvm-cov export --include-branches --instr-profile=%t.profdata \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-FEATURE
 
-// CHECK:      covered-functions-format 2
+// CHECK:      covered-functions-format 3
+// CHECK-NEXT: mode - execution
+// CHECK-NEXT: features - branches=0 mcdc=0
 // CHECK:      function - "f2"
 // CHECK-NEXT: function-id - "f2" 0x0000000000000000
 // CHECK-NEXT: entry-count - 1
 // CHECK-NEXT: overall-coverage - 1 1 100.00
 // CHECK-NEXT: coverage-body-at - "/mapped/a/f2.c" 1 11
 // CHECK-NEXT: fragment - root "/mapped/a/f2.c" 1 1 100.00
-// CHECK-NEXT: region - 1 1 11 1
+// CHECK-NEXT: region - 1 1 11 1 13 1
 // CHECK-NEXT: end-fragment
 // CHECK-NEXT: end-function
 // CHECK:      function - "f4"
@@ -77,7 +105,9 @@
 // CHECK:      coverage-body-at - "/mapped/f1.c" 1 11
 // CHECK:      fragment - root "/mapped/f1.c" 1 1 100.00
 
-// EMPTY:      covered-functions-format 2
+// EMPTY:      covered-functions-format 3
+// EMPTY-NEXT: mode - execution
+// EMPTY-NEXT: features - branches=0 mcdc=0
 // EMPTY-NOT:  function -
 
 // PARTIAL:      function - "_Z4funcv"
@@ -86,8 +116,8 @@
 // PARTIAL-NEXT: overall-coverage - 2 1 50.00
 // PARTIAL-NEXT: coverage-body-at - "/mapped/showHighlightedRanges.cpp" 3 13
 // PARTIAL-NEXT: fragment - root "/mapped/showHighlightedRanges.cpp" 2 1 50.00
-// PARTIAL-NEXT: region - 1 3 13 1
-// PARTIAL-NEXT: region - 1 5 3 0
+// PARTIAL-NEXT: region - 1 3 13 6 2 1
+// PARTIAL-NEXT: region - 1 5 3 6 2 0
 
 // HEADER:      function - "_Z10sampleFunci"
 // HEADER-NEXT: function-id - "_Z10sampleFunci" 0x000000000000000a
@@ -104,10 +134,10 @@
 // OVERLAP-NEXT: fragment - root "/tmp/ec/combine_expansions.cpp" 1 1 100.00
 // OVERLAP:      fragment - expansion "/tmp/ec/combine_expansions.cpp" 4 4 100.00
 // OVERLAP-NEXT: expansion-at - "/tmp/ec/combine_expansions.cpp" 14 5 1 1 100.00
-// OVERLAP-NEXT: region - 1 7 3 1
+// OVERLAP-NEXT: region - 1 7 3 7 6 1
 // OVERLAP-NEXT: end-expansion
 // OVERLAP-NEXT: expansion-at - "/tmp/ec/combine_expansions.cpp" 14 5 1 1 100.00
-// OVERLAP-NEXT: region - 1 7 3 1
+// OVERLAP-NEXT: region - 1 7 3 7 6 1
 
 // IDENTITY-NOT:   function - "use_
 // IDENTITY:       function - "_ZL2f1v"
@@ -127,15 +157,15 @@
 // FRAGMENTS-NEXT: overall-coverage - 5 4 80.00
 // FRAGMENTS-NEXT: coverage-body-at - "/tmp/covered-functions-fragment/covered-functions-fragment.c" 3 20
 // FRAGMENTS-NEXT: fragment - root "/tmp/covered-functions-fragment/covered-functions-fragment.c" 1 1 100.00
-// FRAGMENTS-NEXT: region - 1 3 20 1
-// FRAGMENTS-NEXT: region - 2 3 29 1
+// FRAGMENTS-NEXT: region - 1 3 20 3 50 1
+// FRAGMENTS-NEXT: region - 2 3 29 3 44 1
 // FRAGMENTS-NEXT: end-fragment
 // FRAGMENTS-NEXT: fragment - expansion "/tmp/covered-functions-fragment/covered-functions-fragment.h" 4 3 75.00
 // FRAGMENTS-NEXT: expansion-at - "/tmp/covered-functions-fragment/covered-functions-fragment.c" 3 29 4 3 75.00
-// FRAGMENTS-NEXT: region - 1 1 28 1
-// FRAGMENTS-NEXT: region - 1 1 29 1
-// FRAGMENTS-NEXT: region - 1 1 39 1
-// FRAGMENTS-NEXT: region - 1 1 49 0
+// FRAGMENTS-NEXT: region - 1 1 28 1 51 1
+// FRAGMENTS-NEXT: region - 1 1 29 1 36 1
+// FRAGMENTS-NEXT: region - 1 1 39 1 46 1
+// FRAGMENTS-NEXT: region - 1 1 49 1 50 0
 // FRAGMENTS-NEXT: end-expansion
 // FRAGMENTS-NEXT: end-fragment
 // FRAGMENTS-NEXT: end-function
@@ -143,6 +173,51 @@
 
 // REPORT: covered{{ +}}5{{ +}}1{{ +}}80.00%
 
-// PAIR: error: --coverage-only must be used with --format=covered-functions
+// BASELINE:      covered-functions-format 3
+// BASELINE-NEXT: mode - baseline
+// BASELINE-NEXT: features - branches=0 mcdc=0
+// BASELINE:      function - "f2"
+// BASELINE-NEXT: function-id - "f2" 0x0000000000000000
+// BASELINE-NEXT: entry-count - 0
+// BASELINE-NEXT: overall-coverage - 1 0 0.00
+// BASELINE:      region - 1 1 11 1 13 0
+// BASELINE:      function - "main"
+// BASELINE-NEXT: function-id - "main" 0x0000000000000000
+// BASELINE-NEXT: entry-count - 0
+// BASELINE-NEXT: overall-coverage - 1 0 0.00
+// BASELINE:      region - 1 1 12 1 14 0
+
+// BRANCHES:      covered-functions-format 3
+// BRANCHES-NEXT: mode - execution
+// BRANCHES-NEXT: features - branches=1 mcdc=0
+// BRANCHES:      function - "simple_loops"
+// BRANCHES:      branch - 9 15 9 22 100 1 0 0
+// BRANCHES:      function - "conditionals"
+// BRANCHES:      branch - 27 9 27 10 0 0 1 1
+
+// MCDC:      covered-functions-format 3
+// MCDC-NEXT: mode - execution
+// MCDC-NEXT: features - branches=0 mcdc=1
+// MCDC:      function - "_Z4testbbbb"
+// MCDC:      mcdc-decision - 12 7 12 27 2 4 4 4 0
+// MCDC:      mcdc-branch - 12 8 12 9 5 2 0 2 1 0 0
+
+// MCDC-AS-BRANCH:      covered-functions-format 3
+// MCDC-AS-BRANCH-NEXT: mode - execution
+// MCDC-AS-BRANCH-NEXT: features - branches=1 mcdc=0
+// MCDC-AS-BRANCH:      function - "_Z4testbbbb"
+// MCDC-AS-BRANCH:      branch - 12 8 12 9 5 2 0 0
+// MCDC-AS-BRANCH-NOT:  {{^}}mcdc-
+
+// MCDC-BASELINE:      covered-functions-format 3
+// MCDC-BASELINE-NEXT: mode - baseline
+// MCDC-BASELINE-NEXT: features - branches=0 mcdc=1
+// MCDC-BASELINE:      function - "_Z4testbbbb"
+// MCDC-BASELINE:      mcdc-decision - 12 7 12 27 0 0 4 0 0
+// MCDC-BASELINE:      mcdc-branch - 12 8 12 9 0 0 0 2 1 0 0
+
+// PAIR-COVERAGE: error: --coverage-only requires --format=covered-functions
+// PAIR-FORMAT: error: --format=covered-functions requires either --coverage-only with --instr-profile or --empty-profile
 // PROFILE: error: --coverage-only requires --instr-profile
-// BAD-FILTER: error: --coverage-only does not support source, function, summary, demangler, or skip filters
+// BAD-FILTER: error: covered-functions export does not support source, function, summary, demangler, or skip filters
+// BAD-FEATURE: error: --include-branches and --include-mcdc require --format=covered-functions
