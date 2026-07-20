@@ -716,9 +716,17 @@ ArrayRef<unsigned> CoverageMapping::getImpreciseRecordIndicesForFilename(
 }
 
 static unsigned getMaxCounterID(const CounterMappingContext &Ctx,
-                                const CoverageMappingRecord &Record) {
+                                const CoverageMappingRecord &Record,
+                                bool LoadBranchRecords,
+                                bool LoadMCDCRecords) {
   unsigned MaxCounterID = 0;
   for (const auto &Region : Record.MappingRegions) {
+    if (Region.Kind == CounterMappingRegion::BranchRegion &&
+        !LoadBranchRecords)
+      continue;
+    if (Region.Kind == CounterMappingRegion::MCDCBranchRegion &&
+        !LoadBranchRecords && !LoadMCDCRecords)
+      continue;
     MaxCounterID = std::max(MaxCounterID, Ctx.getMaxCounterID(Region.Count));
     if (Region.isBranch())
       MaxCounterID =
@@ -787,7 +795,8 @@ struct CountedRegionEmitter {
   CounterMappingContext &Ctx;
   FunctionRecord &Function;
   bool IsVersion11;
-  bool LoadBranchAndMCDCRecords;
+  bool LoadBranchRecords;
+  bool LoadMCDCRecords;
 
   /// Evaluated Counters.
   std::map<Counter, uint64_t> CounterValues;
@@ -812,9 +821,10 @@ struct CountedRegionEmitter {
 
   CountedRegionEmitter(const CoverageMappingRecord &Record,
                        CounterMappingContext &Ctx, FunctionRecord &Function,
-                       bool IsVersion11, bool LoadBranchAndMCDCRecords)
+                       bool IsVersion11, bool LoadBranchRecords,
+                       bool LoadMCDCRecords)
       : Record(Record), Ctx(Ctx), Function(Function), IsVersion11(IsVersion11),
-        LoadBranchAndMCDCRecords(LoadBranchAndMCDCRecords),
+        LoadBranchRecords(LoadBranchRecords), LoadMCDCRecords(LoadMCDCRecords),
         Files(Record.Filenames.size()) {
     // Scan MappingRegions and mark each last index by FileID.
     for (auto [I, Region] : enumerate(Record.MappingRegions)) {
@@ -860,11 +870,15 @@ struct CountedRegionEmitter {
         if (auto E = walk(Region.ExpandedFileID))
           return E;
 
-      if (LoadBranchAndMCDCRecords || !Region.isBranch())
+      bool LoadRegion =
+          !Region.isBranch() || LoadBranchRecords ||
+          (Region.Kind == CounterMappingRegion::MCDCBranchRegion &&
+           LoadMCDCRecords);
+      if (LoadRegion)
         if (auto E = evaluateAndCacheCounter(Region.Count))
           return E;
 
-      if (LoadBranchAndMCDCRecords) {
+      if (LoadMCDCRecords) {
         if (Region.Kind == CounterMappingRegion::MCDCDecisionRegion) {
           // Start the new Decision on the stack.
           DecisionStack.emplace_back(Region);
@@ -888,7 +902,7 @@ struct CountedRegionEmitter {
 
       // Evaluate FalseCount
       // It may have the Counter in Branches, or Zero.
-      if (LoadBranchAndMCDCRecords)
+      if (LoadRegion)
         if (auto E = evaluateAndCacheCounter(Region.FalseCount))
           return E;
     }
@@ -913,7 +927,11 @@ struct CountedRegionEmitter {
     for (const auto &Region : Record.MappingRegions) {
       if (Region.Kind == CounterMappingRegion::MCDCDecisionRegion)
         continue; // Don't emit.
-      if (!LoadBranchAndMCDCRecords && Region.isBranch())
+      if (Region.Kind == CounterMappingRegion::BranchRegion &&
+          !LoadBranchRecords)
+        continue;
+      if (Region.Kind == CounterMappingRegion::MCDCBranchRegion &&
+          !LoadBranchRecords && !LoadMCDCRecords)
         continue;
       // Adopt values from the CounterValues.
       // FalseCount may be Zero unless Branches.
@@ -983,6 +1001,12 @@ Error CoverageMapping::loadFunctionRecord(
   CounterMappingContext Ctx(Record.Expressions);
 
   std::vector<uint64_t> Counts;
+  auto SetZeroCounts = [&] {
+    unsigned MaxCounterID =
+        getMaxCounterID(Ctx, Record, Options.LoadBranchRecords,
+                        Options.LoadMCDCRecords);
+    Counts.assign(MaxCounterID + 1, 0);
+  };
   if (ProfileRecord) {
     Counts = std::move(ProfileRecord->Counts);
   } else if (ProfileReader) {
@@ -996,10 +1020,10 @@ Error CoverageMapping::loadFunctionRecord(
       }
       if (IPE != instrprof_error::unknown_function)
         return make_error<InstrProfError>(IPE);
-      Counts.assign(getMaxCounterID(Ctx, Record) + 1, 0);
+      SetZeroCounts();
     }
   } else {
-    Counts.assign(getMaxCounterID(Ctx, Record) + 1, 0);
+    SetZeroCounts();
   }
   Ctx.setCounts(Counts);
 
@@ -1008,38 +1032,40 @@ Error CoverageMapping::loadFunctionRecord(
                            IndexedInstrProf::ProfVersion::Version12;
 
   BitVector Bitmap;
-  if (ProfileRecord) {
-    ArrayRef<uint8_t> BitmapBytes = ProfileRecord->BitmapBytes;
-    size_t I = 0, E = BitmapBytes.size();
-    Bitmap.resize(E * CHAR_BIT);
-    BitVector::apply(
-        [&](auto X) {
-          using XTy = decltype(X);
-          alignas(XTy) uint8_t W[sizeof(XTy)];
-          size_t N = std::min(E - I, sizeof(W));
-          std::memset(W, 0, sizeof(W));
-          std::memcpy(W, &BitmapBytes[I], N);
-          I += N;
-          return support::endian::read<XTy, support::aligned>(
-              W, llvm::endianness::little);
-        },
-        Bitmap, Bitmap);
-    assert(I == E);
-  } else if (ProfileReader) {
-    if (Error E = ProfileReader.value().get().getFunctionBitmap(
-            Record.FunctionName, Record.FunctionHash, Bitmap)) {
-      instrprof_error IPE = std::get<0>(InstrProfError::take(std::move(E)));
-      if (IPE == instrprof_error::hash_mismatch) {
-        FuncHashMismatches.emplace_back(std::string(Record.FunctionName),
-                                        Record.FunctionHash);
-        return Error::success();
+  if (Options.LoadMCDCRecords) {
+    if (ProfileRecord) {
+      ArrayRef<uint8_t> BitmapBytes = ProfileRecord->BitmapBytes;
+      size_t I = 0, E = BitmapBytes.size();
+      Bitmap.resize(E * CHAR_BIT);
+      BitVector::apply(
+          [&](auto X) {
+            using XTy = decltype(X);
+            alignas(XTy) uint8_t W[sizeof(XTy)];
+            size_t N = std::min(E - I, sizeof(W));
+            std::memset(W, 0, sizeof(W));
+            std::memcpy(W, &BitmapBytes[I], N);
+            I += N;
+            return support::endian::read<XTy, support::aligned>(
+                W, llvm::endianness::little);
+          },
+          Bitmap, Bitmap);
+      assert(I == E);
+    } else if (ProfileReader) {
+      if (Error E = ProfileReader.value().get().getFunctionBitmap(
+              Record.FunctionName, Record.FunctionHash, Bitmap)) {
+        instrprof_error IPE = std::get<0>(InstrProfError::take(std::move(E)));
+        if (IPE == instrprof_error::hash_mismatch) {
+          FuncHashMismatches.emplace_back(std::string(Record.FunctionName),
+                                          Record.FunctionHash);
+          return Error::success();
+        }
+        if (IPE != instrprof_error::unknown_function)
+          return make_error<InstrProfError>(IPE);
+        Bitmap = BitVector(getMaxBitmapSize(Record, IsVersion11));
       }
-      if (IPE != instrprof_error::unknown_function)
-        return make_error<InstrProfError>(IPE);
-      Bitmap = BitVector(getMaxBitmapSize(Record, IsVersion11));
+    } else {
+      Bitmap = BitVector(getMaxBitmapSize(Record, false));
     }
-  } else {
-    Bitmap = BitVector(getMaxBitmapSize(Record, false));
   }
   Ctx.setBitmap(std::move(Bitmap));
 
@@ -1058,7 +1084,8 @@ Error CoverageMapping::loadFunctionRecord(
 
   // Emit CountedRegions into FunctionRecord.
   if (auto E = CountedRegionEmitter(Record, Ctx, Function, IsVersion11,
-                                    Options.LoadBranchAndMCDCRecords)
+                                    Options.LoadBranchRecords,
+                                    Options.LoadMCDCRecords)
                    .emitCountedRegions()) {
     errs() << "warning: " << Record.FunctionName << ": ";
     logAllUnhandledErrors(std::move(E), errs());

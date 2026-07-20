@@ -506,12 +506,113 @@ DESCRIPTION
 ^^^^^^^^^^^
 
 The :program:`llvm-cov export` command exports coverage data of the binaries
-*BIN*... using the profile data *PROFILE* in either JSON or lcov trace file
-format.
+*BIN*... using the profile data *PROFILE* in JSON, lcov trace file, or covered
+functions format.
 
 When exporting JSON, the regions, functions, branches, expansions, and
 summaries of the coverage data will be exported. When exporting an lcov trace
 file, the line-based coverage, branch coverage, and summaries will be exported.
+
+The covered functions format is a versioned, function-oriented streaming
+format intended for scalable coverage processing. It has two modes:
+
+* ``-empty-profile -format=covered-functions`` emits a complete baseline of
+  every mapped function, file fragment, and region with zero counts.
+* ``-coverage-only`` with ``-instr-profile=<PROFILE>`` and
+  ``-format=covered-functions`` emits a sparse execution report containing
+  only functions and file fragments with executed code regions.
+
+Both modes use bounded-memory streaming and an external sort. A baseline and
+an execution report generated from the same binaries can therefore be joined
+by the ``function-id`` and fragment identity without loading the complete
+reports into memory. A source file with no coverage mapping has no record in
+the baseline.
+
+The output begins with a version, mode, and feature declaration:
+
+.. code-block:: text
+
+  covered-functions-format 3
+  mode - <baseline|execution>
+  features - branches=<0|1> mcdc=<0|1>
+
+The default feature values are both zero. Branch and MC/DC records are only
+decoded and emitted when explicitly requested with ``-include-branches`` or
+``-include-mcdc``, respectively.
+
+Each function and source fragment is delimited explicitly:
+
+.. code-block:: text
+
+  function - "<display-name>"
+  function-id - "<raw-profile-name>" <function-hash>
+  entry-count - <count>
+  overall-coverage - <code-regions> <covered-code-regions> <percentage>
+  coverage-body-at - "<root-file>" <line> <column>
+  fragment - <root|expansion> "<file>" \
+             <code-regions> <covered-code-regions> <percentage>
+  expansion-at - "<parent-file>" <line> <column> \
+                 <code-regions> <covered-code-regions> <percentage>
+  ... region records ...
+  end-expansion
+  end-fragment
+  end-function
+
+``function-id`` is the stable identity within reports generated from the same
+binary set. It disambiguates static functions, template instantiations, and
+other functions that share a display name. ``expansion-at`` is emitted only
+inside an expansion fragment.
+
+A region record has the following form, where line and column numbers are
+one-based and the end location is exclusive:
+
+.. code-block:: text
+
+  region - <kind> <start-line> <start-column> <end-line> <end-column> <count>
+
+Region kinds are stable, one-based values:
+
+* ``1`` -- code region
+* ``2`` -- macro or include expansion region
+* ``3`` -- skipped, non-coverable region
+* ``4`` -- gap metadata used while rendering coverage
+
+Only kind ``1`` contributes to the code-region totals and percentages in
+``overall-coverage``, ``fragment``, and ``expansion-at`` records. In
+particular, a zero execution count on a kind ``3`` record does not mean that
+its source line is uncovered. Kind ``3`` records commonly begin on blank or
+preprocessor-skipped lines. Kind ``4`` records are not independent executable
+statements.
+
+Branch records use this form:
+
+.. code-block:: text
+
+  branch - <start-line> <start-column> <end-line> <end-column> \
+           <true-count> <false-count> <true-folded> <false-folded>
+
+The folded fields are ``0`` or ``1``. MC/DC records use these forms:
+
+.. code-block:: text
+
+  mcdc-decision - <start-line> <start-column> <end-line> <end-column> \
+                  <true-decisions> <false-decisions> <conditions> \
+                  <covered-conditions> <folded-conditions>
+  mcdc-branch - <start-line> <start-column> <end-line> <end-column> \
+                <true-count> <false-count> <condition-id> \
+                <true-next-id> <false-next-id> <true-folded> <false-folded>
+
+A next-condition ID of ``-1`` means that evaluation of that outcome completes
+the decision. MC/DC coverage is computed with the same independence-pair rules
+as the JSON and rendered reports. Test vectors are intentionally not included
+in the covered functions format. When both optional features are enabled, an
+MC/DC condition has a ``branch`` record for branch consumers and an
+``mcdc-branch`` record carrying its condition graph identity.
+
+The covered functions format preserves exact source ranges, but it is not a
+line coverage report. Skipped regions and gap regions must not be interpreted
+as uncovered lines. Consumers that need rendered line status should use
+:program:`llvm-cov show`, the JSON export, or the lcov export.
 
 The exported data can optionally be filtered to only export the coverage
 for the files listed in *SOURCE*....
@@ -532,7 +633,27 @@ OPTIONS
 .. option:: -format=<FORMAT>
 
  Use the specified output format. The supported formats are: "text" (JSON),
- "lcov".
+ "lcov", and "covered-functions". The "covered-functions" format requires
+ either ``-empty-profile`` for a baseline or ``-coverage-only`` with
+ ``-instr-profile`` for an execution report.
+
+.. option:: -coverage-only
+
+ Export the versioned covered functions format while decoding only executed
+ functions. This option must be used with ``-format=covered-functions`` and
+ requires ``-instr-profile``. Source, function, summary, demangler, and skip
+ filters are not supported in this mode.
+
+.. option:: -include-branches
+
+ Include branch records in covered functions output. This includes branch
+ outcomes from MC/DC-instrumented code, but does not perform MC/DC decision or
+ independence-pair processing. Branch records are omitted by default.
+
+.. option:: -include-mcdc
+
+ Include MC/DC decision and condition records in covered functions output.
+ MC/DC evaluation and records are omitted by default.
 
 .. option:: -summary-only
 

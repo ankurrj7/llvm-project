@@ -1358,6 +1358,16 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
       cl::desc("Export only functions with executed coverage data"),
       cl::cat(ExportCategory));
 
+  cl::opt<bool> IncludeBranches(
+      "include-branches", cl::Optional,
+      cl::desc("Include branch records in covered-functions output"),
+      cl::cat(ExportCategory));
+
+  cl::opt<bool> IncludeMCDC(
+      "include-mcdc", cl::Optional,
+      cl::desc("Include MC/DC records in covered-functions output"),
+      cl::cat(ExportCategory));
+
   auto Err = commandLineParser(argc, argv);
   if (Err)
     return Err;
@@ -1370,8 +1380,23 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
 
   bool IsCoveredFunctions =
       ViewOpts.Format == CoverageViewOptions::OutputFormat::CoveredFunctions;
-  if (CoverageOnly != IsCoveredFunctions) {
-    error("--coverage-only must be used with --format=covered-functions");
+  bool IsCoveredFunctionsBaseline = IsCoveredFunctions && !PGOFilename;
+  if (CoverageOnly && !IsCoveredFunctions) {
+    error("--coverage-only requires --format=covered-functions");
+    return 1;
+  }
+  if (IsCoveredFunctionsBaseline && CoverageOnly) {
+    error("--coverage-only requires --instr-profile");
+    return 1;
+  }
+  if (IsCoveredFunctions && !CoverageOnly && !IsCoveredFunctionsBaseline) {
+    error("--format=covered-functions requires either --coverage-only with "
+          "--instr-profile or --empty-profile");
+    return 1;
+  }
+  if (!IsCoveredFunctions && (IncludeBranches || IncludeMCDC)) {
+    error("--include-branches and --include-mcdc require "
+          "--format=covered-functions");
     return 1;
   }
 
@@ -1391,28 +1416,32 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
     }
   }
 
-  if (CoverageOnly) {
-    if (!PGOFilename) {
-      error("--coverage-only requires --instr-profile");
-      return 1;
-    }
+  if (IsCoveredFunctions) {
     if (!SourceFiles.empty() || !Filters.empty() || ViewOpts.hasDemangler() ||
         ViewOpts.ExportSummaryOnly || SkipExpansions || SkipFunctions ||
         SkipBranches || ShowMCDCNonExecutedVectors) {
-      error("--coverage-only does not support source, function, summary, "
-            "demangler, or skip filters");
+      error("covered-functions export does not support source, function, "
+            "summary, demangler, or skip filters");
       return 1;
     }
 
     ArrayRef<std::pair<std::string, std::string>> Remappings;
     if (PathRemappings)
       Remappings = *PathRemappings;
+    CoveredFunctionsExportOptions ExportOptions;
+    ExportOptions.ExportMode =
+        IsCoveredFunctionsBaseline
+            ? CoveredFunctionsExportOptions::Mode::Baseline
+            : CoveredFunctionsExportOptions::Mode::Execution;
+    ExportOptions.IncludeBranches = IncludeBranches;
+    ExportOptions.IncludeMCDC = IncludeMCDC;
     CoverageExporterCoveredFunctions Exporter(outs(), Remappings,
-                                              FilenameFilters);
+                                              FilenameFilters, ExportOptions);
     CoverageMappingLoadOptions LoadOptions;
-    LoadOptions.LoadExecutedFunctionsOnly = true;
+    LoadOptions.LoadExecutedFunctionsOnly = CoverageOnly;
     LoadOptions.KeepFunctionRecords = false;
-    LoadOptions.LoadBranchAndMCDCRecords = false;
+    LoadOptions.LoadBranchRecords = IncludeBranches;
+    LoadOptions.LoadMCDCRecords = IncludeMCDC;
     LoadOptions.FunctionRecordConsumer = &Exporter;
 
     auto FS = vfs::getRealFileSystem();

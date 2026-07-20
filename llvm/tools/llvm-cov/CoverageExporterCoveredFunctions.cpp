@@ -40,6 +40,9 @@ constexpr size_t MergeFanIn = 16;
 constexpr size_t MaxRegionsPerFragmentChunk = 16 * 1024;
 // The report format uses stable one-based region kind values.
 constexpr uint32_t ReportCodeRegionKind = 1;
+constexpr uint32_t ReportBranchRegionKind = 5;
+constexpr uint32_t ReportMCDCDecisionRegionKind = 6;
+constexpr uint32_t ReportMCDCBranchRegionKind = 7;
 
 std::optional<uint32_t>
 getReportRegionKind(CounterMappingRegion::RegionKind Kind) {
@@ -67,12 +70,23 @@ struct FragmentRegion {
   uint32_t LineEnd;
   uint32_t ColumnEnd;
   uint64_t ExecutionCount;
+  uint64_t FalseExecutionCount = 0;
+  int32_t ConditionID = -1;
+  int32_t TrueConditionID = -1;
+  int32_t FalseConditionID = -1;
+  bool TrueFolded = false;
+  bool FalseFolded = false;
 
   bool operator<(const FragmentRegion &Other) const {
     return std::tie(LineStart, ColumnStart, Kind, LineEnd, ColumnEnd,
-                    ExecutionCount) <
+                    ExecutionCount, FalseExecutionCount, ConditionID,
+                    TrueConditionID, FalseConditionID, TrueFolded,
+                    FalseFolded) <
            std::tie(Other.LineStart, Other.ColumnStart, Other.Kind,
-                    Other.LineEnd, Other.ColumnEnd, Other.ExecutionCount);
+                    Other.LineEnd, Other.ColumnEnd, Other.ExecutionCount,
+                    Other.FalseExecutionCount, Other.ConditionID,
+                    Other.TrueConditionID, Other.FalseConditionID,
+                    Other.TrueFolded, Other.FalseFolded);
   }
 };
 
@@ -180,6 +194,12 @@ Error writeFragment(raw_ostream &OS, const FunctionFragment &Fragment) {
     writePod(OS, Region.LineEnd);
     writePod(OS, Region.ColumnEnd);
     writePod(OS, Region.ExecutionCount);
+    writePod(OS, Region.FalseExecutionCount);
+    writePod(OS, Region.ConditionID);
+    writePod(OS, Region.TrueConditionID);
+    writePod(OS, Region.FalseConditionID);
+    writePod(OS, Region.TrueFolded);
+    writePod(OS, Region.FalseFolded);
   }
   return Error::success();
 }
@@ -328,6 +348,18 @@ public:
         return R.takeError();
       if (Expected<bool> R = readPod(Region.ExecutionCount, false); !R)
         return R.takeError();
+      if (Expected<bool> R = readPod(Region.FalseExecutionCount, false); !R)
+        return R.takeError();
+      if (Expected<bool> R = readPod(Region.ConditionID, false); !R)
+        return R.takeError();
+      if (Expected<bool> R = readPod(Region.TrueConditionID, false); !R)
+        return R.takeError();
+      if (Expected<bool> R = readPod(Region.FalseConditionID, false); !R)
+        return R.takeError();
+      if (Expected<bool> R = readPod(Region.TrueFolded, false); !R)
+        return R.takeError();
+      if (Expected<bool> R = readPod(Region.FalseFolded, false); !R)
+        return R.takeError();
     }
     return true;
   }
@@ -405,6 +437,7 @@ class CoverageExporterCoveredFunctions::Implementation {
 
   raw_ostream &OS;
   const CoverageFilters &FilenameFilters;
+  const CoveredFunctionsExportOptions Options;
   std::vector<PathRemapping> PathRemappings;
   std::unique_ptr<ToolOutputFile> Spool;
   bool Finished = false;
@@ -524,7 +557,12 @@ class CoverageExporterCoveredFunctions::Implementation {
   }
 
   Error renderRuns(ArrayRef<ToolOutputFile *> Runs) {
-    OS << "covered-functions-format 2\n";
+    OS << "covered-functions-format 3\nmode - "
+       << (Options.ExportMode == CoveredFunctionsExportOptions::Mode::Baseline
+               ? "baseline"
+               : "execution")
+       << "\nfeatures - branches=" << unsigned(Options.IncludeBranches)
+       << " mcdc=" << unsigned(Options.IncludeMCDC) << '\n';
     std::string CurrentRootFilename;
     std::string CurrentRawFunctionName;
     uint64_t CurrentFunctionHash = 0;
@@ -628,9 +666,38 @@ class CoverageExporterCoveredFunctions::Implementation {
            << '\n';
       }
 
-      for (const FragmentRegion &Region : Fragment.Regions)
-        OS << "region - " << Region.Kind << ' ' << Region.LineStart << ' '
-           << Region.ColumnStart << ' ' << Region.ExecutionCount << '\n';
+      for (const FragmentRegion &Region : Fragment.Regions) {
+        if (Region.Kind <= 4) {
+          OS << "region - " << Region.Kind << ' ' << Region.LineStart << ' '
+             << Region.ColumnStart << ' ' << Region.LineEnd << ' '
+             << Region.ColumnEnd << ' ' << Region.ExecutionCount << '\n';
+          continue;
+        }
+        if (Region.Kind == ReportBranchRegionKind) {
+          OS << "branch - " << Region.LineStart << ' ' << Region.ColumnStart
+             << ' ' << Region.LineEnd << ' ' << Region.ColumnEnd << ' '
+             << Region.ExecutionCount << ' ' << Region.FalseExecutionCount
+             << ' ' << unsigned(Region.TrueFolded) << ' '
+             << unsigned(Region.FalseFolded) << '\n';
+          continue;
+        }
+        if (Region.Kind == ReportMCDCDecisionRegionKind) {
+          OS << "mcdc-decision - " << Region.LineStart << ' '
+             << Region.ColumnStart << ' ' << Region.LineEnd << ' '
+             << Region.ColumnEnd << ' ' << Region.ExecutionCount << ' '
+             << Region.FalseExecutionCount << ' ' << Region.ConditionID << ' '
+             << Region.TrueConditionID << ' ' << Region.FalseConditionID
+             << '\n';
+          continue;
+        }
+        assert(Region.Kind == ReportMCDCBranchRegionKind);
+        OS << "mcdc-branch - " << Region.LineStart << ' ' << Region.ColumnStart
+           << ' ' << Region.LineEnd << ' ' << Region.ColumnEnd << ' '
+           << Region.ExecutionCount << ' ' << Region.FalseExecutionCount << ' '
+           << Region.ConditionID << ' ' << Region.TrueConditionID << ' '
+           << Region.FalseConditionID << ' ' << unsigned(Region.TrueFolded)
+           << ' ' << unsigned(Region.FalseFolded) << '\n';
+      }
       return Error::success();
     });
     if (E)
@@ -647,8 +714,9 @@ class CoverageExporterCoveredFunctions::Implementation {
 public:
   Implementation(raw_ostream &OS,
                  ArrayRef<std::pair<std::string, std::string>> Remappings,
-                 const CoverageFilters &FilenameFilters)
-      : OS(OS), FilenameFilters(FilenameFilters) {
+                 const CoverageFilters &FilenameFilters,
+                 CoveredFunctionsExportOptions Options)
+      : OS(OS), FilenameFilters(FilenameFilters), Options(Options) {
     PathRemappings.reserve(Remappings.size());
     for (const auto &[From, To] : Remappings)
       PathRemappings.push_back(
@@ -736,20 +804,20 @@ public:
 
     std::vector<std::unique_ptr<FunctionFragment>> Fragments(
         Function.Filenames.size());
-    for (const CountedRegion &Region : Function.CountedRegions) {
-      std::optional<uint32_t> ReportKind = getReportRegionKind(Region.Kind);
-      if (!ReportKind)
-        continue;
+    auto getOrCreateFragment = [&](const CounterMappingRegion &Region)
+        -> Expected<FunctionFragment *> {
+      if (Region.FileID >= Function.Filenames.size())
+        return make_error<CoverageMapError>(coveragemap_error::malformed,
+                                            "invalid coverage FileID");
       StringRef Filename = Function.Filenames[Region.FileID];
       if (FilenameFilters.matchesFilename(Filename))
-        continue;
-      std::string OutputFilename = remapPath(Filename);
+        return nullptr;
       std::unique_ptr<FunctionFragment> &FragmentStorage =
           Fragments[Region.FileID];
       if (!FragmentStorage) {
         FragmentStorage = std::make_unique<FunctionFragment>();
         FunctionFragment &Fragment = *FragmentStorage;
-        Fragment.Filename = OutputFilename;
+        Fragment.Filename = remapPath(Filename);
         Fragment.CoverageRootFilename = CoverageRootFilename;
         Fragment.DisplayName = Function.Name;
         Fragment.RawFunctionName = RawFunctionName.str();
@@ -774,30 +842,107 @@ public:
           Fragment.ExpansionSiteColumn = Site->Column;
         }
       }
-      FunctionFragment &Fragment = *FragmentStorage;
-      Fragment.Regions.push_back({*ReportKind, Region.LineStart,
-                                  Region.ColumnStart, Region.LineEnd,
-                                  Region.ColumnEnd, Region.ExecutionCount});
+      return FragmentStorage.get();
+    };
+
+    for (const CountedRegion &Region : Function.CountedRegions) {
+      std::optional<uint32_t> ReportKind = getReportRegionKind(Region.Kind);
+      if (!ReportKind)
+        continue;
+      Expected<FunctionFragment *> FragmentOrErr = getOrCreateFragment(Region);
+      if (!FragmentOrErr)
+        return FragmentOrErr.takeError();
+      FunctionFragment *Fragment = *FragmentOrErr;
+      if (!Fragment)
+        continue;
+      Fragment->Regions.push_back({*ReportKind, Region.LineStart,
+                                   Region.ColumnStart, Region.LineEnd,
+                                   Region.ColumnEnd, Region.ExecutionCount});
       if (Region.Kind == CounterMappingRegion::CodeRegion &&
-          (Fragment.SortLine == 0 ||
+          (Fragment->SortLine == 0 ||
            std::tie(Region.LineStart, Region.ColumnStart) <
-               std::tie(Fragment.SortLine, Fragment.SortColumn))) {
-        Fragment.SortLine = Region.LineStart;
-        Fragment.SortColumn = Region.ColumnStart;
+               std::tie(Fragment->SortLine, Fragment->SortColumn))) {
+        Fragment->SortLine = Region.LineStart;
+        Fragment->SortColumn = Region.ColumnStart;
       }
     }
 
-    for (std::unique_ptr<FunctionFragment> &Fragment : Fragments) {
+    for (const CountedRegion &Region : Function.CountedBranchRegions) {
+      Expected<FunctionFragment *> FragmentOrErr = getOrCreateFragment(Region);
+      if (!FragmentOrErr)
+        return FragmentOrErr.takeError();
+      FunctionFragment *Fragment = *FragmentOrErr;
       if (!Fragment)
         continue;
-      bool HasCoveredCodeRegion =
-          llvm::any_of(Fragment->Regions, [](const FragmentRegion &Region) {
-            return Region.Kind == ReportCodeRegionKind &&
-                   Region.ExecutionCount != 0;
-          });
-      if (!HasCoveredCodeRegion)
-        Fragment.reset();
+
+      auto appendBranch = [&](uint32_t ReportKind) {
+        FragmentRegion OutputRegion{ReportKind,         Region.LineStart,
+                                    Region.ColumnStart, Region.LineEnd,
+                                    Region.ColumnEnd,   Region.ExecutionCount};
+        OutputRegion.FalseExecutionCount = Region.FalseExecutionCount;
+        OutputRegion.TrueFolded = Region.TrueFolded;
+        OutputRegion.FalseFolded = Region.FalseFolded;
+        if (ReportKind == ReportMCDCBranchRegionKind) {
+          const mcdc::BranchParameters &Params = Region.getBranchParams();
+          OutputRegion.ConditionID = Params.ID;
+          OutputRegion.FalseConditionID = Params.Conds[0];
+          OutputRegion.TrueConditionID = Params.Conds[1];
+        }
+        Fragment->Regions.push_back(OutputRegion);
+      };
+
+      if (Options.IncludeBranches)
+        appendBranch(ReportBranchRegionKind);
+      if (Region.Kind == CounterMappingRegion::MCDCBranchRegion &&
+          Options.IncludeMCDC)
+        appendBranch(ReportMCDCBranchRegionKind);
     }
+
+    if (Options.IncludeMCDC)
+      for (MCDCRecord &Record : Function.MCDCRecords) {
+        const CounterMappingRegion &Region = Record.getDecisionRegion();
+        Expected<FunctionFragment *> FragmentOrErr =
+            getOrCreateFragment(Region);
+        if (!FragmentOrErr)
+          return FragmentOrErr.takeError();
+        FunctionFragment *Fragment = *FragmentOrErr;
+        if (!Fragment)
+          continue;
+
+        auto [TrueDecisions, FalseDecisions] = Record.getDecisions();
+        unsigned CoveredConditions = 0;
+        unsigned FoldedConditions = 0;
+        for (unsigned I = 0; I != Record.getNumConditions(); ++I) {
+          if (Record.isCondFolded(I))
+            ++FoldedConditions;
+          else if (Record.isConditionIndependencePairCovered(I))
+            ++CoveredConditions;
+        }
+        FragmentRegion OutputRegion{ReportMCDCDecisionRegionKind,
+                                    Region.LineStart,
+                                    Region.ColumnStart,
+                                    Region.LineEnd,
+                                    Region.ColumnEnd,
+                                    TrueDecisions};
+        OutputRegion.FalseExecutionCount = FalseDecisions;
+        OutputRegion.ConditionID = Record.getNumConditions();
+        OutputRegion.TrueConditionID = CoveredConditions;
+        OutputRegion.FalseConditionID = FoldedConditions;
+        Fragment->Regions.push_back(OutputRegion);
+      }
+
+    if (Options.ExportMode == CoveredFunctionsExportOptions::Mode::Execution)
+      for (std::unique_ptr<FunctionFragment> &Fragment : Fragments) {
+        if (!Fragment)
+          continue;
+        bool HasCoveredCodeRegion =
+            llvm::any_of(Fragment->Regions, [](const FragmentRegion &Region) {
+              return Region.Kind == ReportCodeRegionKind &&
+                     Region.ExecutionCount != 0;
+            });
+        if (!HasCoveredCodeRegion)
+          Fragment.reset();
+      }
     if (llvm::none_of(Fragments,
                       [](const auto &Fragment) { return bool(Fragment); }))
       return Error::success();
@@ -872,9 +1017,10 @@ public:
 CoverageExporterCoveredFunctions::CoverageExporterCoveredFunctions(
     raw_ostream &OS,
     ArrayRef<std::pair<std::string, std::string>> PathRemappings,
-    const CoverageFilters &FilenameFilters)
-    : Impl(std::make_unique<Implementation>(OS, PathRemappings,
-                                            FilenameFilters)) {}
+    const CoverageFilters &FilenameFilters,
+    CoveredFunctionsExportOptions Options)
+    : Impl(std::make_unique<Implementation>(OS, PathRemappings, FilenameFilters,
+                                            Options)) {}
 
 CoverageExporterCoveredFunctions::~CoverageExporterCoveredFunctions() = default;
 
