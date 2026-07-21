@@ -9,6 +9,7 @@
 #include "llvm/ProfileData/Coverage/CoverageMapping.h"
 #include "llvm/ProfileData/Coverage/CoverageMappingReader.h"
 #include "llvm/ProfileData/Coverage/CoverageMappingWriter.h"
+#include "llvm/ProfileData/InstrProf.h"
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/raw_ostream.h"
@@ -56,8 +57,8 @@ void PrintTo(const CoverageSegment &S, ::std::ostream *os) {
     *os << S.Count << ", ";
   *os << (S.IsRegionEntry ? "true" : "false") << ")";
 }
-}
-}
+} // namespace coverage
+} // namespace llvm
 
 namespace {
 
@@ -336,7 +337,7 @@ TEST_P(CoverageMappingTest, basic_write_read) {
   startFunction("func", 0x1234);
   addCMR(Counter::getCounter(0), "foo", 1, 1, 1, 1);
   addCMR(Counter::getCounter(1), "foo", 2, 1, 2, 2);
-  addCMR(Counter::getZero(),     "foo", 3, 1, 3, 4);
+  addCMR(Counter::getZero(), "foo", 3, 1, 3, 4);
   addCMR(Counter::getCounter(2), "foo", 4, 1, 4, 8);
   addCMR(Counter::getCounter(3), "bar", 1, 2, 3, 4);
 
@@ -731,13 +732,13 @@ TEST_P(CoverageMappingTest, basic_coverage_iteration) {
   CoverageData Data = LoadedCoverage->getCoverageForFile("file1");
   std::vector<CoverageSegment> Segments(Data.begin(), Data.end());
   ASSERT_EQ(7U, Segments.size());
-  ASSERT_EQ(CoverageSegment(1, 1, 20, true),  Segments[0]);
+  ASSERT_EQ(CoverageSegment(1, 1, 20, true), Segments[0]);
   ASSERT_EQ(CoverageSegment(4, 7, 30, false), Segments[1]);
-  ASSERT_EQ(CoverageSegment(5, 8, 10, true),  Segments[2]);
+  ASSERT_EQ(CoverageSegment(5, 8, 10, true), Segments[2]);
   ASSERT_EQ(CoverageSegment(9, 1, 30, false), Segments[3]);
-  ASSERT_EQ(CoverageSegment(9, 9, false),     Segments[4]);
+  ASSERT_EQ(CoverageSegment(9, 9, false), Segments[4]);
   ASSERT_EQ(CoverageSegment(10, 10, 0, true), Segments[5]);
-  ASSERT_EQ(CoverageSegment(11, 11, false),   Segments[6]);
+  ASSERT_EQ(CoverageSegment(11, 11, false), Segments[6]);
 }
 
 TEST_P(CoverageMappingTest, test_line_coverage_iterator) {
@@ -786,7 +787,7 @@ TEST_P(CoverageMappingTest, uncovered_function) {
   std::vector<CoverageSegment> Segments(Data.begin(), Data.end());
   ASSERT_EQ(2U, Segments.size());
   ASSERT_EQ(CoverageSegment(1, 2, 0, true), Segments[0]);
-  ASSERT_EQ(CoverageSegment(3, 4, false),   Segments[1]);
+  ASSERT_EQ(CoverageSegment(3, 4, false), Segments[1]);
 }
 
 TEST_P(CoverageMappingTest, uncovered_function_with_mapping) {
@@ -798,9 +799,9 @@ TEST_P(CoverageMappingTest, uncovered_function_with_mapping) {
   CoverageData Data = LoadedCoverage->getCoverageForFile("file1");
   std::vector<CoverageSegment> Segments(Data.begin(), Data.end());
   ASSERT_EQ(3U, Segments.size());
-  ASSERT_EQ(CoverageSegment(1, 1, 0, true),  Segments[0]);
+  ASSERT_EQ(CoverageSegment(1, 1, 0, true), Segments[0]);
   ASSERT_EQ(CoverageSegment(4, 7, 0, false), Segments[1]);
-  ASSERT_EQ(CoverageSegment(9, 9, false),    Segments[2]);
+  ASSERT_EQ(CoverageSegment(9, 9, false), Segments[2]);
 }
 
 TEST_P(CoverageMappingTest, combine_regions) {
@@ -1060,6 +1061,31 @@ TEST_P(CoverageMappingTest, skip_duplicate_function_record) {
   auto Funcs = LoadedCoverage->getCoveredFunctions();
   unsigned NumFuncs = std::distance(Funcs.begin(), Funcs.end());
   ASSERT_EQ(3U, NumFuncs);
+}
+
+TEST_P(CoverageMappingTest, preserve_distinct_spi_unit_records) {
+  std::string FirstUnit =
+      getPGOFuncNameWithCoverageMappingSPIUnit("func", "/build/first.o");
+  std::string SecondUnit =
+      getPGOFuncNameWithCoverageMappingSPIUnit("func", "/build/second.o");
+  ProfileWriter.addRecord({FirstUnit, 0x1234, {1}}, Err);
+  ProfileWriter.addRecord({SecondUnit, 0x1234, {2}}, Err);
+
+  startFunction(FirstUnit, 0x1234);
+  addCMR(Counter::getCounter(0), "file", 1, 1, 2, 1);
+  startFunction(SecondUnit, 0x1234);
+  addCMR(Counter::getCounter(0), "file", 1, 1, 2, 1);
+
+  EXPECT_THAT_ERROR(loadCoverageMapping(), Succeeded());
+
+  auto Funcs = LoadedCoverage->getCoveredFunctions();
+  EXPECT_EQ(2U, std::distance(Funcs.begin(), Funcs.end()));
+  for (const FunctionRecord &Func : Funcs)
+    EXPECT_EQ("func", Func.Name);
+
+  CoverageData Data = LoadedCoverage->getCoverageForFile("file");
+  ASSERT_FALSE(Data.empty());
+  EXPECT_EQ(3U, Data.begin()->Count);
 }
 
 INSTANTIATE_TEST_SUITE_P(ParameterizedCovMapTest, CoverageMappingTest,
