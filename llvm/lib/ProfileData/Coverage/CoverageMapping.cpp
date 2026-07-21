@@ -1024,7 +1024,7 @@ Error CoverageMapping::loadFromFile(
   SmallVector<std::unique_ptr<MemoryBuffer>, 4> Buffers;
 
   SmallVector<object::BuildIDRef> BinaryIDs;
-  auto CoverageReadersOrErr = BinaryCoverageReader::create(
+  auto CoverageReadersOrErr = createCoverageMappingReaders(
       CovMappingBufRef, Arch, Buffers, CompilationDir,
       FoundBinaryIDs ? &BinaryIDs : nullptr);
   if (Error E = CoverageReadersOrErr.takeError()) {

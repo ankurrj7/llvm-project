@@ -12,6 +12,7 @@
 #include "clang/CodeGen/ModuleLinker.h"
 #include "clang/Frontend/FrontendAction.h"
 #include <memory>
+#include <string>
 
 namespace llvm {
   class LLVMContext;
@@ -32,6 +33,11 @@ private:
   llvm::LLVMContext *VMContext;
   bool OwnsVMContext;
 
+  std::string CoverageMappingSPIPath;
+  std::string CoverageMappingSPIKey;
+  std::string CoverageMappingSPIMetadata;
+  std::string CoverageMappingSPIPayload;
+
   std::unique_ptr<llvm::Module> loadModule(llvm::MemoryBufferRef MBRef);
 
 protected:
@@ -50,6 +56,8 @@ protected:
   void ExecuteAction() override;
 
   void EndSourceFileAction() override;
+
+  void EndSourceFileAfterOutputFiles() override;
 
 public:
   ~CodeGenAction() override;

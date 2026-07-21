@@ -30,6 +30,7 @@
 #include "clang/Serialization/ASTWriter.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/Demangle/Demangle.h"
@@ -46,9 +47,13 @@
 #include "llvm/LTO/LTOBackend.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Pass.h"
+#include "llvm/ProfileData/Coverage/CoverageMappingSPI.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/IOSandbox.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Mutex.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/Timer.h"
@@ -960,6 +965,16 @@ CodeGenAction::~CodeGenAction() {
 
 bool CodeGenAction::hasIRSupport() const { return true; }
 
+static std::string normalizeCoverageMappingSPIPath(StringRef Path) {
+  if (Path.empty() || Path == "-")
+    return Path.str();
+  auto BypassSandbox = llvm::sys::sandbox::scopedDisable();
+  SmallString<256> Normalized(Path);
+  (void)sys::fs::make_absolute(Normalized);
+  sys::path::remove_dots(Normalized, /*remove_dot_dot=*/true);
+  return Normalized.str().str();
+}
+
 void CodeGenAction::EndSourceFileAction() {
   ASTFrontendAction::EndSourceFileAction();
 
@@ -967,8 +982,41 @@ void CodeGenAction::EndSourceFileAction() {
   if (!getCompilerInstance().hasASTConsumer())
     return;
 
+  if (auto *CoverageMapping =
+          BEConsumer->getCodeGenerator()->CGM().getCoverageMapping()) {
+    CoverageMappingSPIPath =
+        getCompilerInstance().getCodeGenOpts().CoverageMappingSPIPath;
+    if (!CoverageMappingSPIPath.empty() &&
+        !CoverageMapping->getSPIPayload().empty()) {
+      CoverageMappingSPIMetadata =
+          normalizeCoverageMappingSPIPath(getCurrentFileOrBufferName());
+      StringRef Output = getCompilerInstance().getFrontendOpts().OutputFile;
+      StringRef DriverKey =
+          getCompilerInstance().getCodeGenOpts().CoverageMappingSPIKey;
+      CoverageMappingSPIKey = !DriverKey.empty() ? DriverKey.str()
+                              : Output.empty() || Output == "-"
+                                  ? CoverageMappingSPIMetadata
+                                  : normalizeCoverageMappingSPIPath(Output);
+      CoverageMappingSPIPayload = CoverageMapping->getSPIPayload().str();
+    }
+  }
+
   // Steal the module from the consumer.
   TheModule = BEConsumer->takeModule();
+}
+
+void CodeGenAction::EndSourceFileAfterOutputFiles() {
+  if (CoverageMappingSPIPayload.empty())
+    return;
+
+  auto BypassSandbox = llvm::sys::sandbox::scopedDisable();
+  llvm::coverage::CoverageMappingSPIRecord Record{CoverageMappingSPIKey,
+                                                  CoverageMappingSPIMetadata,
+                                                  CoverageMappingSPIPayload};
+  if (llvm::Error E = llvm::coverage::appendCoverageMappingSPIRecord(
+          CoverageMappingSPIPath, Record))
+    getCompilerInstance().getDiagnostics().Report(diag::err_fe_error_backend)
+        << llvm::toString(std::move(E));
 }
 
 std::unique_ptr<llvm::Module> CodeGenAction::takeModule() {
@@ -985,6 +1033,10 @@ CodeGenerator *CodeGenAction::getCodeGenerator() const {
 }
 
 bool CodeGenAction::BeginSourceFileAction(CompilerInstance &CI) {
+  CoverageMappingSPIPath.clear();
+  CoverageMappingSPIKey.clear();
+  CoverageMappingSPIMetadata.clear();
+  CoverageMappingSPIPayload.clear();
   if (CI.getFrontendOpts().GenReducedBMI)
     CI.getLangOpts().setCompilingModule(LangOptions::CMK_ModuleInterface);
   return ASTFrontendAction::BeginSourceFileAction(CI);

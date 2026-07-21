@@ -106,6 +106,15 @@ public:
   CoverageMappingIterator end() { return CoverageMappingIterator(); }
 };
 
+/// Create coverage mapping readers for an object, archive, testing-format
+/// buffer, or coverage mapping SPI container.
+LLVM_ABI Expected<std::vector<std::unique_ptr<CoverageMappingReader>>>
+createCoverageMappingReaders(
+    MemoryBufferRef ObjectBuffer, StringRef Arch,
+    SmallVectorImpl<std::unique_ptr<MemoryBuffer>> &ObjectFileBuffers,
+    StringRef CompilationDir = "",
+    SmallVectorImpl<object::BuildIDRef> *BinaryIDs = nullptr);
+
 /// Base class for the raw coverage mapping and filenames data readers.
 class RawCoverageReader {
 protected:
