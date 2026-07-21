@@ -105,15 +105,15 @@ static void reportOptRecordError(Error E, DiagnosticsEngine &Diags,
                                  const CodeGenOptions &CodeGenOpts) {
   handleAllErrors(
       std::move(E),
-    [&](const LLVMRemarkSetupFileError &E) {
+      [&](const LLVMRemarkSetupFileError &E) {
         Diags.Report(diag::err_cannot_open_file)
             << CodeGenOpts.OptRecordFile << E.message();
       },
-    [&](const LLVMRemarkSetupPatternError &E) {
+      [&](const LLVMRemarkSetupPatternError &E) {
         Diags.Report(diag::err_drv_optimization_remark_pattern)
             << E.message() << CodeGenOpts.OptRecordPasses;
       },
-    [&](const LLVMRemarkSetupFormatError &E) {
+      [&](const LLVMRemarkSetupFormatError &E) {
         Diags.Report(diag::err_drv_optimization_remark_format)
             << CodeGenOpts.OptRecordFormat;
       });
@@ -142,17 +142,13 @@ BackendConsumer::BackendConsumer(CompilerInstance &CI, BackendAction Action,
     LLVMIRGeneration.init("irgen", "LLVM IR generation", CI.getTimerGroup());
 }
 
-llvm::Module* BackendConsumer::getModule() const {
-  return Gen->GetModule();
-}
+llvm::Module *BackendConsumer::getModule() const { return Gen->GetModule(); }
 
 std::unique_ptr<llvm::Module> BackendConsumer::takeModule() {
   return std::unique_ptr<llvm::Module>(Gen->ReleaseModule());
 }
 
-CodeGenerator* BackendConsumer::getCodeGenerator() {
-  return Gen.get();
-}
+CodeGenerator *BackendConsumer::getCodeGenerator() { return Gen.get(); }
 
 void BackendConsumer::HandleCXXStaticMemberVarInstantiation(VarDecl *VD) {
   Gen->HandleCXXStaticMemberVarInstantiation(VD);
@@ -218,7 +214,7 @@ bool BackendConsumer::LinkInModules(llvm::Module *M) {
         if (F.isIntrinsic())
           continue;
         CodeGen::mergeDefaultFunctionDefinitionAttributes(
-          F, CodeGenOpts, LangOpts, TargetOpts, LM.Internalize);
+            F, CodeGenOpts, LangOpts, TargetOpts, LM.Internalize);
       }
 
     CurLinkModule = LM.Module.get();
@@ -262,11 +258,11 @@ void BackendConsumer::HandleTranslationUnit(ASTContext &C) {
 
   LLVMContext &Ctx = getModule()->getContext();
   std::unique_ptr<DiagnosticHandler> OldDiagnosticHandler =
-    Ctx.getDiagnosticHandler();
+      Ctx.getDiagnosticHandler();
   llvm::scope_exit RestoreDiagnosticHandler(
       [&]() { Ctx.setDiagnosticHandler(std::move(OldDiagnosticHandler)); });
-  Ctx.setDiagnosticHandler(std::make_unique<ClangDiagnosticHandler>(
-      CodeGenOpts, this));
+  Ctx.setDiagnosticHandler(
+      std::make_unique<ClangDiagnosticHandler>(CodeGenOpts, this));
 
   Ctx.setDefaultTargetCPU(TargetOpts.CPU);
   Ctx.setDefaultTargetFeatures(llvm::join(TargetOpts.Features, ","));
@@ -294,7 +290,7 @@ void BackendConsumer::HandleTranslationUnit(ASTContext &C) {
 
   if (CodeGenOpts.DiagnosticsMisExpectTolerance) {
     Ctx.setDiagnosticsMisExpectTolerance(
-      CodeGenOpts.DiagnosticsMisExpectTolerance);
+        CodeGenOpts.DiagnosticsMisExpectTolerance);
   }
 
   // Link each LinkModule into our module.
@@ -355,11 +351,9 @@ void BackendConsumer::AssignInheritanceModel(CXXRecordDecl *RD) {
   Gen->AssignInheritanceModel(RD);
 }
 
-void BackendConsumer::HandleVTable(CXXRecordDecl *RD) {
-  Gen->HandleVTable(RD);
-}
+void BackendConsumer::HandleVTable(CXXRecordDecl *RD) { Gen->HandleVTable(RD); }
 
-void BackendConsumer::anchor() { }
+void BackendConsumer::anchor() {}
 
 } // namespace clang
 
@@ -380,7 +374,7 @@ static FullSourceLoc ConvertBackendLocation(const llvm::SMDiagnostic &D,
   // We need to copy the underlying LLVM memory buffer because llvm::SourceMgr
   // already owns its one and clang::SourceManager wants to own its one.
   const MemoryBuffer *LBuf =
-  LSM.getMemoryBuffer(LSM.FindBufferContainingLoc(D.getLoc()));
+      LSM.getMemoryBuffer(LSM.FindBufferContainingLoc(D.getLoc()));
 
   // Create the copy and transfer ownership to clang::SourceManager.
   // TODO: Avoid copying files into memory.
@@ -393,7 +387,7 @@ static FullSourceLoc ConvertBackendLocation(const llvm::SMDiagnostic &D,
   // Translate the offset into the file.
   unsigned Offset = D.getLoc().getPointer() - LBuf->getBufferStart();
   SourceLocation NewLoc =
-  CSM.getLocForStartOfFile(FID).getLocWithOffset(Offset);
+      CSM.getLocForStartOfFile(FID).getLocWithOffset(Offset);
   return FullSourceLoc(NewLoc, CSM);
 }
 
@@ -491,8 +485,8 @@ void BackendConsumer::SrcMgrDiagHandler(const llvm::DiagnosticInfoSrcMgr &DI) {
   Diags.Report(Loc, DiagID).AddString(Message);
 }
 
-bool
-BackendConsumer::InlineAsmDiagHandler(const llvm::DiagnosticInfoInlineAsm &D) {
+bool BackendConsumer::InlineAsmDiagHandler(
+    const llvm::DiagnosticInfoInlineAsm &D) {
   unsigned DiagID;
   ComputeDiagID(D.getSeverity(), inline_asm, DiagID);
   std::string Message = D.getMsgStr().str();
@@ -516,8 +510,8 @@ BackendConsumer::InlineAsmDiagHandler(const llvm::DiagnosticInfoInlineAsm &D) {
   return true;
 }
 
-bool
-BackendConsumer::StackSizeDiagHandler(const llvm::DiagnosticInfoStackSize &D) {
+bool BackendConsumer::StackSizeDiagHandler(
+    const llvm::DiagnosticInfoStackSize &D) {
   if (D.getSeverity() != llvm::DS_Warning)
     // For now, the only support we have for StackSize diagnostic is warning.
     // We do not know how to format other severities.
@@ -965,16 +959,6 @@ CodeGenAction::~CodeGenAction() {
 
 bool CodeGenAction::hasIRSupport() const { return true; }
 
-static std::string normalizeCoverageMappingSPIPath(StringRef Path) {
-  if (Path.empty() || Path == "-")
-    return Path.str();
-  auto BypassSandbox = llvm::sys::sandbox::scopedDisable();
-  SmallString<256> Normalized(Path);
-  (void)sys::fs::make_absolute(Normalized);
-  sys::path::remove_dots(Normalized, /*remove_dot_dot=*/true);
-  return Normalized.str().str();
-}
-
 void CodeGenAction::EndSourceFileAction() {
   ASTFrontendAction::EndSourceFileAction();
 
@@ -988,16 +972,9 @@ void CodeGenAction::EndSourceFileAction() {
         getCompilerInstance().getCodeGenOpts().CoverageMappingSPIPath;
     if (!CoverageMappingSPIPath.empty() &&
         !CoverageMapping->getSPIPayload().empty()) {
-      CoverageMappingSPIMetadata =
-          normalizeCoverageMappingSPIPath(getCurrentFileOrBufferName());
-      StringRef Output = getCompilerInstance().getFrontendOpts().OutputFile;
-      StringRef DriverKey =
+      CoverageMappingSPIKey =
           getCompilerInstance().getCodeGenOpts().CoverageMappingSPIKey;
-      CoverageMappingSPIKey = !DriverKey.empty() ? DriverKey.str()
-                              : Output.empty() || Output == "-"
-                                  ? CoverageMappingSPIMetadata
-                                  : normalizeCoverageMappingSPIPath(Output);
-      CoverageMappingSPIPayload = CoverageMapping->getSPIPayload().str();
+      CoverageMappingSPIPayload = CoverageMapping->getSPIPayload();
     }
   }
 
@@ -1010,9 +987,9 @@ void CodeGenAction::EndSourceFileAfterOutputFiles() {
     return;
 
   auto BypassSandbox = llvm::sys::sandbox::scopedDisable();
-  llvm::coverage::CoverageMappingSPIRecord Record{CoverageMappingSPIKey,
-                                                  CoverageMappingSPIMetadata,
-                                                  CoverageMappingSPIPayload};
+  llvm::coverage::CoverageMappingSPIRecord Record{
+      std::move(CoverageMappingSPIKey), "",
+      std::move(CoverageMappingSPIPayload)};
   if (llvm::Error E = llvm::coverage::appendCoverageMappingSPIRecord(
           CoverageMappingSPIPath, Record))
     getCompilerInstance().getDiagnostics().Report(diag::err_fe_error_backend)
@@ -1033,10 +1010,11 @@ CodeGenerator *CodeGenAction::getCodeGenerator() const {
 }
 
 bool CodeGenAction::BeginSourceFileAction(CompilerInstance &CI) {
-  CoverageMappingSPIPath.clear();
-  CoverageMappingSPIKey.clear();
-  CoverageMappingSPIMetadata.clear();
-  CoverageMappingSPIPayload.clear();
+  if (!CI.getCodeGenOpts().CoverageMappingSPIPath.empty() &&
+      CI.getCodeGenOpts().CoverageMappingSPIKey.empty()) {
+    CI.getDiagnostics().Report(diag::err_coverage_mapping_spi_key_required);
+    return false;
+  }
   if (CI.getFrontendOpts().GenReducedBMI)
     CI.getLangOpts().setCompilingModule(LangOptions::CMK_ModuleInterface);
   return ASTFrontendAction::BeginSourceFileAction(CI);
@@ -1091,9 +1069,8 @@ CodeGenAction::CreateASTConsumer(CompilerInstance &CI, StringRef InFile) {
   // also macro debug info is enabled.
   if (CI.getCodeGenOpts().getDebugInfo() != codegenoptions::NoDebugInfo &&
       CI.getCodeGenOpts().MacroDebugInfo) {
-    std::unique_ptr<PPCallbacks> Callbacks =
-        std::make_unique<MacroPPCallbacks>(BEConsumer->getCodeGenerator(),
-                                            CI.getPreprocessor());
+    std::unique_ptr<PPCallbacks> Callbacks = std::make_unique<MacroPPCallbacks>(
+        BEConsumer->getCodeGenerator(), CI.getPreprocessor());
     CI.getPreprocessor().addPPCallbacks(std::move(Callbacks));
   }
 
@@ -1110,8 +1087,7 @@ CodeGenAction::CreateASTConsumer(CompilerInstance &CI, StringRef InFile) {
   return std::move(Result);
 }
 
-std::unique_ptr<llvm::Module>
-CodeGenAction::loadModule(MemoryBufferRef MBRef) {
+std::unique_ptr<llvm::Module> CodeGenAction::loadModule(MemoryBufferRef MBRef) {
   CompilerInstance &CI = getCompilerInstance();
   SourceManager &SM = CI.getSourceManager();
 
@@ -1301,26 +1277,26 @@ void CodeGenAction::ExecuteAction() {
 
 //
 
-void EmitAssemblyAction::anchor() { }
+void EmitAssemblyAction::anchor() {}
 EmitAssemblyAction::EmitAssemblyAction(llvm::LLVMContext *_VMContext)
-  : CodeGenAction(Backend_EmitAssembly, _VMContext) {}
+    : CodeGenAction(Backend_EmitAssembly, _VMContext) {}
 
-void EmitBCAction::anchor() { }
+void EmitBCAction::anchor() {}
 EmitBCAction::EmitBCAction(llvm::LLVMContext *_VMContext)
-  : CodeGenAction(Backend_EmitBC, _VMContext) {}
+    : CodeGenAction(Backend_EmitBC, _VMContext) {}
 
-void EmitLLVMAction::anchor() { }
+void EmitLLVMAction::anchor() {}
 EmitLLVMAction::EmitLLVMAction(llvm::LLVMContext *_VMContext)
-  : CodeGenAction(Backend_EmitLL, _VMContext) {}
+    : CodeGenAction(Backend_EmitLL, _VMContext) {}
 
-void EmitLLVMOnlyAction::anchor() { }
+void EmitLLVMOnlyAction::anchor() {}
 EmitLLVMOnlyAction::EmitLLVMOnlyAction(llvm::LLVMContext *_VMContext)
-  : CodeGenAction(Backend_EmitNothing, _VMContext) {}
+    : CodeGenAction(Backend_EmitNothing, _VMContext) {}
 
-void EmitCodeGenOnlyAction::anchor() { }
+void EmitCodeGenOnlyAction::anchor() {}
 EmitCodeGenOnlyAction::EmitCodeGenOnlyAction(llvm::LLVMContext *_VMContext)
-  : CodeGenAction(Backend_EmitMCNull, _VMContext) {}
+    : CodeGenAction(Backend_EmitMCNull, _VMContext) {}
 
-void EmitObjAction::anchor() { }
+void EmitObjAction::anchor() {}
 EmitObjAction::EmitObjAction(llvm::LLVMContext *_VMContext)
-  : CodeGenAction(Backend_EmitObj, _VMContext) {}
+    : CodeGenAction(Backend_EmitObj, _VMContext) {}

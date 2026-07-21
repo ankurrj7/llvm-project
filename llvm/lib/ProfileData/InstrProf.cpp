@@ -42,6 +42,7 @@
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/SwapByteOrder.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
@@ -450,7 +451,36 @@ std::pair<StringRef, StringRef> getParsedIRPGOName(StringRef IRPGOName) {
   return std::make_pair(FileName, MangledName);
 }
 
+static constexpr StringLiteral CoverageMappingSPIUnitPrefix =
+    "__llvm_covspi$1$";
+static constexpr size_t CoverageMappingSPIUnitIDSize = 64;
+
+std::string getPGOFuncNameWithCoverageMappingSPIUnit(StringRef PGOFuncName,
+                                                     StringRef UnitKey) {
+  SHA256 Hasher;
+  Hasher.update(UnitKey);
+  std::string Result = CoverageMappingSPIUnitPrefix.str();
+  Result += toHex(Hasher.final(), /*LowerCase=*/true);
+  Result.push_back('$');
+  Result += PGOFuncName;
+  return Result;
+}
+
+StringRef getPGOFuncNameWithoutCoverageMappingSPIUnit(StringRef PGOFuncName) {
+  StringRef OriginalName = PGOFuncName;
+  if (!PGOFuncName.consume_front(CoverageMappingSPIUnitPrefix))
+    return OriginalName;
+  if (PGOFuncName.size() <= CoverageMappingSPIUnitIDSize ||
+      PGOFuncName[CoverageMappingSPIUnitIDSize] != '$')
+    return OriginalName;
+  StringRef UnitID = PGOFuncName.take_front(CoverageMappingSPIUnitIDSize);
+  if (!llvm::all_of(UnitID, llvm::isHexDigit))
+    return OriginalName;
+  return PGOFuncName.drop_front(CoverageMappingSPIUnitIDSize + 1);
+}
+
 StringRef getFuncNameWithoutPrefix(StringRef PGOFuncName, StringRef FileName) {
+  PGOFuncName = getPGOFuncNameWithoutCoverageMappingSPIUnit(PGOFuncName);
   if (FileName.empty())
     return PGOFuncName;
   // Drop the file name including ':' or ';'. See getIRPGONameForGlobalObject as
@@ -714,9 +744,10 @@ Error collectGlobalObjectNameStrings(ArrayRef<std::string> NameStrs,
   std::string UncompressedNameStrings =
       join(NameStrs.begin(), NameStrs.end(), getInstrProfNameSeparator());
 
-  assert(StringRef(UncompressedNameStrings)
-                 .count(getInstrProfNameSeparator()) == (NameStrs.size() - 1) &&
-         "PGO name is invalid (contains separator token)");
+  assert(
+      StringRef(UncompressedNameStrings).count(getInstrProfNameSeparator()) ==
+          (NameStrs.size() - 1) &&
+      "PGO name is invalid (contains separator token)");
 
   unsigned EncLen = encodeULEB128(UncompressedNameStrings.length(), P);
   P += EncLen;
@@ -1210,13 +1241,13 @@ uint32_t getNumValueKindsInstrProf(const void *Record) {
 }
 
 uint32_t getNumValueSitesInstrProf(const void *Record, uint32_t VKind) {
-  return reinterpret_cast<const InstrProfRecord *>(Record)
-      ->getNumValueSites(VKind);
+  return reinterpret_cast<const InstrProfRecord *>(Record)->getNumValueSites(
+      VKind);
 }
 
 uint32_t getNumValueDataInstrProf(const void *Record, uint32_t VKind) {
-  return reinterpret_cast<const InstrProfRecord *>(Record)
-      ->getNumValueData(VKind);
+  return reinterpret_cast<const InstrProfRecord *>(Record)->getNumValueData(
+      VKind);
 }
 
 uint32_t getNumValueDataForSiteInstrProf(const void *R, uint32_t VK,
@@ -1417,9 +1448,8 @@ void annotateValueSite(Module &M, Instruction &Inst,
 }
 
 void annotateValueSite(Module &M, Instruction &Inst,
-                       ArrayRef<InstrProfValueData> VDs,
-                       uint64_t Sum, InstrProfValueKind ValueKind,
-                       uint32_t MaxMDCount) {
+                       ArrayRef<InstrProfValueData> VDs, uint64_t Sum,
+                       InstrProfValueKind ValueKind, uint32_t MaxMDCount) {
   if (VDs.empty())
     return;
   LLVMContext &Ctx = M.getContext();
