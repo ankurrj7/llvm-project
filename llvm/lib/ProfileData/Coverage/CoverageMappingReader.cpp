@@ -25,6 +25,7 @@
 #include "llvm/Object/MachOUniversal.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/Wasm.h"
+#include "llvm/ProfileData/Coverage/CoverageMappingSPI.h"
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compression.h"
@@ -1068,6 +1069,94 @@ loadTestingFormat(StringRef Data, StringRef CompilationDir) {
       std::move(ProfileNames), BytesInAddress, Endian, CompilationDir);
 }
 
+static Expected<std::unique_ptr<BinaryCoverageReader>>
+loadCoverageMappingSPIPayload(StringRef Data, StringRef CompilationDir) {
+  auto Payload = readCoverageMappingSPIPayload(Data);
+  if (!Payload)
+    return Payload.takeError();
+
+  auto ProfileNames = std::make_unique<InstrProfSymtab>();
+  if (Error E = ProfileNames->create(Payload->ProfileNames,
+                                     Payload->ProfileNamesAddress))
+    return std::move(E);
+
+  auto CoverageMapping = MemoryBuffer::getMemBuffer(
+      Payload->CoverageMapping, "coverage mapping SPI map",
+      /*RequiresNullTerminator=*/false);
+  auto CoverageRecords = MemoryBuffer::getMemBuffer(
+      Payload->CoverageRecords, "coverage mapping SPI records",
+      /*RequiresNullTerminator=*/false);
+  StringRef CoverageMappingData = CoverageMapping->getBuffer();
+  return BinaryCoverageReader::createCoverageReaderFromBuffer(
+      CoverageMappingData, std::move(CoverageRecords),
+      std::move(CoverageMapping), std::move(ProfileNames),
+      Payload->BytesInAddress, Payload->Endian, CompilationDir);
+}
+
+class SPICoverageReader final : public CoverageMappingReader {
+  std::vector<CoverageMappingSPIRecord> Records;
+  StringRef CompilationDir;
+  size_t NextRecord = 0;
+  std::unique_ptr<BinaryCoverageReader> CurrentReader;
+
+  SPICoverageReader(std::vector<CoverageMappingSPIRecord> Records,
+                    StringRef CompilationDir)
+      : Records(std::move(Records)), CompilationDir(CompilationDir) {}
+
+public:
+  static Expected<std::unique_ptr<CoverageMappingReader>>
+  create(StringRef Data, StringRef CompilationDir) {
+    auto Contents = readCoverageMappingSPI(Data);
+    if (!Contents)
+      return Contents.takeError();
+    if (Contents->Records.empty())
+      return make_error<CoverageMapError>(coveragemap_error::no_data_found);
+
+    DenseMap<StringRef, size_t> LatestRecord;
+    for (size_t I = 0; I != Contents->Records.size(); ++I)
+      LatestRecord[Contents->Records[I].Key] = I;
+
+    std::vector<CoverageMappingSPIRecord> Records;
+    Records.reserve(LatestRecord.size());
+    for (size_t I = 0; I != Contents->Records.size(); ++I)
+      if (LatestRecord.lookup(Contents->Records[I].Key) == I)
+        Records.push_back(Contents->Records[I]);
+    return std::unique_ptr<CoverageMappingReader>(
+        new SPICoverageReader(std::move(Records), CompilationDir));
+  }
+
+  Error readNextRecord(CoverageMappingRecord &Record) override {
+    for (;;) {
+      if (!CurrentReader) {
+        if (NextRecord == Records.size())
+          return make_error<CoverageMapError>(coveragemap_error::eof);
+        auto Reader = loadCoverageMappingSPIPayload(
+            Records[NextRecord++].Payload, CompilationDir);
+        if (!Reader)
+          return Reader.takeError();
+        CurrentReader = std::move(*Reader);
+      }
+
+      Error E = CurrentReader->readNextRecord(Record);
+      if (!E)
+        return Error::success();
+
+      bool ReachedEnd = false;
+      E = handleErrors(std::move(E), [&](const CoverageMapError &CME) -> Error {
+        if (CME.get() == coveragemap_error::eof) {
+          ReachedEnd = true;
+          return Error::success();
+        }
+        return make_error<CoverageMapError>(CME.get(), CME.getMessage());
+      });
+      if (E)
+        return E;
+      assert(ReachedEnd && "coverage reader returned an unknown error type");
+      CurrentReader.reset();
+    }
+  }
+};
+
 /// Find all sections that match \p IPSK name. There may be more than one if
 /// comdats are in use, e.g. for the __llvm_covfun section on ELF.
 static Expected<std::vector<SectionRef>>
@@ -1376,6 +1465,30 @@ BinaryCoverageReader::create(
   if (!BinaryID.empty())
     BinaryIDs->push_back(BinaryID);
   return std::move(Readers);
+}
+
+Expected<std::vector<std::unique_ptr<CoverageMappingReader>>>
+llvm::coverage::createCoverageMappingReaders(
+    MemoryBufferRef ObjectBuffer, StringRef Arch,
+    SmallVectorImpl<std::unique_ptr<MemoryBuffer>> &ObjectFileBuffers,
+    StringRef CompilationDir, SmallVectorImpl<object::BuildIDRef> *BinaryIDs) {
+  std::vector<std::unique_ptr<CoverageMappingReader>> Readers;
+  if (isCoverageMappingSPI(ObjectBuffer.getBuffer())) {
+    auto Reader =
+        SPICoverageReader::create(ObjectBuffer.getBuffer(), CompilationDir);
+    if (!Reader)
+      return Reader.takeError();
+    Readers.push_back(std::move(*Reader));
+    return Readers;
+  }
+
+  auto BinaryReaders = BinaryCoverageReader::create(
+      ObjectBuffer, Arch, ObjectFileBuffers, CompilationDir, BinaryIDs);
+  if (!BinaryReaders)
+    return BinaryReaders.takeError();
+  for (auto &Reader : *BinaryReaders)
+    Readers.push_back(std::move(Reader));
+  return Readers;
 }
 
 Error BinaryCoverageReader::readNextRecord(

@@ -624,6 +624,93 @@ The source range record contains the following fields:
   the current mapping region is a gap area. A count for a gap area is only used
   as the line execution count if there are no other regions on a line.
 
+Coverage Mapping SPI Container
+==============================
+
+Clang can publish coverage mappings to a separate append-only container with
+`-fcoverage-mapping-spi=<file>`. The driver also accepts
+`-fcoverage-mapping-spi`; this form writes to `cov.spi` in the directory named
+by `LLVM_COV_MAPPING_DIR`. The option requires both
+`-fprofile-instr-generate` and `-fcoverage-mapping`.
+
+The compiler stages a record while generating coverage mapping data and
+appends it only after the compilation output has been committed successfully.
+For a direct compilation output, the record key is its normalized path. When
+the driver gives cc1 a temporary output, it supplies a stable logical key made
+from the final output, original input, and, for a linked image, target triple.
+The normalized input path is used for standard output and is also stored as
+record metadata. A later record with the same key supersedes earlier records
+when the container is read. This lets incremental builds update an output
+without rewriting the container while keeping separate translation units in a
+multi-input link.
+
+Because superseded records remain physically present, a clean build should
+remove the old container before compiling. Incremental builds may keep it and
+rely on newest-record-wins semantics. A compactor can copy only the newest
+record for each key to a new container; v1 does not rewrite a live container in
+place.
+
+All SPI container headers are little-endian. Integers use their fixed-width
+types below, and all reserved fields and padding bytes must be zero. The file
+header is:
+
+`[magic : u64, version : u16, headerSize : u16, flags : u32, reserved : u64]`
+
+The magic is `0x697073636d766c6c` (ASCII `llvmcspi` in little-endian), the
+version is 1, and the header size is 24. Records follow the file header and are
+aligned to 8 bytes. Each record starts with:
+
+`[magic : u32, version : u16, headerSize : u16, flags : u32, recordSize : u64, keySize : u32, metadataSize : u32, payloadSize : u64, checksum : u64, reserved : u32]`
+
+The record magic is `0x52495053` (ASCII `SPIR` in little-endian), the version
+is 1, and the header size is 48. The key and metadata immediately follow the
+header. Zero padding aligns the payload to 8 bytes, and zero padding after the
+payload aligns a 16-byte trailer:
+
+`[magic : u32, version : u16, trailerSize : u16, recordSize : u64]`
+
+The trailer magic is `0x54495053` (ASCII `SPIT` in little-endian), its version
+is 1, and its size is 16. `recordSize` includes the header, both padded gaps,
+the payload, and the trailer. Consequently, the next record remains 8-byte
+aligned.
+
+The checksum detects corruption in both the header and body. To calculate it,
+set the checksum field to zero, calculate XXH3-64 hashes `Hh` and `Hb` over the
+48-byte header and the remaining record body respectively, then calculate:
+
+`Hh ^ (Hb + 0x9e3779b97f4a7c15 + (Hh << 6) + (Hh >> 2))`
+
+The payload carries the three sections normally extracted from an object file,
+along with the target properties required to decode them. Its header is:
+
+`[magic : u64, version : u16, headerSize : u16, flags : u32, profileNamesSize : u64, coverageMappingSize : u64, coverageRecordsSize : u64, profileNamesAddress : u64, bytesInAddress : u8, endianness : u8, reserved : u16, reserved : u32]`
+
+The payload magic is `0x6d6970736d766c6c` (ASCII `llvmspim` in
+little-endian), the version is 1, and the header size is 56.
+`bytesInAddress` is 4 or 8; `endianness` is 1 for little-endian and 2 for
+big-endian. The profile names data follows the header. Zero padding aligns the
+coverage mapping data to 8 bytes, and another zero-padded gap aligns the
+coverage records data. The payload ends with zero padding to an 8-byte
+boundary. The SPI layer does not compress the payload, although the embedded
+profile names section retains its normal coverage-format encoding and may be
+compressed.
+
+Writers serialize appends with an in-process mutex and a file lock. On the
+normal append path, the trailer permits the writer to validate only the final
+record instead of rescanning the container, so the total work across a build
+is linear in the data published. A reader accepts all complete,
+checksum-valid records before an incomplete trailing record. Before a later
+append, a writer holding the lock truncates such a tail to the last valid
+record; only this recovery path requires a full scan. A partial initial header
+is repaired only when it is an exact prefix of
+the expected header. Unsupported headers, inconsistent sizes, non-zero
+padding, and checksum failures are hard errors and are never silently repaired.
+
+`llvm-cov` memory-maps the container, indexes the newest record for each key,
+and decodes one payload at a time using non-owning section views. This avoids
+copying or eagerly decoding every superseded translation unit in a large SPI
+file.
+
 Testing Format
 ==============
 

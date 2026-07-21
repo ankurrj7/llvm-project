@@ -118,6 +118,8 @@ class CoverageMappingModuleGen {
   llvm::SmallDenseMap<FileEntryRef, unsigned, 8> FileEntries;
   std::vector<llvm::Constant *> FunctionNames;
   std::vector<FunctionInfo> FunctionRecords;
+  std::vector<std::string> SPIFunctionNames;
+  std::string SPIPayload;
 
   std::string getCurrentDirname();
   std::string normalizeFilename(StringRef Filename);
@@ -145,6 +147,9 @@ public:
 
   /// Emit the coverage mapping data for a translation unit.
   void emit();
+
+  /// Return this translation unit's staged SPI record payload.
+  llvm::StringRef getSPIPayload() const { return SPIPayload; }
 
   /// Return the coverage mapping translation unit file id
   /// for the given file.

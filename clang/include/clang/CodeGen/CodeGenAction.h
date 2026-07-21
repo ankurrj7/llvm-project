@@ -11,6 +11,7 @@
 
 #include "clang/Frontend/FrontendAction.h"
 #include <memory>
+#include <string>
 
 namespace llvm {
   class LLVMContext;
@@ -51,6 +52,11 @@ private:
   llvm::LLVMContext *VMContext;
   bool OwnsVMContext;
 
+  std::string CoverageMappingSPIPath;
+  std::string CoverageMappingSPIKey;
+  std::string CoverageMappingSPIMetadata;
+  std::string CoverageMappingSPIPayload;
+
   std::unique_ptr<llvm::Module> loadModule(llvm::MemoryBufferRef MBRef);
 
   /// Load bitcode modules to link into our module from the options.
@@ -72,6 +78,8 @@ protected:
   void ExecuteAction() override;
 
   void EndSourceFileAction() override;
+
+  void EndSourceFileAfterOutputFiles() override;
 
 public:
   ~CodeGenAction() override;

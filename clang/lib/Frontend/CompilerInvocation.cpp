@@ -5343,6 +5343,8 @@ void CompilerInvocationBase::visitPathsImpl(
   auto &CodeGenOpts = *this->CodeGenOpts;
   RETURN_IF(CodeGenOpts.DebugCompilationDir);
   RETURN_IF(CodeGenOpts.CoverageCompilationDir);
+  RETURN_IF(CodeGenOpts.CoverageMappingSPIPath);
+  RETURN_IF(CodeGenOpts.CoverageMappingSPIKey);
 
   // Sanitizer options.
   RETURN_IF_MANY(LangOpts->NoSanitizeFiles);

@@ -106,6 +106,10 @@ protected:
       getCompilerInstance().getPreprocessor().SetEnableMacroExpansion();
   }
 
+  /// Callback after this source file's output files have been committed.
+  /// This is not called if compilation failed or the outputs were erased.
+  virtual void EndSourceFileAfterOutputFiles() {}
+
   /// Callback at the end of processing a single input, to determine
   /// if the output files should be erased or not.
   ///

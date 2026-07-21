@@ -23,10 +23,16 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ProfileData/Coverage/CoverageMapping.h"
 #include "llvm/ProfileData/Coverage/CoverageMappingReader.h"
+#include "llvm/ProfileData/Coverage/CoverageMappingSPI.h"
 #include "llvm/ProfileData/Coverage/CoverageMappingWriter.h"
+#include "llvm/Support/Compression.h"
+#include "llvm/Support/EndianStream.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SaveAndRestore.h"
+#include <limits>
 #include <optional>
 
 // This selects the coverage mapping format defined when `InstrProfData.inc`
@@ -3370,6 +3376,9 @@ void CoverageMappingModuleGen::addFunctionMappingRecord(
   const uint64_t NameHash = llvm::IndexedInstrProf::ComputeHash(NameValue);
   FunctionRecords.push_back({NameHash, FuncHash, CoverageMapping, IsUsed});
 
+  if (!CGM.getCodeGenOpts().CoverageMappingSPIPath.empty())
+    SPIFunctionNames.emplace_back(NameValue);
+
   if (!IsUsed)
     FunctionNames.push_back(NamePtr);
 
@@ -3422,6 +3431,74 @@ void CoverageMappingModuleGen::emit() {
   auto *FilenamesVal =
       llvm::ConstantDataArray::getString(Ctx, Filenames, false);
   const int64_t FilenamesRef = llvm::IndexedInstrProf::ComputeHash(Filenames);
+
+  if (!CGM.getCodeGenOpts().CoverageMappingSPIPath.empty()) {
+    std::string ProfileNames;
+    if (llvm::Error E = llvm::collectGlobalObjectNameStrings(
+            SPIFunctionNames, llvm::compression::zlib::isAvailable(),
+            ProfileNames)) {
+      CGM.Error(SourceLocation(),
+                std::string("failed to build coverage mapping SPI names: ") +
+                    llvm::toString(std::move(E)));
+      return;
+    }
+
+    if (Filenames.size() > std::numeric_limits<uint32_t>::max()) {
+      CGM.Error(SourceLocation(),
+                "coverage mapping SPI filenames section is too large");
+      return;
+    }
+
+    llvm::endianness TargetEndian = CGM.getDataLayout().isLittleEndian()
+                                        ? llvm::endianness::little
+                                        : llvm::endianness::big;
+    std::string CoverageMappingData;
+    {
+      llvm::raw_string_ostream OS(CoverageMappingData);
+      llvm::support::endian::Writer Writer(OS, TargetEndian);
+      Writer.write<uint32_t>(0); // Number of affixed records for V4+.
+      Writer.write<uint32_t>(static_cast<uint32_t>(Filenames.size()));
+      Writer.write<uint32_t>(0); // Out-of-line coverage mapping size.
+      Writer.write<uint32_t>(CovMapVersion::CurrentVersion);
+      OS << Filenames;
+    }
+
+    std::string CoverageRecords;
+    {
+      llvm::raw_string_ostream OS(CoverageRecords);
+      llvm::support::endian::Writer Writer(OS, TargetEndian);
+      for (const FunctionInfo &Info : FunctionRecords) {
+        if (Info.CoverageMapping.size() >
+            std::numeric_limits<uint32_t>::max()) {
+          CGM.Error(SourceLocation(),
+                    "coverage mapping SPI function record is too large");
+          return;
+        }
+        Writer.write<uint64_t>(Info.NameHash);
+        Writer.write<uint32_t>(
+            static_cast<uint32_t>(Info.CoverageMapping.size()));
+        Writer.write<uint64_t>(Info.FuncHash);
+        Writer.write<uint64_t>(FilenamesRef);
+        OS << Info.CoverageMapping;
+        for (uint64_t Pad = llvm::offsetToAlignment(OS.tell(), llvm::Align(8));
+             Pad; --Pad)
+          OS.write(uint8_t(0));
+      }
+    }
+
+    auto Payload = llvm::coverage::createCoverageMappingSPIPayload(
+        {ProfileNames, CoverageMappingData, CoverageRecords,
+         /*ProfileNamesAddress=*/0,
+         static_cast<uint8_t>(CGM.getDataLayout().getPointerSize()),
+         TargetEndian});
+    if (!Payload) {
+      CGM.Error(SourceLocation(),
+                std::string("failed to build coverage mapping SPI payload: ") +
+                    llvm::toString(Payload.takeError()));
+      return;
+    }
+    SPIPayload = std::move(*Payload);
+  }
 
   // Emit the function records.
   for (const FunctionInfo &Info : FunctionRecords)
