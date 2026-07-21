@@ -34,6 +34,7 @@
 #include "clang/Driver/XRayArgs.h"
 #include "clang/Options/OptionUtils.h"
 #include "clang/Options/Options.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringExtras.h"
@@ -50,6 +51,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/YAMLParser.h"
 #include "llvm/TargetParser/AArch64TargetParser.h"
 #include "llvm/TargetParser/ARMTargetParserCommon.h"
@@ -360,10 +362,86 @@ static void addDashXForInput(const ArgList &Args, const InputInfo &Input,
   }
 }
 
+static std::string normalizeCoverageMappingSPIKeyPath(const Driver &D,
+                                                      StringRef Path) {
+  if (Path.empty() || Path == "-")
+    return Path.str();
+
+  SmallString<256> Normalized(Path);
+  if (!llvm::sys::path::is_absolute(Normalized)) {
+    if (llvm::ErrorOr<std::string> CWD =
+            D.getVFS().getCurrentWorkingDirectory()) {
+      SmallString<256> Absolute(*CWD);
+      llvm::sys::path::append(Absolute, Normalized);
+      Normalized = Absolute;
+    } else {
+      (void)llvm::sys::fs::make_absolute(Normalized);
+    }
+  }
+  llvm::sys::path::remove_dots(Normalized, /*remove_dot_dot=*/true);
+  return Normalized.str().str();
+}
+
+static std::string getCoverageMappingSPIKey(const ToolChain &TC, Compilation &C,
+                                            const InputInfo &Output,
+                                            const InputInfo &Input,
+                                            const ArgList &Args,
+                                            const char *LinkingOutput) {
+  const Driver &D = TC.getDriver();
+  bool IsTemporary = llvm::any_of(C.getTempFiles(), [&](const char *Temp) {
+    return StringRef(Temp) == Output.getFilename();
+  });
+
+  StringRef LogicalOutput = Output.getFilename();
+  SmallString<256> DefaultOutput;
+  if (IsTemporary) {
+    if (LinkingOutput) {
+      LogicalOutput = LinkingOutput;
+    } else if (const Arg *A = Args.getLastArg(options::OPT_o)) {
+      LogicalOutput = A->getValue();
+    } else {
+      if (llvm::ErrorOr<std::string> CWD =
+              D.getVFS().getCurrentWorkingDirectory())
+        DefaultOutput = *CWD;
+      StringRef BaseInput = Input.getBaseInput();
+      if (BaseInput.empty())
+        BaseInput = Input.getFilename();
+      llvm::sys::path::append(DefaultOutput,
+                              llvm::sys::path::filename(BaseInput));
+      LogicalOutput = DefaultOutput;
+    }
+  }
+
+  StringRef BaseInput = Input.getBaseInput();
+  if (BaseInput.empty())
+    BaseInput = Input.getFilename();
+  if (LogicalOutput.empty() || LogicalOutput == "-")
+    return normalizeCoverageMappingSPIKeyPath(D, BaseInput);
+
+  std::string OutputKey = normalizeCoverageMappingSPIKeyPath(D, LogicalOutput);
+  if (!IsTemporary)
+    return OutputKey;
+
+  llvm::SHA256 Hasher;
+  auto AddComponent = [&](StringRef Name, StringRef Value) {
+    Hasher.update(Name);
+    Hasher.update(StringRef("\0", 1));
+    Hasher.update(Value);
+    Hasher.update(StringRef("\0", 1));
+  };
+  AddComponent("output", OutputKey);
+  AddComponent("input", normalizeCoverageMappingSPIKeyPath(D, BaseInput));
+  if (LinkingOutput)
+    AddComponent("target", TC.getTripleString());
+  return "logical:" + llvm::toHex(Hasher.final(), /*LowerCase=*/true);
+}
+
 static void addPGOAndCoverageFlags(const ToolChain &TC, Compilation &C,
                                    const JobAction &JA, const InputInfo &Output,
-                                   const ArgList &Args, SanitizerArgs &SanArgs,
-                                   ArgStringList &CmdArgs) {
+                                   const InputInfo &Input, const ArgList &Args,
+                                   SanitizerArgs &SanArgs,
+                                   ArgStringList &CmdArgs,
+                                   const char *LinkingOutput) {
   const Driver &D = TC.getDriver();
   const llvm::Triple &T = TC.getTriple();
   auto *PGOGenerateArg = Args.getLastArg(options::OPT_fprofile_generate,
@@ -544,6 +622,37 @@ static void addPGOAndCoverageFlags(const ToolChain &TC, Compilation &C,
           << "-fprofile-instr-generate";
 
     CmdArgs.push_back("-fcoverage-mapping");
+  }
+
+  if (const Arg *A = Args.getLastArg(options::OPT_fcoverage_mapping_spi,
+                                     options::OPT_fcoverage_mapping_spi_EQ)) {
+    if (!ProfileGenerateArg)
+      D.Diag(clang::diag::err_drv_argument_only_allowed_with)
+          << A->getSpelling() << "-fprofile-instr-generate";
+    if (!Args.hasFlag(options::OPT_fcoverage_mapping,
+                      options::OPT_fno_coverage_mapping, false))
+      D.Diag(clang::diag::err_drv_argument_only_allowed_with)
+          << A->getSpelling() << "-fcoverage-mapping";
+
+    SmallString<128> SPIPath;
+    if (A->getOption().matches(options::OPT_fcoverage_mapping_spi_EQ)) {
+      SPIPath = A->getValue();
+    } else if (auto Dir = llvm::sys::Process::GetEnv("LLVM_COV_MAPPING_DIR")) {
+      if (!Dir->empty()) {
+        SPIPath = *Dir;
+        llvm::sys::path::append(SPIPath, "cov.spi");
+      }
+    }
+
+    if (SPIPath.empty())
+      D.Diag(clang::diag::err_drv_coverage_mapping_spi_path);
+    else {
+      CmdArgs.push_back(
+          Args.MakeArgString(Twine("-fcoverage-mapping-spi=") + SPIPath));
+      CmdArgs.push_back(Args.MakeArgString(
+          Twine("-fcoverage-mapping-spi-key=") +
+          getCoverageMappingSPIKey(TC, C, Output, Input, Args, LinkingOutput)));
+    }
   }
 
   if (Args.hasFlag(options::OPT_fmcdc_coverage, options::OPT_fno_mcdc_coverage,
@@ -6270,7 +6379,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
 
   // NVPTX doesn't support PGO or coverage
   if (!Triple.isNVPTX())
-    addPGOAndCoverageFlags(TC, C, JA, Output, Args, SanitizeArgs, CmdArgs);
+    addPGOAndCoverageFlags(TC, C, JA, Output, Input, Args, SanitizeArgs,
+                           CmdArgs, LinkingOutput);
 
   Args.AddLastArg(CmdArgs, options::OPT_fclang_abi_compat_EQ);
 

@@ -10,6 +10,7 @@ set(LLVM_LINK_COMPONENTS
 add_llvm_unittest(ProfileDataTests
   BPFunctionNodeTest.cpp
   CoverageMappingTest.cpp
+  CoverageMappingSPITest.cpp
   DataAccessProfTest.cpp
   InstrProfDataTest.cpp
   InstrProfTest.cpp

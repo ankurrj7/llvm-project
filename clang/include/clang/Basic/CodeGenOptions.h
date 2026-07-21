@@ -247,6 +247,12 @@ public:
   /// The string to embed in coverage mapping as the current working directory.
   std::string CoverageCompilationDir;
 
+  /// The SPI container to receive coverage mapping records.
+  std::string CoverageMappingSPIPath;
+
+  /// The stable record key selected by the driver for the SPI container.
+  std::string CoverageMappingSPIKey;
+
   /// The string to embed in the debug information for the compile unit, if
   /// non-empty.
   std::string DwarfDebugFlags;
