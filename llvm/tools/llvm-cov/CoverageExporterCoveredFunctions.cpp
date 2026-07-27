@@ -1,4 +1,4 @@
-//===- CoverageExporterCoveredFunctions.cpp - Streaming coverage export --===//
+//===- CoverageExporterCoveredFunctions.cpp - Text coverage export -------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -7,24 +7,28 @@
 //===----------------------------------------------------------------------===//
 
 #include "CoverageExporterCoveredFunctions.h"
-#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
-#include <queue>
 #include <string>
-#include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,16 +37,15 @@ using namespace llvm::coverage;
 
 namespace {
 
-constexpr size_t SortMemoryLimit = 32 * 1024 * 1024;
-constexpr size_t MergeFanIn = 16;
-// Bound the size of an individual spool record. This matters for very large
-// functions because a merge retains one current record per input run.
-constexpr size_t MaxRegionsPerFragmentChunk = 16 * 1024;
-// The report format uses stable one-based region kind values.
+constexpr unsigned NumSourcePartitions = 128;
+constexpr size_t ReadBufferSize = 64 * 1024;
+constexpr size_t SourcePartitionMemoryLimit = 64 * 1024 * 1024;
+constexpr unsigned MaxSourcePartitionDepth = 8;
+
+// Report and spool records use stable one-based region kind values.
+// Non-countable skipped and gap regions are intentionally omitted.
 constexpr uint32_t ReportCodeRegionKind = 1;
-constexpr uint32_t ReportBranchRegionKind = 5;
-constexpr uint32_t ReportMCDCDecisionRegionKind = 6;
-constexpr uint32_t ReportMCDCBranchRegionKind = 7;
+constexpr uint32_t ReportExpansionRegionKind = 2;
 
 std::optional<uint32_t>
 getReportRegionKind(CounterMappingRegion::RegionKind Kind) {
@@ -50,11 +53,9 @@ getReportRegionKind(CounterMappingRegion::RegionKind Kind) {
   case CounterMappingRegion::CodeRegion:
     return ReportCodeRegionKind;
   case CounterMappingRegion::ExpansionRegion:
-    return 2;
+    return ReportExpansionRegionKind;
   case CounterMappingRegion::SkippedRegion:
-    return 3;
   case CounterMappingRegion::GapRegion:
-    return 4;
   case CounterMappingRegion::BranchRegion:
   case CounterMappingRegion::MCDCDecisionRegion:
   case CounterMappingRegion::MCDCBranchRegion:
@@ -63,165 +64,66 @@ getReportRegionKind(CounterMappingRegion::RegionKind Kind) {
   llvm_unreachable("unknown coverage region kind");
 }
 
-struct FragmentRegion {
+template <typename T> void writePod(raw_ostream &OS, const T &Value) {
+  OS.write(reinterpret_cast<const char *>(&Value), sizeof(Value));
+}
+
+struct SourceRegion {
+  uint32_t FilenameID;
   uint32_t Kind;
   uint32_t LineStart;
   uint32_t ColumnStart;
   uint32_t LineEnd;
   uint32_t ColumnEnd;
   uint64_t ExecutionCount;
-  uint64_t FalseExecutionCount = 0;
-  int32_t ConditionID = -1;
-  int32_t TrueConditionID = -1;
-  int32_t FalseConditionID = -1;
-  bool TrueFolded = false;
-  bool FalseFolded = false;
-
-  bool operator<(const FragmentRegion &Other) const {
-    return std::tie(LineStart, ColumnStart, Kind, LineEnd, ColumnEnd,
-                    ExecutionCount, FalseExecutionCount, ConditionID,
-                    TrueConditionID, FalseConditionID, TrueFolded,
-                    FalseFolded) <
-           std::tie(Other.LineStart, Other.ColumnStart, Other.Kind,
-                    Other.LineEnd, Other.ColumnEnd, Other.ExecutionCount,
-                    Other.FalseExecutionCount, Other.ConditionID,
-                    Other.TrueConditionID, Other.FalseConditionID,
-                    Other.TrueFolded, Other.FalseFolded);
-  }
 };
 
-struct FunctionFragment {
-  std::string Filename;
-  std::string CoverageRootFilename;
-  std::string ExpansionSiteFilename;
-  std::string DisplayName;
-  std::string RawFunctionName;
-  uint64_t FunctionHash = 0;
-  uint64_t EntryCount = 0;
-  uint64_t OverallTotalCodeRegions = 0;
-  uint64_t OverallHitCodeRegions = 0;
-  uint64_t FragmentTotalCodeRegions = 0;
-  uint64_t FragmentHitCodeRegions = 0;
-  uint64_t FragmentGroupTotalCodeRegions = 0;
-  uint64_t FragmentGroupHitCodeRegions = 0;
-  uint32_t CoverageBodyLine = 0;
-  uint32_t CoverageBodyColumn = 0;
-  uint32_t ExpansionSiteLine = 0;
-  uint32_t ExpansionSiteColumn = 0;
-  uint32_t FragmentOrdinal = 0;
-  uint32_t SortLine = 0;
-  uint32_t SortColumn = 0;
-  uint32_t ChunkIndex = 0;
-  bool IsRootFragment = false;
-  std::vector<FragmentRegion> Regions;
-
-  size_t memorySize() const {
-    return sizeof(*this) + Filename.capacity() +
-           CoverageRootFilename.capacity() + ExpansionSiteFilename.capacity() +
-           DisplayName.capacity() + RawFunctionName.capacity() +
-           Regions.capacity() * sizeof(FragmentRegion);
-  }
-
-  bool operator<(const FunctionFragment &Other) const {
-    return std::tuple(CoverageRootFilename, CoverageBodyLine,
-                      CoverageBodyColumn, RawFunctionName, FunctionHash,
-                      Filename != CoverageRootFilename, !IsRootFragment,
-                      Filename, ExpansionSiteFilename, ExpansionSiteLine,
-                      ExpansionSiteColumn, FragmentOrdinal, SortLine,
-                      SortColumn, ChunkIndex) <
-           std::tuple(Other.CoverageRootFilename, Other.CoverageBodyLine,
-                      Other.CoverageBodyColumn, Other.RawFunctionName,
-                      Other.FunctionHash,
-                      Other.Filename != Other.CoverageRootFilename,
-                      !Other.IsRootFragment, Other.Filename,
-                      Other.ExpansionSiteFilename, Other.ExpansionSiteLine,
-                      Other.ExpansionSiteColumn, Other.FragmentOrdinal,
-                      Other.SortLine, Other.SortColumn, Other.ChunkIndex);
-  }
+struct SourceFileRegions {
+  std::unordered_map<std::string, SourceRegion> Regions;
 };
 
-template <typename T> void writePod(raw_ostream &OS, const T &Value) {
-  OS.write(reinterpret_cast<const char *>(&Value), sizeof(Value));
-}
-
-Error writeString(raw_ostream &OS, StringRef Value) {
-  if (Value.size() > std::numeric_limits<uint32_t>::max())
-    return createStringError(errc::file_too_large,
-                             "covered-functions string is too large");
-  uint32_t Size = Value.size();
-  writePod(OS, Size);
-  OS.write(Value.data(), Value.size());
-  return Error::success();
-}
-
-Error writeFragment(raw_ostream &OS, const FunctionFragment &Fragment) {
-  if (Error E = writeString(OS, Fragment.Filename))
-    return E;
-  if (Error E = writeString(OS, Fragment.CoverageRootFilename))
-    return E;
-  if (Error E = writeString(OS, Fragment.ExpansionSiteFilename))
-    return E;
-  if (Error E = writeString(OS, Fragment.DisplayName))
-    return E;
-  if (Error E = writeString(OS, Fragment.RawFunctionName))
-    return E;
-  writePod(OS, Fragment.FunctionHash);
-  writePod(OS, Fragment.EntryCount);
-  writePod(OS, Fragment.OverallTotalCodeRegions);
-  writePod(OS, Fragment.OverallHitCodeRegions);
-  writePod(OS, Fragment.FragmentTotalCodeRegions);
-  writePod(OS, Fragment.FragmentHitCodeRegions);
-  writePod(OS, Fragment.FragmentGroupTotalCodeRegions);
-  writePod(OS, Fragment.FragmentGroupHitCodeRegions);
-  writePod(OS, Fragment.CoverageBodyLine);
-  writePod(OS, Fragment.CoverageBodyColumn);
-  writePod(OS, Fragment.ExpansionSiteLine);
-  writePod(OS, Fragment.ExpansionSiteColumn);
-  writePod(OS, Fragment.FragmentOrdinal);
-  writePod(OS, Fragment.SortLine);
-  writePod(OS, Fragment.SortColumn);
-  writePod(OS, Fragment.ChunkIndex);
-  writePod(OS, Fragment.IsRootFragment);
-  if (Fragment.Regions.size() > std::numeric_limits<uint32_t>::max())
-    return createStringError(errc::file_too_large,
-                             "covered-functions region list is too large");
-  uint32_t NumRegions = Fragment.Regions.size();
-  writePod(OS, NumRegions);
-  for (const FragmentRegion &Region : Fragment.Regions) {
-    writePod(OS, Region.Kind);
-    writePod(OS, Region.LineStart);
-    writePod(OS, Region.ColumnStart);
-    writePod(OS, Region.LineEnd);
-    writePod(OS, Region.ColumnEnd);
+Error writeSourceRegion(raw_ostream &OS, const SourceRegion &Region,
+                        bool IsBaseline) {
+  writePod(OS, Region.FilenameID);
+  writePod(OS, Region.Kind);
+  writePod(OS, Region.LineStart);
+  writePod(OS, Region.ColumnStart);
+  writePod(OS, Region.LineEnd);
+  writePod(OS, Region.ColumnEnd);
+  if (!IsBaseline)
     writePod(OS, Region.ExecutionCount);
-    writePod(OS, Region.FalseExecutionCount);
-    writePod(OS, Region.ConditionID);
-    writePod(OS, Region.TrueConditionID);
-    writePod(OS, Region.FalseConditionID);
-    writePod(OS, Region.TrueFolded);
-    writePod(OS, Region.FalseFolded);
-  }
   return Error::success();
 }
 
-class FragmentReader {
+class SourceRegionReader {
   sys::fs::file_t File;
   bool IsOpen = false;
+  std::array<char, ReadBufferSize> ReadBuffer;
+  size_t ReadBufferOffset = 0;
+  size_t ReadBufferEnd = 0;
 
   Expected<bool> readBytes(MutableArrayRef<char> Buffer, bool AllowEOF) {
     size_t Offset = 0;
     while (Offset < Buffer.size()) {
-      Expected<size_t> Bytes =
-          sys::fs::readNativeFile(File, Buffer.drop_front(Offset));
-      if (!Bytes)
-        return Bytes.takeError();
-      if (*Bytes == 0) {
-        if (AllowEOF && Offset == 0)
-          return false;
-        return createStringError(errc::io_error,
-                                 "truncated covered-functions spool file");
+      if (ReadBufferOffset == ReadBufferEnd) {
+        Expected<size_t> Bytes = sys::fs::readNativeFile(File, ReadBuffer);
+        if (!Bytes)
+          return Bytes.takeError();
+        if (*Bytes == 0) {
+          if (AllowEOF && Offset == 0)
+            return false;
+          return createStringError(errc::io_error,
+                                   "truncated text coverage spool file");
+        }
+        ReadBufferOffset = 0;
+        ReadBufferEnd = *Bytes;
       }
-      Offset += *Bytes;
+      size_t BytesToCopy =
+          std::min(Buffer.size() - Offset, ReadBufferEnd - ReadBufferOffset);
+      std::memcpy(Buffer.data() + Offset, ReadBuffer.data() + ReadBufferOffset,
+                  BytesToCopy);
+      Offset += BytesToCopy;
+      ReadBufferOffset += BytesToCopy;
     }
     return true;
   }
@@ -232,199 +134,72 @@ class FragmentReader {
         AllowEOF);
   }
 
-  Error readString(std::string &Value, uint32_t Size) {
-    Value.resize(Size);
-    if (Size == 0)
-      return Error::success();
-    Expected<bool> Read = readBytes(MutableArrayRef(Value.data(), Size), false);
-    if (!Read)
-      return Read.takeError();
-    return Error::success();
-  }
+  SourceRegionReader() = default;
 
 public:
-  static Expected<std::unique_ptr<FragmentReader>> create(StringRef Path) {
+  static Expected<std::unique_ptr<SourceRegionReader>> create(StringRef Path) {
     Expected<sys::fs::file_t> FileOrErr = sys::fs::openNativeFileForRead(Path);
     if (!FileOrErr)
       return FileOrErr.takeError();
-    auto Reader = std::unique_ptr<FragmentReader>(new FragmentReader());
+    auto Reader = std::unique_ptr<SourceRegionReader>(new SourceRegionReader());
     Reader->File = *FileOrErr;
     Reader->IsOpen = true;
     return std::move(Reader);
   }
 
-  ~FragmentReader() {
+  ~SourceRegionReader() {
     if (IsOpen)
       consumeError(errorCodeToError(sys::fs::closeFile(File)));
   }
 
-  Expected<bool> read(FunctionFragment &Fragment) {
-    uint32_t FilenameSize = 0;
-    Expected<bool> Read = readPod(FilenameSize, true);
+  Expected<bool> read(SourceRegion &Region, size_t NumSourceFilenames,
+                      bool IsBaseline) {
+    Expected<bool> Read = readPod(Region.FilenameID, true);
     if (!Read || !*Read)
       return Read;
-    if (Error E = readString(Fragment.Filename, FilenameSize))
-      return std::move(E);
-
-    uint32_t CoverageRootFilenameSize = 0;
-    if (Expected<bool> R = readPod(CoverageRootFilenameSize, false); !R)
+    if (Region.FilenameID >= NumSourceFilenames)
+      return createStringError(errc::io_error,
+                               "invalid text coverage source filename ID");
+    if (Expected<bool> R = readPod(Region.Kind, false); !R)
       return R.takeError();
-    if (Error E =
-            readString(Fragment.CoverageRootFilename, CoverageRootFilenameSize))
-      return std::move(E);
-
-    uint32_t ExpansionSiteFilenameSize = 0;
-    if (Expected<bool> R = readPod(ExpansionSiteFilenameSize, false); !R)
+    if (Expected<bool> R = readPod(Region.LineStart, false); !R)
       return R.takeError();
-    if (Error E = readString(Fragment.ExpansionSiteFilename,
-                             ExpansionSiteFilenameSize))
-      return std::move(E);
-
-    uint32_t DisplayNameSize = 0;
-    if (Expected<bool> R = readPod(DisplayNameSize, false); !R)
+    if (Expected<bool> R = readPod(Region.ColumnStart, false); !R)
       return R.takeError();
-    if (Error E = readString(Fragment.DisplayName, DisplayNameSize))
-      return std::move(E);
-
-    uint32_t RawNameSize = 0;
-    if (Expected<bool> R = readPod(RawNameSize, false); !R)
+    if (Expected<bool> R = readPod(Region.LineEnd, false); !R)
       return R.takeError();
-    if (Error E = readString(Fragment.RawFunctionName, RawNameSize))
-      return std::move(E);
-
-    if (Expected<bool> R = readPod(Fragment.FunctionHash, false); !R)
+    if (Expected<bool> R = readPod(Region.ColumnEnd, false); !R)
       return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.EntryCount, false); !R)
+    if (IsBaseline)
+      Region.ExecutionCount = 0;
+    else if (Expected<bool> R = readPod(Region.ExecutionCount, false); !R)
       return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.OverallTotalCodeRegions, false); !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.OverallHitCodeRegions, false); !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.FragmentTotalCodeRegions, false);
-        !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.FragmentHitCodeRegions, false); !R)
-      return R.takeError();
-    if (Expected<bool> R =
-            readPod(Fragment.FragmentGroupTotalCodeRegions, false);
-        !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.FragmentGroupHitCodeRegions, false);
-        !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.CoverageBodyLine, false); !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.CoverageBodyColumn, false); !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.ExpansionSiteLine, false); !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.ExpansionSiteColumn, false); !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.FragmentOrdinal, false); !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.SortLine, false); !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.SortColumn, false); !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.ChunkIndex, false); !R)
-      return R.takeError();
-    if (Expected<bool> R = readPod(Fragment.IsRootFragment, false); !R)
-      return R.takeError();
-
-    uint32_t NumRegions = 0;
-    if (Expected<bool> R = readPod(NumRegions, false); !R)
-      return R.takeError();
-    Fragment.Regions.resize(NumRegions);
-    for (FragmentRegion &Region : Fragment.Regions) {
-      if (Expected<bool> R = readPod(Region.Kind, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.LineStart, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.ColumnStart, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.LineEnd, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.ColumnEnd, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.ExecutionCount, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.FalseExecutionCount, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.ConditionID, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.TrueConditionID, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.FalseConditionID, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.TrueFolded, false); !R)
-        return R.takeError();
-      if (Expected<bool> R = readPod(Region.FalseFolded, false); !R)
-        return R.takeError();
-    }
     return true;
   }
-
-private:
-  FragmentReader() = default;
 };
 
 Expected<std::unique_ptr<ToolOutputFile>> createTemporaryOutput() {
   int FD = -1;
   SmallString<128> Path;
-  if (std::error_code EC = sys::fs::createTemporaryFile(
-          "llvm-cov-covered-functions", "tmp", FD, Path))
+  if (std::error_code EC =
+          sys::fs::createTemporaryFile("llvm-cov-txtcvrg", "tmp", FD, Path))
     return errorCodeToError(EC);
   return std::make_unique<ToolOutputFile>(Path, FD);
 }
 
-struct RunCursor {
-  std::unique_ptr<FragmentReader> Reader;
-  FunctionFragment Current;
-  bool HasCurrent = false;
-};
+void appendKeyPart(std::string &Key, uint32_t Value) {
+  Key.append(reinterpret_cast<const char *>(&Value), sizeof(Value));
+}
 
-template <typename ConsumerT>
-Error mergeRuns(ArrayRef<ToolOutputFile *> Runs, ConsumerT Consume) {
-  std::vector<RunCursor> Cursors;
-  Cursors.reserve(Runs.size());
-  for (ToolOutputFile *Run : Runs) {
-    Expected<std::unique_ptr<FragmentReader>> Reader =
-        FragmentReader::create(Run->getFilename());
-    if (!Reader)
-      return Reader.takeError();
-    RunCursor Cursor{std::move(*Reader), FunctionFragment(), false};
-    Expected<bool> HasRecord = Cursor.Reader->read(Cursor.Current);
-    if (!HasRecord)
-      return HasRecord.takeError();
-    Cursor.HasCurrent = *HasRecord;
-    Cursors.push_back(std::move(Cursor));
-  }
-
-  auto Compare = [&](size_t LHS, size_t RHS) {
-    return Cursors[RHS].Current < Cursors[LHS].Current;
-  };
-  std::priority_queue<size_t, std::vector<size_t>, decltype(Compare)> Queue(
-      Compare);
-  for (size_t I = 0; I < Cursors.size(); ++I)
-    if (Cursors[I].HasCurrent)
-      Queue.push(I);
-
-  while (!Queue.empty()) {
-    size_t I = Queue.top();
-    Queue.pop();
-    FunctionFragment Current = std::move(Cursors[I].Current);
-    Cursors[I].Current = FunctionFragment();
-    Cursors[I].HasCurrent = false;
-    Expected<bool> HasRecord = Cursors[I].Reader->read(Cursors[I].Current);
-    if (!HasRecord)
-      return HasRecord.takeError();
-    Cursors[I].HasCurrent = *HasRecord;
-    if (Cursors[I].HasCurrent)
-      Queue.push(I);
-    if (Error E = Consume(Current))
-      return E;
-  }
-  return Error::success();
+std::string sourceRegionKey(const SourceRegion &Region) {
+  std::string Key;
+  Key.reserve(5 * sizeof(uint32_t));
+  appendKeyPart(Key, Region.Kind);
+  appendKeyPart(Key, Region.LineStart);
+  appendKeyPart(Key, Region.ColumnStart);
+  appendKeyPart(Key, Region.LineEnd);
+  appendKeyPart(Key, Region.ColumnEnd);
+  return Key;
 }
 
 } // namespace
@@ -439,7 +214,15 @@ class CoverageExporterCoveredFunctions::Implementation {
   const CoverageFilters &FilenameFilters;
   const CoveredFunctionsExportOptions Options;
   std::vector<PathRemapping> PathRemappings;
-  std::unique_ptr<ToolOutputFile> Spool;
+  StringMap<std::string> RemappedPathCache;
+  StringMap<uint32_t> SourceFilenameIDs;
+  std::vector<std::string> SourceFilenames;
+  std::array<std::unique_ptr<ToolOutputFile>, NumSourcePartitions>
+      SourcePartitions;
+  DenseMap<uint32_t, SourceFileRegions> PendingSourceRegions;
+  size_t PendingSourceRegionMemory = 0;
+  std::string CurrentFunctionFile;
+  bool FunctionFileOpen = false;
   bool Finished = false;
 
   static std::string normalizedPath(StringRef Path, bool TrailingSeparator) {
@@ -454,260 +237,233 @@ class CoverageExporterCoveredFunctions::Implementation {
 
   std::string remapPath(StringRef Path) const {
     std::string Native = normalizedPath(Path, false);
-    for (const PathRemapping &Remapping : PathRemappings) {
+    for (const PathRemapping &Remapping : PathRemappings)
       if (StringRef(Native).starts_with(Remapping.From))
         return Remapping.To +
                StringRef(Native).drop_front(Remapping.From.size()).str();
-    }
     return Native;
   }
 
-  Error ensureSpool() {
-    if (Spool)
-      return Error::success();
-    Expected<std::unique_ptr<ToolOutputFile>> Output = createTemporaryOutput();
-    if (!Output)
-      return Output.takeError();
-    Spool = std::move(*Output);
+  StringRef remapPathCached(StringRef Path) {
+    auto [I, Inserted] = RemappedPathCache.try_emplace(Path);
+    if (Inserted)
+      I->second = remapPath(Path);
+    return I->second;
+  }
+
+  Expected<uint32_t> getSourceFilenameID(StringRef Filename) {
+    auto I = SourceFilenameIDs.find(Filename);
+    if (I != SourceFilenameIDs.end())
+      return I->second;
+    if (SourceFilenames.size() == std::numeric_limits<uint32_t>::max())
+      return createStringError(errc::file_too_large,
+                               "too many text coverage source filenames");
+    uint32_t ID = SourceFilenames.size();
+    SourceFilenames.push_back(Filename.str());
+    SourceFilenameIDs.insert({SourceFilenames.back(), ID});
+    return ID;
+  }
+
+  static size_t aggregateSourceRegionInFile(SourceFileRegions &File,
+                                            SourceRegion Region) {
+    uint64_t ExecutionCount = Region.ExecutionCount;
+    std::string Key = sourceRegionKey(Region);
+    auto [I, Inserted] =
+        File.Regions.try_emplace(std::move(Key), std::move(Region));
+    if (!Inserted) {
+      I->second.ExecutionCount =
+          SaturatingAdd(I->second.ExecutionCount, ExecutionCount);
+      return 0;
+    }
+    // Include conservative estimates for the string object, hash-table node,
+    // and bucket storage. The limit is intentionally approximate, but it must
+    // overestimate normal libstdc++ and libc++ unordered_map entries so a
+    // partition is split before its aggregate becomes unexpectedly large.
+    return sizeof(SourceRegion) + sizeof(std::string) + I->first.capacity() +
+           64;
+  }
+
+  static size_t
+  aggregateSourceRegion(DenseMap<uint32_t, SourceFileRegions> &Files,
+                        SourceRegion Region) {
+    auto [File, Inserted] = Files.try_emplace(Region.FilenameID);
+    size_t AddedMemory = Inserted ? sizeof(SourceFileRegions) + 128 : 0;
+    return AddedMemory +
+           aggregateSourceRegionInFile(File->second, std::move(Region));
+  }
+
+  Error writeInitialSourceRegion(const SourceRegion &Region) {
+    // Partition by filename rather than region coordinates. That produces one
+    // source-file block per file unless recursive repartitioning is needed.
+    unsigned Partition = Region.FilenameID % NumSourcePartitions;
+    std::unique_ptr<ToolOutputFile> &Output = SourcePartitions[Partition];
+    if (!Output) {
+      Expected<std::unique_ptr<ToolOutputFile>> OutputOrErr =
+          createTemporaryOutput();
+      if (!OutputOrErr)
+        return OutputOrErr.takeError();
+      Output = std::move(*OutputOrErr);
+    }
+    return writeSourceRegion(Output->os(), Region,
+                             Options.ExportMode ==
+                                 CoveredFunctionsExportOptions::Mode::Baseline);
+  }
+
+  Error flushPendingSourceRegions() {
+    for (const auto &File : PendingSourceRegions)
+      for (const auto &Entry : File.second.Regions)
+        if (Error E = writeInitialSourceRegion(Entry.second))
+          return E;
+    DenseMap<uint32_t, SourceFileRegions> EmptyRegions;
+    PendingSourceRegions.swap(EmptyRegions);
+    PendingSourceRegionMemory = 0;
     return Error::success();
   }
 
-  Expected<std::unique_ptr<ToolOutputFile>>
-  writeSortedRun(std::vector<FunctionFragment> &Fragments) {
-    llvm::sort(Fragments);
-    Expected<std::unique_ptr<ToolOutputFile>> Run = createTemporaryOutput();
-    if (!Run)
-      return Run.takeError();
-    for (const FunctionFragment &Fragment : Fragments)
-      if (Error E = writeFragment((*Run)->os(), Fragment))
-        return std::move(E);
-    (*Run)->os().close();
-    if ((*Run)->os().has_error())
-      return errorCodeToError((*Run)->os().error());
-    return std::move(*Run);
-  }
-
-  Expected<std::vector<std::unique_ptr<ToolOutputFile>>> createSortedRuns() {
-    std::vector<std::unique_ptr<ToolOutputFile>> Runs;
-    if (!Spool)
-      return Runs;
-    Spool->os().close();
-    if (Spool->os().has_error())
-      return errorCodeToError(Spool->os().error());
-
-    Expected<std::unique_ptr<FragmentReader>> Reader =
-        FragmentReader::create(Spool->getFilename());
-    if (!Reader)
-      return Reader.takeError();
-
-    std::vector<FunctionFragment> Fragments;
-    size_t Memory = 0;
-    for (;;) {
-      FunctionFragment Fragment;
-      Expected<bool> HasRecord = (*Reader)->read(Fragment);
-      if (!HasRecord)
-        return HasRecord.takeError();
-      if (!*HasRecord)
-        break;
-      Memory += Fragment.memorySize();
-      Fragments.push_back(std::move(Fragment));
-      if (Memory < SortMemoryLimit)
-        continue;
-      Expected<std::unique_ptr<ToolOutputFile>> Run = writeSortedRun(Fragments);
-      if (!Run)
-        return Run.takeError();
-      Runs.push_back(std::move(*Run));
-      Fragments.clear();
-      Memory = 0;
-    }
-    if (!Fragments.empty()) {
-      Expected<std::unique_ptr<ToolOutputFile>> Run = writeSortedRun(Fragments);
-      if (!Run)
-        return Run.takeError();
-      Runs.push_back(std::move(*Run));
-    }
-    return Runs;
-  }
-
-  Expected<std::vector<std::unique_ptr<ToolOutputFile>>>
-  reduceRuns(std::vector<std::unique_ptr<ToolOutputFile>> Runs) {
-    while (Runs.size() > MergeFanIn) {
-      std::vector<std::unique_ptr<ToolOutputFile>> MergedRuns;
-      for (size_t Begin = 0; Begin < Runs.size(); Begin += MergeFanIn) {
-        size_t End = std::min(Runs.size(), Begin + MergeFanIn);
-        Expected<std::unique_ptr<ToolOutputFile>> Output =
-            createTemporaryOutput();
-        if (!Output)
-          return Output.takeError();
-        SmallVector<ToolOutputFile *, MergeFanIn> Inputs;
-        for (size_t I = Begin; I < End; ++I)
-          Inputs.push_back(Runs[I].get());
-        if (Error E = mergeRuns(Inputs, [&](const FunctionFragment &Fragment) {
-              return writeFragment((*Output)->os(), Fragment);
-            }))
-          return std::move(E);
-        (*Output)->os().close();
-        if ((*Output)->os().has_error())
-          return errorCodeToError((*Output)->os().error());
-        MergedRuns.push_back(std::move(*Output));
-      }
-      Runs = std::move(MergedRuns);
-    }
-    return Runs;
-  }
-
-  Error renderRuns(ArrayRef<ToolOutputFile *> Runs) {
-    OS << "covered-functions-format 3\nmode - "
-       << (Options.ExportMode == CoveredFunctionsExportOptions::Mode::Baseline
-               ? "baseline"
-               : "execution")
-       << "\nfeatures - branches=" << unsigned(Options.IncludeBranches)
-       << " mcdc=" << unsigned(Options.IncludeMCDC) << '\n';
-    std::string CurrentRootFilename;
-    std::string CurrentRawFunctionName;
-    uint64_t CurrentFunctionHash = 0;
-    uint32_t CurrentBodyLine = 0;
-    uint32_t CurrentBodyColumn = 0;
-    bool HasCurrentFunction = false;
-    std::string CurrentFragmentFilename;
-    bool CurrentFragmentIsRoot = false;
-    bool HasCurrentFragment = false;
-    uint32_t CurrentExpansionOrdinal = 0;
-    bool HasCurrentExpansion = false;
-
-    Error E = mergeRuns(Runs, [&](const FunctionFragment &Fragment) -> Error {
-      bool StartsFunction =
-          !HasCurrentFunction ||
-          std::tie(Fragment.CoverageRootFilename, Fragment.CoverageBodyLine,
-                   Fragment.CoverageBodyColumn, Fragment.RawFunctionName,
-                   Fragment.FunctionHash) !=
-              std::tie(CurrentRootFilename, CurrentBodyLine, CurrentBodyColumn,
-                       CurrentRawFunctionName, CurrentFunctionHash);
-      if (StartsFunction) {
-        if (HasCurrentExpansion) {
-          OS << "end-expansion\n";
-          HasCurrentExpansion = false;
-        }
-        if (HasCurrentFragment) {
-          OS << "end-fragment\n";
-          HasCurrentFragment = false;
-        }
-        if (HasCurrentFunction)
-          OS << "end-function\n";
-        HasCurrentFunction = true;
-        CurrentRootFilename = Fragment.CoverageRootFilename;
-        CurrentRawFunctionName = Fragment.RawFunctionName;
-        CurrentFunctionHash = Fragment.FunctionHash;
-        CurrentBodyLine = Fragment.CoverageBodyLine;
-        CurrentBodyColumn = Fragment.CoverageBodyColumn;
-
-        double OverallPercent = Fragment.OverallTotalCodeRegions
-                                    ? 100.0 * Fragment.OverallHitCodeRegions /
-                                          Fragment.OverallTotalCodeRegions
-                                    : 0.0;
-        OS << "\nfunction - \"";
-        printEscapedString(Fragment.DisplayName, OS);
-        OS << "\"\nfunction-id - \"";
-        printEscapedString(Fragment.RawFunctionName, OS);
-        OS << "\" " << format_hex(Fragment.FunctionHash, 18) << '\n';
-        OS << "entry-count - " << Fragment.EntryCount << '\n';
-        OS << "overall-coverage - " << Fragment.OverallTotalCodeRegions << ' '
-           << Fragment.OverallHitCodeRegions << ' '
-           << format("%.2f", OverallPercent) << '\n';
-        OS << "coverage-body-at - \"";
-        printEscapedString(Fragment.CoverageRootFilename, OS);
-        OS << "\" " << Fragment.CoverageBodyLine << ' '
-           << Fragment.CoverageBodyColumn << '\n';
-      }
-
-      bool StartsFragment = !HasCurrentFragment || StartsFunction ||
-                            Fragment.Filename != CurrentFragmentFilename ||
-                            Fragment.IsRootFragment != CurrentFragmentIsRoot;
-      if (StartsFragment) {
-        if (HasCurrentExpansion) {
-          OS << "end-expansion\n";
-          HasCurrentExpansion = false;
-        }
-        if (HasCurrentFragment)
-          OS << "end-fragment\n";
-        HasCurrentFragment = true;
-        CurrentFragmentFilename = Fragment.Filename;
-        CurrentFragmentIsRoot = Fragment.IsRootFragment;
-
-        double Percent = Fragment.FragmentGroupTotalCodeRegions
-                             ? 100.0 * Fragment.FragmentGroupHitCodeRegions /
-                                   Fragment.FragmentGroupTotalCodeRegions
-                             : 0.0;
-        OS << "fragment - "
-           << (Fragment.IsRootFragment ? "root \"" : "expansion \"");
-        printEscapedString(Fragment.Filename, OS);
-        OS << "\" " << Fragment.FragmentGroupTotalCodeRegions << ' '
-           << Fragment.FragmentGroupHitCodeRegions << ' '
-           << format("%.2f", Percent) << '\n';
-      }
-
-      if (!Fragment.IsRootFragment &&
-          (!HasCurrentExpansion ||
-           Fragment.FragmentOrdinal != CurrentExpansionOrdinal)) {
-        if (HasCurrentExpansion)
-          OS << "end-expansion\n";
-        HasCurrentExpansion = true;
-        CurrentExpansionOrdinal = Fragment.FragmentOrdinal;
-        double Percent = Fragment.FragmentTotalCodeRegions
-                             ? 100.0 * Fragment.FragmentHitCodeRegions /
-                                   Fragment.FragmentTotalCodeRegions
-                             : 0.0;
-        OS << "expansion-at - \"";
-        printEscapedString(Fragment.ExpansionSiteFilename, OS);
-        OS << "\" " << Fragment.ExpansionSiteLine << ' '
-           << Fragment.ExpansionSiteColumn << ' '
-           << Fragment.FragmentTotalCodeRegions << ' '
-           << Fragment.FragmentHitCodeRegions << ' ' << format("%.2f", Percent)
-           << '\n';
-      }
-
-      for (const FragmentRegion &Region : Fragment.Regions) {
-        if (Region.Kind <= 4) {
-          OS << "region - " << Region.Kind << ' ' << Region.LineStart << ' '
-             << Region.ColumnStart << ' ' << Region.LineEnd << ' '
-             << Region.ColumnEnd << ' ' << Region.ExecutionCount << '\n';
-          continue;
-        }
-        if (Region.Kind == ReportBranchRegionKind) {
-          OS << "branch - " << Region.LineStart << ' ' << Region.ColumnStart
-             << ' ' << Region.LineEnd << ' ' << Region.ColumnEnd << ' '
-             << Region.ExecutionCount << ' ' << Region.FalseExecutionCount
-             << ' ' << unsigned(Region.TrueFolded) << ' '
-             << unsigned(Region.FalseFolded) << '\n';
-          continue;
-        }
-        if (Region.Kind == ReportMCDCDecisionRegionKind) {
-          OS << "mcdc-decision - " << Region.LineStart << ' '
-             << Region.ColumnStart << ' ' << Region.LineEnd << ' '
-             << Region.ColumnEnd << ' ' << Region.ExecutionCount << ' '
-             << Region.FalseExecutionCount << ' ' << Region.ConditionID << ' '
-             << Region.TrueConditionID << ' ' << Region.FalseConditionID
-             << '\n';
-          continue;
-        }
-        assert(Region.Kind == ReportMCDCBranchRegionKind);
-        OS << "mcdc-branch - " << Region.LineStart << ' ' << Region.ColumnStart
-           << ' ' << Region.LineEnd << ' ' << Region.ColumnEnd << ' '
-           << Region.ExecutionCount << ' ' << Region.FalseExecutionCount << ' '
-           << Region.ConditionID << ' ' << Region.TrueConditionID << ' '
-           << Region.FalseConditionID << ' ' << unsigned(Region.TrueFolded)
-           << ' ' << unsigned(Region.FalseFolded) << '\n';
-      }
+  Error addSourceRegion(SourceRegion Region) {
+    PendingSourceRegionMemory +=
+        aggregateSourceRegion(PendingSourceRegions, std::move(Region));
+    if (PendingSourceRegionMemory <= SourcePartitionMemoryLimit)
       return Error::success();
-    });
-    if (E)
-      return E;
-    if (HasCurrentExpansion)
-      OS << "end-expansion\n";
-    if (HasCurrentFragment)
-      OS << "end-fragment\n";
-    if (HasCurrentFunction)
-      OS << "end-function\n";
+    return flushPendingSourceRegions();
+  }
+
+  static unsigned getSourceRegionPartition(const SourceRegion &Region,
+                                           unsigned Depth) {
+    return static_cast<size_t>(hash_combine(
+               Depth, Region.FilenameID, Region.Kind, Region.LineStart,
+               Region.ColumnStart, Region.LineEnd, Region.ColumnEnd)) %
+           NumSourcePartitions;
+  }
+
+  Error addPartitionedSourceRegion(std::array<std::unique_ptr<ToolOutputFile>,
+                                              NumSourcePartitions> &Partitions,
+                                   const SourceRegion &Region, unsigned Depth) {
+    unsigned Partition = getSourceRegionPartition(Region, Depth);
+    std::unique_ptr<ToolOutputFile> &Output = Partitions[Partition];
+    if (!Output) {
+      Expected<std::unique_ptr<ToolOutputFile>> OutputOrErr =
+          createTemporaryOutput();
+      if (!OutputOrErr)
+        return OutputOrErr.takeError();
+      Output = std::move(*OutputOrErr);
+    }
+    return writeSourceRegion(Output->os(), Region,
+                             Options.ExportMode ==
+                                 CoveredFunctionsExportOptions::Mode::Baseline);
+  }
+
+  void renderFunction(StringRef RootFilename, StringRef DisplayName,
+                      uint64_t TotalCodeRegions, uint64_t HitCodeRegions) {
+    if (!FunctionFileOpen || CurrentFunctionFile != RootFilename) {
+      CurrentFunctionFile = RootFilename;
+      FunctionFileOpen = true;
+      OS << "\nfile\t\"";
+      printEscapedString(RootFilename, OS);
+      OS << "\"\n";
+    }
+    double Percent =
+        TotalCodeRegions ? 100.0 * HitCodeRegions / TotalCodeRegions : 0.0;
+    OS << "function\t\"";
+    printEscapedString(DisplayName, OS);
+    OS << "\"\t" << TotalCodeRegions << '\t' << HitCodeRegions << '\t'
+       << format("%.2f", Percent) << '\n';
+  }
+
+  void renderSourceFiles(DenseMap<uint32_t, SourceFileRegions> &Files) {
+    for (auto &File : Files) {
+      assert(File.first < SourceFilenames.size() &&
+             "invalid source filename ID");
+      OS << "\nfile\t\"";
+      printEscapedString(SourceFilenames[File.first], OS);
+      OS << "\"\n";
+      for (const auto &Entry : File.second.Regions) {
+        const SourceRegion &Region = Entry.second;
+        OS << Region.Kind << '\t' << Region.LineStart << '.'
+           << Region.ColumnStart << '\t' << Region.LineEnd << '.'
+           << Region.ColumnEnd << '\t' << Region.ExecutionCount << '\n';
+      }
+    }
+  }
+
+  Error renderSourcePartition(StringRef Path, unsigned Depth) {
+    Expected<std::unique_ptr<SourceRegionReader>> ReaderOrErr =
+        SourceRegionReader::create(Path);
+    if (!ReaderOrErr)
+      return ReaderOrErr.takeError();
+    std::unique_ptr<SourceRegionReader> Reader = std::move(*ReaderOrErr);
+
+    DenseMap<uint32_t, SourceFileRegions> Files;
+    size_t MemoryUsage = 0;
+    std::array<std::unique_ptr<ToolOutputFile>, NumSourcePartitions>
+        ChildPartitions;
+    bool Repartitioned = false;
+    while (true) {
+      SourceRegion Region;
+      Expected<bool> HasRegion = Reader->read(
+          Region, SourceFilenames.size(),
+          Options.ExportMode == CoveredFunctionsExportOptions::Mode::Baseline);
+      if (!HasRegion)
+        return HasRegion.takeError();
+      if (!*HasRegion)
+        break;
+
+      if (Repartitioned) {
+        if (Error E =
+                addPartitionedSourceRegion(ChildPartitions, Region, Depth + 1))
+          return E;
+        continue;
+      }
+
+      MemoryUsage += aggregateSourceRegion(Files, std::move(Region));
+      if (MemoryUsage <= SourcePartitionMemoryLimit)
+        continue;
+      if (Depth >= MaxSourcePartitionDepth)
+        return createStringError(
+            errc::not_enough_memory,
+            "text coverage source partition exceeds the memory limit after "
+            "recursive repartitioning");
+
+      for (const auto &File : Files)
+        for (const auto &Entry : File.second.Regions)
+          if (Error E = addPartitionedSourceRegion(ChildPartitions,
+                                                   Entry.second, Depth + 1))
+            return E;
+      DenseMap<uint32_t, SourceFileRegions> EmptyFiles;
+      Files.swap(EmptyFiles);
+      MemoryUsage = 0;
+      Repartitioned = true;
+    }
+
+    if (!Repartitioned) {
+      renderSourceFiles(Files);
+      return Error::success();
+    }
+
+    Reader.reset();
+    for (const std::unique_ptr<ToolOutputFile> &Output : ChildPartitions) {
+      if (!Output)
+        continue;
+      Output->os().close();
+      if (Output->os().has_error())
+        return errorCodeToError(Output->os().error());
+    }
+    for (const std::unique_ptr<ToolOutputFile> &Output : ChildPartitions) {
+      if (!Output)
+        continue;
+      if (Error E = renderSourcePartition(Output->getFilename(), Depth + 1))
+        return E;
+    }
+    return Error::success();
+  }
+
+  Error renderSourcePartitions() {
+    for (const std::unique_ptr<ToolOutputFile> &Output : SourcePartitions) {
+      if (!Output)
+        continue;
+      if (Error E = renderSourcePartition(Output->getFilename(), 0))
+        return E;
+    }
     return Error::success();
   }
 
@@ -721,26 +477,22 @@ public:
     for (const auto &[From, To] : Remappings)
       PathRemappings.push_back(
           {normalizedPath(From, true), normalizedPath(To, true)});
+    OS << "txtcvrg\t3\t"
+       << (Options.ExportMode == CoveredFunctionsExportOptions::Mode::Baseline
+               ? "baseline"
+               : "execution")
+       << "\tbranches=" << unsigned(Options.IncludeBranches)
+       << "\tmcdc=" << unsigned(Options.IncludeMCDC) << '\n';
   }
 
-  Error consume(StringRef RawFunctionName, uint64_t FunctionHash,
+  Error consume(StringRef RawFunctionName, uint64_t,
                 FunctionRecord &&Function) {
     if (Finished)
       return createStringError(errc::invalid_argument,
-                               "covered-functions exporter is finished");
-    if (Error E = ensureSpool())
-      return E;
+                               "text coverage exporter is finished");
 
-    struct ExpansionSite {
-      unsigned ParentFileID;
-      uint32_t Line;
-      uint32_t Column;
-    };
-
-    BitVector UsedFileIDs(Function.Filenames.size());
-    BitVector ExpandedFileIDs(Function.Filenames.size());
-    std::vector<std::optional<ExpansionSite>> ExpansionSites(
-        Function.Filenames.size());
+    SmallBitVector UsedFileIDs(Function.Filenames.size());
+    SmallBitVector ExpandedFileIDs(Function.Filenames.size());
     for (const CountedRegion &Region : Function.CountedRegions) {
       if (Region.FileID >= Function.Filenames.size())
         return make_error<CoverageMapError>(coveragemap_error::malformed,
@@ -751,164 +503,115 @@ public:
       if (Region.ExpandedFileID >= Function.Filenames.size())
         return make_error<CoverageMapError>(coveragemap_error::malformed,
                                             "invalid expanded coverage FileID");
-      if (ExpansionSites[Region.ExpandedFileID])
-        return make_error<CoverageMapError>(
-            coveragemap_error::malformed,
-            "coverage FileID has multiple expansion sites");
-      ExpansionSites[Region.ExpandedFileID] =
-          ExpansionSite{Region.FileID, Region.LineStart, Region.ColumnStart};
       ExpandedFileIDs.set(Region.ExpandedFileID);
     }
 
-    std::optional<unsigned> CoverageRootFileID;
-    for (unsigned FileID = 0; FileID != Function.Filenames.size(); ++FileID) {
+    std::optional<unsigned> RootFileID;
+    for (unsigned FileID = 0; FileID != Function.Filenames.size(); ++FileID)
       if (UsedFileIDs.test(FileID) && !ExpandedFileIDs.test(FileID)) {
-        CoverageRootFileID = FileID;
+        RootFileID = FileID;
         break;
       }
-    }
-    if (!CoverageRootFileID)
+    if (!RootFileID)
       return make_error<CoverageMapError>(
           coveragemap_error::malformed,
           "coverage function has no non-expanded root file");
+    if (FilenameFilters.matchesFilename(Function.Filenames[*RootFileID]))
+      return Error::success();
 
-    const CountedRegion *CoverageBodyRegion = nullptr;
-    const CountedRegion *FallbackBodyRegion = nullptr;
+    uint64_t TotalCodeRegions = 0;
+    uint64_t HitCodeRegions = 0;
+    bool HasReportableRootRegion = false;
     for (const CountedRegion &Region : Function.CountedRegions) {
-      if (Region.FileID != *CoverageRootFileID)
-        continue;
-      if (!FallbackBodyRegion)
-        FallbackBodyRegion = &Region;
-      if (Region.Kind == CounterMappingRegion::CodeRegion) {
-        CoverageBodyRegion = &Region;
-        break;
+      if (Region.FileID == *RootFileID) {
+        HasReportableRootRegion |= bool(getReportRegionKind(Region.Kind));
+        if (Region.Kind == CounterMappingRegion::CodeRegion) {
+          ++TotalCodeRegions;
+          HitCodeRegions += Region.ExecutionCount != 0;
+        }
       }
     }
-    if (!CoverageBodyRegion)
-      CoverageBodyRegion = FallbackBodyRegion;
-    if (!CoverageBodyRegion)
-      return make_error<CoverageMapError>(
-          coveragemap_error::malformed,
-          "coverage root file has no reportable regions");
+    if (Options.ExportMode == CoveredFunctionsExportOptions::Mode::Execution &&
+        HitCodeRegions == 0)
+      return Error::success();
+    if (!HasReportableRootRegion)
+      return Error::success();
 
-    std::string CoverageRootFilename =
-        remapPath(Function.Filenames[*CoverageRootFileID]);
-    uint64_t OverallTotalCodeRegions = 0;
-    uint64_t OverallHitCodeRegions = 0;
+    StringRef RootFilename = remapPathCached(Function.Filenames[*RootFileID]);
+    std::string DisplayName =
+        Function.Name.empty() ? RawFunctionName.str() : Function.Name;
+    if (DisplayName.empty())
+      DisplayName = "<global-init@" + RootFilename.str() + ">";
+    renderFunction(RootFilename, DisplayName, TotalCodeRegions, HitCodeRegions);
     for (const CountedRegion &Region : Function.CountedRegions) {
-      if (Region.Kind != CounterMappingRegion::CodeRegion)
+      std::optional<uint32_t> ReportKind = getReportRegionKind(Region.Kind);
+      if (!ReportKind)
         continue;
-      ++OverallTotalCodeRegions;
-      OverallHitCodeRegions += Region.ExecutionCount != 0;
-    }
-
-    std::vector<std::unique_ptr<FunctionFragment>> Fragments(
-        Function.Filenames.size());
-    auto getOrCreateFragment = [&](const CounterMappingRegion &Region)
-        -> Expected<FunctionFragment *> {
       if (Region.FileID >= Function.Filenames.size())
         return make_error<CoverageMapError>(coveragemap_error::malformed,
                                             "invalid coverage FileID");
       StringRef Filename = Function.Filenames[Region.FileID];
       if (FilenameFilters.matchesFilename(Filename))
-        return nullptr;
-      std::unique_ptr<FunctionFragment> &FragmentStorage =
-          Fragments[Region.FileID];
-      if (!FragmentStorage) {
-        FragmentStorage = std::make_unique<FunctionFragment>();
-        FunctionFragment &Fragment = *FragmentStorage;
-        Fragment.Filename = remapPath(Filename);
-        Fragment.CoverageRootFilename = CoverageRootFilename;
-        Fragment.DisplayName = Function.Name;
-        Fragment.RawFunctionName = RawFunctionName.str();
-        Fragment.FunctionHash = FunctionHash;
-        Fragment.EntryCount = Function.ExecutionCount;
-        Fragment.OverallTotalCodeRegions = OverallTotalCodeRegions;
-        Fragment.OverallHitCodeRegions = OverallHitCodeRegions;
-        Fragment.CoverageBodyLine = CoverageBodyRegion->LineStart;
-        Fragment.CoverageBodyColumn = CoverageBodyRegion->ColumnStart;
-        Fragment.FragmentOrdinal = Region.FileID;
-        Fragment.IsRootFragment = !ExpandedFileIDs.test(Region.FileID);
-        if (!Fragment.IsRootFragment) {
-          const std::optional<ExpansionSite> &Site =
-              ExpansionSites[Region.FileID];
-          if (!Site)
-            return make_error<CoverageMapError>(
-                coveragemap_error::malformed,
-                "expanded coverage FileID has no expansion site");
-          Fragment.ExpansionSiteFilename =
-              remapPath(Function.Filenames[Site->ParentFileID]);
-          Fragment.ExpansionSiteLine = Site->Line;
-          Fragment.ExpansionSiteColumn = Site->Column;
-        }
-      }
-      return FragmentStorage.get();
-    };
-
-    for (const CountedRegion &Region : Function.CountedRegions) {
-      std::optional<uint32_t> ReportKind = getReportRegionKind(Region.Kind);
-      if (!ReportKind)
         continue;
-      Expected<FunctionFragment *> FragmentOrErr = getOrCreateFragment(Region);
-      if (!FragmentOrErr)
-        return FragmentOrErr.takeError();
-      FunctionFragment *Fragment = *FragmentOrErr;
-      if (!Fragment)
+      if (Region.FileID == *RootFileID) {
+        OS << *ReportKind << '\t' << Region.LineStart << '.'
+           << Region.ColumnStart << '\t' << Region.LineEnd << '.'
+           << Region.ColumnEnd << '\t' << Region.ExecutionCount << '\n';
         continue;
-      Fragment->Regions.push_back({*ReportKind, Region.LineStart,
-                                   Region.ColumnStart, Region.LineEnd,
-                                   Region.ColumnEnd, Region.ExecutionCount});
-      if (Region.Kind == CounterMappingRegion::CodeRegion &&
-          (Fragment->SortLine == 0 ||
-           std::tie(Region.LineStart, Region.ColumnStart) <
-               std::tie(Fragment->SortLine, Fragment->SortColumn))) {
-        Fragment->SortLine = Region.LineStart;
-        Fragment->SortColumn = Region.ColumnStart;
       }
+      StringRef RemappedFilename = remapPathCached(Filename);
+      Expected<uint32_t> FilenameID = getSourceFilenameID(RemappedFilename);
+      if (!FilenameID)
+        return FilenameID.takeError();
+      SourceRegion OutputRegion{*FilenameID,          *ReportKind,
+                                Region.LineStart,     Region.ColumnStart,
+                                Region.LineEnd,       Region.ColumnEnd,
+                                Region.ExecutionCount};
+      if (Error E = addSourceRegion(std::move(OutputRegion)))
+        return E;
     }
 
     for (const CountedRegion &Region : Function.CountedBranchRegions) {
-      Expected<FunctionFragment *> FragmentOrErr = getOrCreateFragment(Region);
-      if (!FragmentOrErr)
-        return FragmentOrErr.takeError();
-      FunctionFragment *Fragment = *FragmentOrErr;
-      if (!Fragment)
+      if (Region.FileID >= Function.Filenames.size())
+        return make_error<CoverageMapError>(coveragemap_error::malformed,
+                                            "invalid branch coverage FileID");
+      StringRef Filename = Function.Filenames[Region.FileID];
+      if (FilenameFilters.matchesFilename(Filename))
         continue;
-
-      auto appendBranch = [&](uint32_t ReportKind) {
-        FragmentRegion OutputRegion{ReportKind,         Region.LineStart,
-                                    Region.ColumnStart, Region.LineEnd,
-                                    Region.ColumnEnd,   Region.ExecutionCount};
-        OutputRegion.FalseExecutionCount = Region.FalseExecutionCount;
-        OutputRegion.TrueFolded = Region.TrueFolded;
-        OutputRegion.FalseFolded = Region.FalseFolded;
-        if (ReportKind == ReportMCDCBranchRegionKind) {
-          const mcdc::BranchParameters &Params = Region.getBranchParams();
-          OutputRegion.ConditionID = Params.ID;
-          OutputRegion.FalseConditionID = Params.Conds[0];
-          OutputRegion.TrueConditionID = Params.Conds[1];
-        }
-        Fragment->Regions.push_back(OutputRegion);
-      };
-
-      if (Options.IncludeBranches)
-        appendBranch(ReportBranchRegionKind);
-      if (Region.Kind == CounterMappingRegion::MCDCBranchRegion &&
-          Options.IncludeMCDC)
-        appendBranch(ReportMCDCBranchRegionKind);
+      StringRef RemappedFilename = remapPathCached(Filename);
+      if (Options.IncludeBranches) {
+        OS << "branch\t\"";
+        printEscapedString(RemappedFilename, OS);
+        OS << "\"\t" << Region.LineStart << '.' << Region.ColumnStart << '\t'
+           << Region.LineEnd << '.' << Region.ColumnEnd << '\t'
+           << Region.ExecutionCount << '\t' << Region.FalseExecutionCount
+           << '\t' << unsigned(Region.TrueFolded) << '\t'
+           << unsigned(Region.FalseFolded) << '\n';
+      }
+      if (Options.IncludeMCDC &&
+          Region.Kind == CounterMappingRegion::MCDCBranchRegion) {
+        const mcdc::BranchParameters &Params = Region.getBranchParams();
+        OS << "mcdc-branch\t\"";
+        printEscapedString(RemappedFilename, OS);
+        OS << "\"\t" << Region.LineStart << '.' << Region.ColumnStart << '\t'
+           << Region.LineEnd << '.' << Region.ColumnEnd << '\t'
+           << Region.ExecutionCount << '\t' << Region.FalseExecutionCount
+           << '\t' << Params.ID << '\t' << Params.Conds[1] << '\t'
+           << Params.Conds[0] << '\t' << unsigned(Region.TrueFolded) << '\t'
+           << unsigned(Region.FalseFolded) << '\n';
+      }
     }
 
     if (Options.IncludeMCDC)
       for (MCDCRecord &Record : Function.MCDCRecords) {
         const CounterMappingRegion &Region = Record.getDecisionRegion();
-        Expected<FunctionFragment *> FragmentOrErr =
-            getOrCreateFragment(Region);
-        if (!FragmentOrErr)
-          return FragmentOrErr.takeError();
-        FunctionFragment *Fragment = *FragmentOrErr;
-        if (!Fragment)
+        if (Region.FileID >= Function.Filenames.size())
+          return make_error<CoverageMapError>(
+              coveragemap_error::malformed,
+              "invalid MC/DC decision coverage FileID");
+        StringRef Filename = Function.Filenames[Region.FileID];
+        if (FilenameFilters.matchesFilename(Filename))
           continue;
-
         auto [TrueDecisions, FalseDecisions] = Record.getDecisions();
         unsigned CoveredConditions = 0;
         unsigned FoldedConditions = 0;
@@ -918,99 +621,36 @@ public:
           else if (Record.isConditionIndependencePairCovered(I))
             ++CoveredConditions;
         }
-        FragmentRegion OutputRegion{ReportMCDCDecisionRegionKind,
-                                    Region.LineStart,
-                                    Region.ColumnStart,
-                                    Region.LineEnd,
-                                    Region.ColumnEnd,
-                                    TrueDecisions};
-        OutputRegion.FalseExecutionCount = FalseDecisions;
-        OutputRegion.ConditionID = Record.getNumConditions();
-        OutputRegion.TrueConditionID = CoveredConditions;
-        OutputRegion.FalseConditionID = FoldedConditions;
-        Fragment->Regions.push_back(OutputRegion);
+        OS << "mcdc-decision\t\"";
+        printEscapedString(remapPathCached(Filename), OS);
+        OS << "\"\t" << Region.LineStart << '.' << Region.ColumnStart << '\t'
+           << Region.LineEnd << '.' << Region.ColumnEnd << '\t' << TrueDecisions
+           << '\t' << FalseDecisions << '\t' << Record.getNumConditions()
+           << '\t' << CoveredConditions << '\t' << FoldedConditions << '\n';
       }
-
-    if (Options.ExportMode == CoveredFunctionsExportOptions::Mode::Execution)
-      for (std::unique_ptr<FunctionFragment> &Fragment : Fragments) {
-        if (!Fragment)
-          continue;
-        bool HasCoveredCodeRegion =
-            llvm::any_of(Fragment->Regions, [](const FragmentRegion &Region) {
-              return Region.Kind == ReportCodeRegionKind &&
-                     Region.ExecutionCount != 0;
-            });
-        if (!HasCoveredCodeRegion)
-          Fragment.reset();
-      }
-    if (llvm::none_of(Fragments,
-                      [](const auto &Fragment) { return bool(Fragment); }))
-      return Error::success();
-
-    StringMap<std::pair<uint64_t, uint64_t>> RootGroupTotals;
-    StringMap<std::pair<uint64_t, uint64_t>> ExpansionGroupTotals;
-    for (std::unique_ptr<FunctionFragment> &FragmentStorage : Fragments) {
-      if (!FragmentStorage)
-        continue;
-      FunctionFragment &Fragment = *FragmentStorage;
-      llvm::sort(Fragment.Regions);
-      for (const FragmentRegion &Region : Fragment.Regions) {
-        if (Region.Kind != ReportCodeRegionKind)
-          continue;
-        ++Fragment.FragmentTotalCodeRegions;
-        Fragment.FragmentHitCodeRegions += Region.ExecutionCount != 0;
-      }
-      auto &GroupTotals =
-          Fragment.IsRootFragment ? RootGroupTotals : ExpansionGroupTotals;
-      auto &Totals = GroupTotals[Fragment.Filename];
-      Totals.first += Fragment.FragmentTotalCodeRegions;
-      Totals.second += Fragment.FragmentHitCodeRegions;
-    }
-
-    for (std::unique_ptr<FunctionFragment> &FragmentStorage : Fragments) {
-      if (!FragmentStorage)
-        continue;
-      FunctionFragment &Fragment = *FragmentStorage;
-      auto &GroupTotals =
-          Fragment.IsRootFragment ? RootGroupTotals : ExpansionGroupTotals;
-      const auto &Totals = GroupTotals.find(Fragment.Filename)->second;
-      Fragment.FragmentGroupTotalCodeRegions = Totals.first;
-      Fragment.FragmentGroupHitCodeRegions = Totals.second;
-      std::vector<FragmentRegion> Regions = std::move(Fragment.Regions);
-      for (size_t Begin = 0; Begin < Regions.size();
-           Begin += MaxRegionsPerFragmentChunk) {
-        size_t End =
-            std::min(Regions.size(), Begin + MaxRegionsPerFragmentChunk);
-        size_t ChunkIndex = Begin / MaxRegionsPerFragmentChunk;
-        if (ChunkIndex > std::numeric_limits<uint32_t>::max())
-          return createStringError(errc::file_too_large,
-                                   "covered-functions fragment is too large");
-        Fragment.ChunkIndex = ChunkIndex;
-        Fragment.Regions.assign(Regions.begin() + Begin, Regions.begin() + End);
-        if (Error E = writeFragment(Spool->os(), Fragment))
-          return E;
-      }
-    }
     return Error::success();
   }
 
   Error finish() {
     if (Finished)
       return createStringError(errc::invalid_argument,
-                               "covered-functions exporter finished twice");
+                               "text coverage exporter finished twice");
     Finished = true;
-    Expected<std::vector<std::unique_ptr<ToolOutputFile>>> RunsOrErr =
-        createSortedRuns();
-    if (!RunsOrErr)
-      return RunsOrErr.takeError();
-    Expected<std::vector<std::unique_ptr<ToolOutputFile>>> ReducedOrErr =
-        reduceRuns(std::move(*RunsOrErr));
-    if (!ReducedOrErr)
-      return ReducedOrErr.takeError();
-    SmallVector<ToolOutputFile *, MergeFanIn> Runs;
-    for (const std::unique_ptr<ToolOutputFile> &Run : *ReducedOrErr)
-      Runs.push_back(Run.get());
-    return renderRuns(Runs);
+    if (FunctionFileOpen)
+      FunctionFileOpen = false;
+    if (Error E = flushPendingSourceRegions())
+      return E;
+    for (const std::unique_ptr<ToolOutputFile> &Output : SourcePartitions) {
+      if (!Output)
+        continue;
+      Output->os().close();
+      if (Output->os().has_error())
+        return errorCodeToError(Output->os().error());
+    }
+    if (Error E = renderSourcePartitions())
+      return E;
+    OS << "end\n";
+    return Error::success();
   }
 };
 

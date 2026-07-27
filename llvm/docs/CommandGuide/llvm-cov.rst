@@ -506,112 +506,90 @@ DESCRIPTION
 ^^^^^^^^^^^
 
 The :program:`llvm-cov export` command exports coverage data of the binaries
-*BIN*... using the profile data *PROFILE* in JSON, lcov trace file, or covered
-functions format.
+*BIN*... using the profile data *PROFILE* in JSON, an lcov trace file, or the
+scalable text coverage format.
 
 When exporting JSON, the regions, functions, branches, expansions, and
 summaries of the coverage data will be exported. When exporting an lcov trace
 file, the line-based coverage, branch coverage, and summaries will be exported.
 
-The covered functions format is a versioned, function-oriented streaming
-format intended for scalable coverage processing. It has two modes:
+The scalable text coverage format is versioned and intended for processing
+very large coverage mappings without retaining every decoded function. It has
+two modes:
 
-* ``-empty-profile -format=covered-functions`` emits a complete baseline of
-  every mapped function, file fragment, and region with zero counts.
-* ``-coverage-only`` with ``-instr-profile=<PROFILE>`` and
-  ``-format=covered-functions`` emits a sparse execution report containing
-  only functions and file fragments with executed code regions.
+* ``-txtcvrgfull`` emits a complete baseline containing every mapped function
+  and region with zero counts. It does not accept a profile.
+* ``-txtcvrg`` with ``-instr-profile=<PROFILE>`` emits only functions with
+  executed root code regions and their source-owned expansion regions.
 
-Both modes use bounded-memory streaming and an external sort. A baseline and
-an execution report generated from the same binaries can therefore be joined
-by the ``function-id`` and fragment identity without loading the complete
-reports into memory. A source file with no coverage mapping has no record in
-the baseline.
+Functions are streamed directly. Source-owned macro regions first pass through
+a bounded streaming aggregate and are then reduced using bounded recursive hash
+partitions. No global report sort is performed.
+Consequently, a filename may have more than one ``file`` record;
+consumers must merge file blocks with the same filename. A source file with no
+coverage mapping has no record in the baseline.
 
-The output begins with a version, mode, and feature declaration:
-
-.. code-block:: text
-
-  covered-functions-format 3
-  mode - <baseline|execution>
-  features - branches=<0|1> mcdc=<0|1>
-
-The default feature values are both zero. Branch and MC/DC records are only
-decoded and emitted when explicitly requested with ``-include-branches`` or
-``-include-mcdc``, respectively.
-
-Each function and source fragment is delimited explicitly:
+Format 3 is tab-delimited. The header contains the version, mode, and optional
+features on one line:
 
 .. code-block:: text
 
-  function - "<display-name>"
-  function-id - "<raw-profile-name>" <function-hash>
-  entry-count - <count>
-  overall-coverage - <code-regions> <covered-code-regions> <percentage>
-  coverage-body-at - "<root-file>" <line> <column>
-  fragment - <root|expansion> "<file>" \
-             <code-regions> <covered-code-regions> <percentage>
-  expansion-at - "<parent-file>" <line> <column> \
-                 <code-regions> <covered-code-regions> <percentage>
-  ... region records ...
-  end-expansion
-  end-fragment
-  end-function
+  txtcvrg\t3\t<baseline|execution>\tbranches=<0|1>\tmcdc=<0|1>
 
-``function-id`` is the stable identity within reports generated from the same
-binary set. It disambiguates static functions, template instantiations, and
-other functions that share a display name. ``expansion-at`` is emitted only
-inside an expansion fragment.
-
-A region record has the following form, where line and column numbers are
-one-based and the end location is exclusive:
+Tabs delimit columns but do not indent records. A ``file`` record resets the
+current function. Regions before a ``function`` record are file-owned macro or
+otherwise unowned source; regions after a ``function`` record belong to that
+function until the next ``function`` or ``file`` record. Coordinates use
+``line.column``:
 
 .. code-block:: text
 
-  region - <kind> <start-line> <start-column> <end-line> <end-column> <count>
+  file\t"<root-file>"
+  function\t"<display-name>"\t<code-regions>\t<hit-code-regions>\
+  \t<percent>
+  <kind>\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<count>
+  branch\t"<source-file>"\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<true-count>\t<false-count>\
+  \t<true-folded>\t<false-folded>
+  mcdc-branch\t"<source-file>"\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<true-count>\t<false-count>\
+  \t<condition-id>\t<true-next-id>\t<false-next-id>\
+  \t<true-folded>\t<false-folded>
+  mcdc-decision\t"<source-file>"\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<true-decisions>\t<false-decisions>\
+  \t<conditions>\t<covered-conditions>\t<folded-conditions>
+  ...
+  file\t"<macro-or-unowned-source-file>"
+  <kind>\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<count>
+  end
 
-Region kinds are stable, one-based values:
+Raw profile names, function hashes, and entry counts are not emitted. Functions
+with the same display name remain separate ``function`` records.
 
-* ``1`` -- code region
-* ``2`` -- macro or include expansion region
-* ``3`` -- skipped, non-coverable region
-* ``4`` -- gap metadata used while rendering coverage
+Function totals include code regions in the function's root file only. Macro
+body regions owned by another source file are emitted in a separate ``file``
+record and do not contribute to that root-only total. Expansion-site records
+remain inside the root function but are not code regions.
 
-Only kind ``1`` contributes to the code-region totals and percentages in
-``overall-coverage``, ``fragment``, and ``expansion-at`` records. In
-particular, a zero execution count on a kind ``3`` record does not mean that
-its source line is uncovered. Kind ``3`` records commonly begin on blank or
-preprocessor-skipped lines. Kind ``4`` records are not independent executable
-statements.
+Branch and MC/DC records are omitted by default. ``-include-branches`` emits
+branch records, and ``-include-mcdc`` emits MC/DC branch and decision records.
+Their explicit source filename preserves the owning source and distinguishes
+branches originating in macro expansions without requiring global source-file
+aggregation. MC/DC next-condition IDs use ``-1`` for a terminal outcome.
 
-Branch records use this form:
+Region kinds are compact numeric values:
 
-.. code-block:: text
+* ``1`` -- executable code region
+* ``2`` -- macro or include expansion site
 
-  branch - <start-line> <start-column> <end-line> <end-column> \
-           <true-count> <false-count> <true-folded> <false-folded>
+Skipped and gap regions are rendering metadata rather than independently
+coverable code and are not emitted.
 
-The folded fields are ``0`` or ``1``. MC/DC records use these forms:
-
-.. code-block:: text
-
-  mcdc-decision - <start-line> <start-column> <end-line> <end-column> \
-                  <true-decisions> <false-decisions> <conditions> \
-                  <covered-conditions> <folded-conditions>
-  mcdc-branch - <start-line> <start-column> <end-line> <end-column> \
-                <true-count> <false-count> <condition-id> \
-                <true-next-id> <false-next-id> <true-folded> <false-folded>
-
-A next-condition ID of ``-1`` means that evaluation of that outcome completes
-the decision. MC/DC coverage is computed with the same independence-pair rules
-as the JSON and rendered reports. Test vectors are intentionally not included
-in the covered functions format. When both optional features are enabled, an
-MC/DC condition has a ``branch`` record for branch consumers and an
-``mcdc-branch`` record carrying its condition graph identity.
-
-The covered functions format preserves exact source ranges, but it is not a
-line coverage report. Skipped regions and gap regions must not be interpreted
-as uncovered lines. Consumers that need rendered line status should use
+Only kind ``1`` contributes to function totals and percentages. The format
+preserves exact source ranges, but it is not itself a rendered line coverage
+report. Consumers that need rendered line status should use
 :program:`llvm-cov show`, the JSON export, or the lcov export.
 
 The exported data can optionally be filtered to only export the coverage
@@ -632,28 +610,32 @@ OPTIONS
 
 .. option:: -format=<FORMAT>
 
- Use the specified output format. The supported formats are: "text" (JSON),
- "lcov", and "covered-functions". The "covered-functions" format requires
- either ``-empty-profile`` for a baseline or ``-coverage-only`` with
- ``-instr-profile`` for an execution report.
+ Use the specified output format. The supported formats are "text" (JSON) and
+ "lcov". The ``-txtcvrg`` and ``-txtcvrgfull`` modes select their own versioned
+ text format.
 
-.. option:: -coverage-only
+.. option:: -txtcvrg
 
- Export the versioned covered functions format while decoding only executed
- functions. This option must be used with ``-format=covered-functions`` and
- requires ``-instr-profile``. Source, function, summary, demangler, and skip
- filters are not supported in this mode.
+ Export the versioned scalable text format while decoding only executed
+ functions. This option requires ``-instr-profile``. Source, function, summary,
+ demangler, and skip filters are not supported.
+
+.. option:: -txtcvrgfull
+
+ Export the complete all-zero scalable text baseline without loading or
+ evaluating a profile. This option does not accept ``-instr-profile`` or
+ ``-empty-profile``.
 
 .. option:: -include-branches
 
- Include branch records in covered functions output. This includes branch
- outcomes from MC/DC-instrumented code, but does not perform MC/DC decision or
- independence-pair processing. Branch records are omitted by default.
+ Include branch records in ``-txtcvrg`` or ``-txtcvrgfull`` output. Branch
+ records are not loaded or emitted by default.
 
 .. option:: -include-mcdc
 
- Include MC/DC decision and condition records in covered functions output.
- MC/DC evaluation and records are omitted by default.
+ Include MC/DC branch and decision records in ``-txtcvrg`` or
+ ``-txtcvrgfull`` output. MC/DC records and bitmap data are not loaded by
+ default.
 
 .. option:: -summary-only
 

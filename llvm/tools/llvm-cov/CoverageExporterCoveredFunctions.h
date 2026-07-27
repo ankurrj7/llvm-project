@@ -27,16 +27,13 @@ struct CoveredFunctionsExportOptions {
   bool IncludeMCDC = false;
 };
 
-/// Streams evaluated coverage functions into a bounded external sort and
-/// renders the versioned, function-centric covered-functions text format.
+/// Streams evaluated coverage functions and renders the txtcvrg text format.
 ///
-/// Each `function` contains one or more `fragment` blocks. A root fragment is
-/// part of the function's coverage root file; an expansion fragment contains
-/// regions attributed to a macro or include file. Each expansion instance is
-/// nested inside that fragment with an `expansion-at` source location. Coverage
-/// totals count CodeRegions only. Other region kinds are emitted for source
-/// attribution but do not affect the totals. Branch outcomes are intentionally
-/// not represented because this format has one execution count per region.
+/// Function blocks contain code regions in their root source file only.
+/// Regions in macro and include files are emitted in source-file fragments,
+/// where identical coordinates are combined with saturating addition. Large
+/// partitions are recursively repartitioned to bound memory. Optional branch
+/// and MC/DC records retain an explicit source filename and expansion identity.
 class CoverageExporterCoveredFunctions final
     : public coverage::CoverageMappingFunctionRecordConsumer {
   class Implementation;
@@ -53,7 +50,8 @@ public:
   Error consume(StringRef RawFunctionName, uint64_t FunctionHash,
                 coverage::FunctionRecord &&Function) override;
 
-  /// Complete sorting and render the report. Must be called exactly once.
+  /// Complete source-region aggregation and render the report. Must be called
+  /// exactly once.
   Error finish();
 };
 
