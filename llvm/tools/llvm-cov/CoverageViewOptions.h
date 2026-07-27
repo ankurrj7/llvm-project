@@ -17,7 +17,7 @@ namespace llvm {
 
 /// The options for displaying the code coverage information.
 struct CoverageViewOptions {
-  enum class OutputFormat { Text, HTML, Lcov, CoveredFunctions };
+  enum class OutputFormat { Text, HTML, Lcov };
 
   enum class BranchOutputType { Count, Percent, Off };
 

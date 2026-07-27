@@ -1,0 +1,211 @@
+// RUN: llvm-profdata merge %S/Inputs/multiple-files.proftext -o %t.profdata
+// RUN: llvm-profdata merge %S/Inputs/prefer_used_to_unused.proftext \
+// RUN:   -o %t.header.profdata
+// RUN: llvm-profdata merge %S/Inputs/combine_expansions.proftext \
+// RUN:   -o %t.expansions.profdata
+// RUN: llvm-profdata merge %S/Inputs/covered-functions-fragments.proftext \
+// RUN:   -o %t.fragments.profdata
+// RUN: llvm-profdata merge %S/Inputs/branch-c-general.proftext \
+// RUN:   -o %t.branches.profdata
+// RUN: llvm-profdata merge %S/Inputs/mcdc-general.proftext \
+// RUN:   -o %t.mcdc.profdata
+// RUN: yaml2obj %S/Inputs/covered-functions-fragments.yaml \
+// RUN:   -o %t.fragments.o
+
+// RUN: llvm-cov export --txtcvrg --instr-profile=%t.profdata \
+// RUN:   --path-equivalence=/tmp/coverage,/mapped \
+// RUN:   %S/Inputs/multiple-files.covmapping > %t.exec
+// RUN: FileCheck %s --check-prefix=EXEC < %t.exec
+// RUN: %python -c "import sys; d=open(sys.argv[1],'rb').read().splitlines(); \
+// RUN:   assert b'\t' in d[0]; assert all(not x.startswith(b'\t') for x in d)" \
+// RUN:   %t.exec
+// RUN: llvm-cov export --txtcvrg --instr-profile=%t.profdata \
+// RUN:   --ignore-filename-regex='.*' \
+// RUN:   %S/Inputs/multiple-files.covmapping | FileCheck %s \
+// RUN:   --check-prefix=EMPTY
+// RUN: llvm-cov export --txtcvrg \
+// RUN:   --instr-profile=%S/Inputs/highlightedRanges.profdata \
+// RUN:   --path-equivalence=/tmp,/mapped \
+// RUN:   %S/Inputs/highlightedRanges.covmapping | FileCheck %s \
+// RUN:   --check-prefix=PARTIAL
+// RUN: llvm-cov export --txtcvrg --instr-profile=%t.header.profdata \
+// RUN:   --path-equivalence=/tmp,/mapped \
+// RUN:   %S/Inputs/prefer_used_to_unused.covmapping | FileCheck %s \
+// RUN:   --check-prefix=HEADER
+// RUN: llvm-cov export --txtcvrg --instr-profile=%t.expansions.profdata \
+// RUN:   %S/Inputs/combine_expansions.covmapping | FileCheck %s \
+// RUN:   --check-prefix=EXPANSIONS
+// RUN: llvm-cov export --txtcvrg \
+// RUN:   --instr-profile=%S/Inputs/multiple_objects/merged.profdata \
+// RUN:   --path-equivalence=/tmp,/mapped \
+// RUN:   %S/Inputs/multiple_objects/use_2.covmapping \
+// RUN:   -object %S/Inputs/multiple_objects/use_1.covmapping | FileCheck %s \
+// RUN:   --check-prefix=IDENTITY
+// RUN: llvm-cov export --txtcvrg --instr-profile=%t.fragments.profdata \
+// RUN:   %t.fragments.o | FileCheck %s --check-prefix=FRAGMENTS
+
+// RUN: llvm-cov export --txtcvrgfull \
+// RUN:   --path-equivalence=/tmp/coverage,/mapped \
+// RUN:   %S/Inputs/multiple-files.covmapping | FileCheck %s \
+// RUN:   --check-prefix=FULL
+// RUN: llvm-cov export --txtcvrgfull --path-equivalence=/tmp,/mapped \
+// RUN:   %S/Inputs/prefer_used_to_unused.covmapping | FileCheck %s \
+// RUN:   --check-prefix=FULL-HEADER
+// RUN: llvm-cov export --format=lcov --empty-profile \
+// RUN:   %S/Inputs/multiple-files.covmapping | FileCheck %s \
+// RUN:   --check-prefix=LCOV-ZERO
+
+// RUN: llvm-cov export --txtcvrg --include-branches \
+// RUN:   --instr-profile=%t.branches.profdata \
+// RUN:   %S/Inputs/branch-c-general.o32l | FileCheck %s \
+// RUN:   --check-prefix=BRANCHES
+// RUN: llvm-cov export --txtcvrg --include-mcdc \
+// RUN:   --instr-profile=%t.mcdc.profdata \
+// RUN:   %S/Inputs/mcdc-general.o | FileCheck %s --check-prefix=MCDC
+// RUN: llvm-cov export --txtcvrg --include-branches \
+// RUN:   --instr-profile=%t.mcdc.profdata \
+// RUN:   %S/Inputs/mcdc-general.o | FileCheck %s \
+// RUN:   --check-prefix=MCDC-AS-BRANCH
+// RUN: llvm-cov export --txtcvrgfull --include-mcdc \
+// RUN:   %S/Inputs/mcdc-general.o | FileCheck %s \
+// RUN:   --check-prefix=MCDC-BASELINE
+
+// RUN: not llvm-cov export --txtcvrgfull --instr-profile=%t.profdata \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-FULL
+// RUN: not llvm-cov export --txtcvrg \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=MISSING-PROFILE
+// RUN: not llvm-cov export --txtcvrg --empty-profile \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-EMPTY
+// RUN: not llvm-cov export --txtcvrgfull --empty-profile \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-FULL
+// RUN: not llvm-cov export --include-branches --instr-profile=%t.profdata \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-FEATURE
+// RUN: not llvm-cov export --txtcvrg --format=lcov \
+// RUN:   --instr-profile=%t.profdata \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-FORMAT
+// RUN: not llvm-cov export --txtcvrg --format=text \
+// RUN:   --instr-profile=%t.profdata \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-FORMAT
+// RUN: not llvm-cov export --txtcvrg --instr-profile=%t.profdata -name=f2 \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-FILTER
+
+// EXEC:      txtcvrg 3 execution branches=0 mcdc=0
+// EXEC:      file "/mapped/f1.c"
+// EXEC-NEXT: function "f1" 1 1 100.00
+// EXEC-NEXT: 1 1.11 1.13 1
+// EXEC:      file "/mapped/a/f2.c"
+// EXEC-NEXT: function "f2" 1 1 100.00
+// EXEC:      file "/mapped/b/f3.c"
+// EXEC-NEXT: function "f3" 1 1 100.00
+// EXEC:      file "/mapped/b/c/f4.c"
+// EXEC-NEXT: function "f4" 1 1 100.00
+// EXEC-NOT:  entry-count
+// EXEC-NOT:  skipped
+// EXEC-NOT:  gap
+// EXEC:      end
+
+// EMPTY:      txtcvrg 3 execution branches=0 mcdc=0
+// EMPTY-NOT:  function
+// EMPTY:      end
+
+// PARTIAL:      file "/mapped/showHighlightedRanges.cpp"
+// PARTIAL-NEXT: function "_Z4funcv" 2 1 50.00
+// PARTIAL-NEXT: 1 3.13 6.2 1
+// PARTIAL-NEXT: 1 5.3 6.2 0
+
+// HEADER:      file "/mapped/prefer_used_to_unused.h"
+// HEADER-NEXT: function "_Z10sampleFunci" 4 3 75.00
+// HEADER-NEXT: 1 15.30 19.2 1
+
+// The root function owns expansion sites. The macro body is emitted once as
+// source-owned data, and counts from the two expansion instances are added.
+// EXPANSIONS:      file "/tmp/ec/combine_expansions.cpp"
+// EXPANSIONS-NEXT: function "main" 1 1 100.00
+// EXPANSIONS:      2 23.3 23.15 1
+// EXPANSIONS-NEXT: 2 24.3 24.15 1
+// EXPANSIONS:      file "/tmp/ec/combine_expansions.cpp"
+// EXPANSIONS-DAG:  1 7.3 7.6 2
+// EXPANSIONS-DAG:  1 12.3 15.4 2
+// EXPANSIONS-DAG:  2 14.5 14.14 2
+// EXPANSIONS:      end
+
+// Static functions with the same display name remain separate records.
+// IDENTITY: function "_ZL2f1v" 1 1 100.00
+// IDENTITY: 1 1.25 12.2 1
+// IDENTITY: function "_ZL2f1v" 13 5 38.46
+// IDENTITY: 1 1.25 12.2 1
+
+// Macro body regions do not inflate the root function summary and are not
+// duplicated inside the function block.
+// FRAGMENTS:      file "/tmp/covered-functions-fragment/covered-functions-fragment.c"
+// FRAGMENTS-NEXT: function "covered" 1 1 100.00
+// FRAGMENTS-NEXT: 1 3.20 3.50 1
+// FRAGMENTS-NEXT: 2 3.29 3.44 1
+// FRAGMENTS:      file "/tmp/covered-functions-fragment/covered-functions-fragment.h"
+// FRAGMENTS-DAG:  1 1.28 1.51 1
+// FRAGMENTS-DAG:  1 1.29 1.36 1
+// FRAGMENTS-DAG:  1 1.39 1.46 1
+// FRAGMENTS-DAG:  1 1.49 1.50 0
+// FRAGMENTS:      end
+
+// FULL:      txtcvrg 3 baseline branches=0 mcdc=0
+// FULL:      function "f2" 1 0 0.00
+// FULL-NEXT: 1 1.11 1.13 0
+// FULL:      function "main" 1 0 0.00
+// FULL-NEXT: 1 1.12 1.14 0
+// FULL-NOT:  entry-count
+// FULL-NOT:  {{^3[[:space:]]}}
+// FULL-NOT:  {{^4[[:space:]]}}
+// FULL:      end
+
+// A placeholder mapping encountered before the full inline definition must not
+// hide the full function body in a baseline.
+// FULL-HEADER:      function "_Z10sampleFunci" 4 0 0.00
+// FULL-HEADER:      1 15.30 19.2 0
+// FULL-HEADER:      1 17.5 17.13 0
+// FULL-HEADER:      end
+
+// LCOV-ZERO:      SF:/tmp/coverage/a/f2.c
+// LCOV-ZERO-NEXT: FN:1,f2
+// LCOV-ZERO-NEXT: FNDA:0,f2
+// LCOV-ZERO:      DA:1,0
+
+// BRANCHES:      txtcvrg 3 execution branches=1 mcdc=0
+// BRANCHES:      function "simple_loops" 8 8 100.00
+// BRANCHES:      branch "/tmp/branch-c-general.c" 9.15 9.22 100 1 0 0
+// BRANCHES:      function "conditionals" 24 24 100.00
+// BRANCHES:      branch "/tmp/branch-c-general.c" 27.9 27.10 0 0 1 1
+// BRANCHES:      end
+
+// MCDC:      txtcvrg 3 execution branches=0 mcdc=1
+// MCDC:      function "_Z4testbbbb" 25 25 100.00
+// MCDC:      mcdc-branch "mcdc-general.cpp" 12.8 12.9 5 2 0 2 1 0 0
+// MCDC:      mcdc-decision "mcdc-general.cpp" 12.7 12.27 2 4 4 4 0
+// MCDC:      end
+
+// MCDC-AS-BRANCH:      txtcvrg 3 execution branches=1 mcdc=0
+// MCDC-AS-BRANCH:      function "_Z4testbbbb" 25 25 100.00
+// MCDC-AS-BRANCH:      branch "mcdc-general.cpp" 12.8 12.9 5 2 0 0
+// MCDC-AS-BRANCH-NOT:  {{^}}mcdc-
+// MCDC-AS-BRANCH:      end
+
+// MCDC-BASELINE:      txtcvrg 3 baseline branches=0 mcdc=1
+// MCDC-BASELINE:      function "_Z4testbbbb" 25 0 0.00
+// MCDC-BASELINE:      mcdc-branch "mcdc-general.cpp" 12.8 12.9 0 0 0 2 1 0 0
+// MCDC-BASELINE:      mcdc-decision "mcdc-general.cpp" 12.7 12.27 0 0 4 0 0
+// MCDC-BASELINE:      end
+
+// BAD-FULL: error: --txtcvrgfull does not accept --instr-profile or --empty-profile
+// MISSING-PROFILE: error: --txtcvrg requires --instr-profile
+// BAD-EMPTY: error: --txtcvrg does not accept --empty-profile
+// BAD-FEATURE: error: --include-branches and --include-mcdc require --txtcvrg or --txtcvrgfull
+// BAD-FORMAT: error: txtcvrg export cannot be combined with --format
+// BAD-FILTER: error: txtcvrg export does not support source, function, summary, demangler, or skip filters
