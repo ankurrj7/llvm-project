@@ -783,6 +783,7 @@ struct CountedRegionEmitter {
   bool IsVersion11;
   bool LoadBranchRecords;
   bool LoadMCDCRecords;
+  bool AllCountersZero;
 
   /// Evaluated Counters.
   std::map<Counter, uint64_t> CounterValues;
@@ -808,10 +809,10 @@ struct CountedRegionEmitter {
   CountedRegionEmitter(const CoverageMappingRecord &Record,
                        CounterMappingContext &Ctx, FunctionRecord &Function,
                        bool IsVersion11, bool LoadBranchRecords,
-                       bool LoadMCDCRecords)
+                       bool LoadMCDCRecords, bool AllCountersZero)
       : Record(Record), Ctx(Ctx), Function(Function), IsVersion11(IsVersion11),
         LoadBranchRecords(LoadBranchRecords), LoadMCDCRecords(LoadMCDCRecords),
-        Files(Record.Filenames.size()) {
+        AllCountersZero(AllCountersZero), Files(Record.Filenames.size()) {
     // Scan MappingRegions and mark each last index by FileID.
     for (auto [I, Region] : enumerate(Record.MappingRegions)) {
       if (Region.FileID >= Files.size()) {
@@ -832,6 +833,10 @@ struct CountedRegionEmitter {
   Error evaluateAndCacheCounter(Counter C) {
     if (CounterValues.count(C))
       return Error::success();
+
+    if (AllCountersZero)
+      return Error::success();
+
     auto ValueOrErr = Ctx.evaluate(C);
     if (!ValueOrErr)
       return ValueOrErr.takeError();
@@ -918,8 +923,11 @@ struct CountedRegionEmitter {
         continue;
       // Adopt values from the CounterValues.
       // FalseCount may be Zero unless Branches.
-      Function.pushRegion(Region, CounterValues[Region.Count],
-                          CounterValues[Region.FalseCount]);
+      if (AllCountersZero)
+        Function.pushRegion(Region, 0, 0);
+      else
+        Function.pushRegion(Region, CounterValues[Region.Count],
+                            CounterValues[Region.FalseCount]);
     }
 
     return Error::success();
@@ -984,31 +992,32 @@ Error CoverageMapping::loadFunctionRecord(
   CounterMappingContext Ctx(Record.Expressions);
 
   std::vector<uint64_t> Counts;
-  auto SetZeroCounts = [&] {
-    unsigned MaxCounterID =
-        getMaxCounterID(Ctx, Record, Options.LoadBranchRecords,
-                        Options.LoadMCDCRecords);
-    Counts.assign(MaxCounterID + 1, 0);
-  };
-  if (ProfileRecord) {
-    Counts = std::move(ProfileRecord->Counts);
-  } else if (ProfileReader) {
-    if (Error E = ProfileReader.value().get().getFunctionCounts(
-            Record.FunctionName, Record.FunctionHash, Counts)) {
-      instrprof_error IPE = std::get<0>(InstrProfError::take(std::move(E)));
-      if (IPE == instrprof_error::hash_mismatch) {
-        FuncHashMismatches.emplace_back(std::string(Record.FunctionName),
-                                        Record.FunctionHash);
-        return Error::success();
+  if (!Options.AllCountersZero) {
+    auto SetZeroCounts = [&] {
+      unsigned MaxCounterID = getMaxCounterID(
+          Ctx, Record, Options.LoadBranchRecords, Options.LoadMCDCRecords);
+      Counts.assign(MaxCounterID + 1, 0);
+    };
+    if (ProfileRecord) {
+      Counts = std::move(ProfileRecord->Counts);
+    } else if (ProfileReader) {
+      if (Error E = ProfileReader.value().get().getFunctionCounts(
+              Record.FunctionName, Record.FunctionHash, Counts)) {
+        instrprof_error IPE = std::get<0>(InstrProfError::take(std::move(E)));
+        if (IPE == instrprof_error::hash_mismatch) {
+          FuncHashMismatches.emplace_back(std::string(Record.FunctionName),
+                                          Record.FunctionHash);
+          return Error::success();
+        }
+        if (IPE != instrprof_error::unknown_function)
+          return make_error<InstrProfError>(IPE);
+        SetZeroCounts();
       }
-      if (IPE != instrprof_error::unknown_function)
-        return make_error<InstrProfError>(IPE);
+    } else {
       SetZeroCounts();
     }
-  } else {
-    SetZeroCounts();
+    Ctx.setCounts(Counts);
   }
-  Ctx.setCounts(Counts);
 
   bool IsVersion11 =
       ProfileReader && ProfileReader.value().get().getVersion() <
@@ -1054,21 +1063,32 @@ Error CoverageMapping::loadFunctionRecord(
 
   assert(!Record.MappingRegions.empty() && "Function has no regions");
 
+  // A single zero-count region is the placeholder mapping emitted for an
+  // unused inline function in a translation unit. It has no executable
+  // mapping to contribute to an all-zero baseline. Skip it before recording
+  // streaming provenance so a full definition of the same function from
+  // another translation unit can still be consumed later.
+  if (Options.AllCountersZero && Record.MappingRegions.size() == 1 &&
+      Record.MappingRegions[0].Count.isZero())
+    return Error::success();
+
   // This coverage record is a zero region for a function that's unused in
   // some TU, but used in a different TU. Ignore it. The coverage maps from the
   // the other TU will either be loaded (providing full region counts) or they
   // won't (in which case we don't unintuitively report functions as uncovered
   // when they have non-zero counts in the profile).
   if (Record.MappingRegions.size() == 1 &&
-      Record.MappingRegions[0].Count.isZero() && Counts[0] > 0)
+      Record.MappingRegions[0].Count.isZero() && !Counts.empty() &&
+      Counts[0] > 0)
     return Error::success();
 
   FunctionRecord Function(OrigFuncName, Record.Filenames);
   // Emit CountedRegions into FunctionRecord.
-  if (auto E = CountedRegionEmitter(Record, Ctx, Function, IsVersion11,
-                                    Options.LoadBranchRecords,
-                                    Options.LoadMCDCRecords)
-                   .emitCountedRegions()) {
+  if (auto E =
+          CountedRegionEmitter(Record, Ctx, Function, IsVersion11,
+                               Options.LoadBranchRecords,
+                               Options.LoadMCDCRecords, Options.AllCountersZero)
+              .emitCountedRegions()) {
     errs() << "warning: " << Record.FunctionName << ": ";
     logAllUnhandledErrors(std::move(E), errs());
     return Error::success();
@@ -1212,6 +1232,10 @@ Expected<std::unique_ptr<CoverageMapping>> CoverageMapping::load(
     return createStringError(
         errc::invalid_argument,
         "executed-functions-only coverage loading requires a profile");
+  if (Options.AllCountersZero && ProfileReader)
+    return createStringError(
+        errc::invalid_argument,
+        "all-zero coverage loading does not support a profile");
   if (!Options.KeepFunctionRecords && !Options.FunctionRecordConsumer)
     return createStringError(errc::invalid_argument,
                              "streaming coverage loading requires a consumer");
@@ -1293,6 +1317,10 @@ CoverageMapping::load(ArrayRef<StringRef> ObjectFilenames,
     return createStringError(
         errc::invalid_argument,
         "executed-functions-only coverage loading requires a profile");
+  if (Options.AllCountersZero && ProfileFilename)
+    return createStringError(
+        errc::invalid_argument,
+        "all-zero coverage loading does not support a profile");
   if (!Options.KeepFunctionRecords && !Options.FunctionRecordConsumer)
     return createStringError(errc::invalid_argument,
                              "streaming coverage loading requires a consumer");

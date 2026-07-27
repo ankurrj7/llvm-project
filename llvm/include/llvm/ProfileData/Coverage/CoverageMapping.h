@@ -786,6 +786,11 @@ struct CoverageMappingLoadOptions {
   /// functions whose counters and bitmap data are all zero.
   bool LoadExecutedFunctionsOnly = false;
 
+  /// Treat every mapping counter as zero. This avoids allocating a synthetic
+  /// all-zero counter array and evaluating counter expressions when loading a
+  /// complete baseline without a profile.
+  bool AllCountersZero = false;
+
   /// Retain evaluated functions in CoverageMapping::Functions.
   bool KeepFunctionRecords = true;
 

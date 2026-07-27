@@ -16,6 +16,7 @@
 #include "llvm/Testing/Support/SupportHelpers.h"
 #include "gtest/gtest.h"
 
+#include <limits>
 #include <map>
 #include <ostream>
 #include <utility>
@@ -1343,6 +1344,80 @@ TEST(CoverageMappingTest, SparseStreamingDoesNotRetainDecodedFunctions) {
   EXPECT_EQ(MappingReaderPtr->InspectedRecords, NumFunctions);
   EXPECT_EQ(MappingReaderPtr->DecodedRecords, 1u);
   EXPECT_EQ(Consumer.Count, 1u);
+  EXPECT_TRUE((*CoverageOrErr)->getCoveredFunctions().empty());
+}
+
+TEST(CoverageMappingTest, AllZeroStreamingAvoidsSyntheticCounterArray) {
+  OutputFunctionCoverageData Function;
+  Function.Name = "large-counter";
+  Function.Hash = 1;
+  Function.FilenamesStorage.push_back("source.c");
+  Function.Filenames.push_back(Function.FilenamesStorage.front());
+  Function.Regions.push_back(CounterMappingRegion::makeRegion(
+      Counter::getCounter(std::numeric_limits<unsigned>::max()), 0, 1, 1, 1,
+      2));
+
+  std::vector<std::unique_ptr<CoverageMappingReader>> MappingReaders;
+  MappingReaders.push_back(
+      std::make_unique<CoverageMappingReaderMock>(ArrayRef(Function)));
+  std::optional<std::reference_wrapper<IndexedInstrProfReader>> Profile;
+
+  RecordingFunctionConsumer Consumer;
+  CoverageMappingLoadOptions Options;
+  Options.AllCountersZero = true;
+  Options.KeepFunctionRecords = false;
+  Options.FunctionRecordConsumer = &Consumer;
+  auto CoverageOrErr = CoverageMapping::load(MappingReaders, Profile, Options);
+  ASSERT_THAT_EXPECTED(CoverageOrErr, Succeeded());
+
+  ASSERT_EQ(Consumer.Functions.size(), 1u);
+  ASSERT_EQ(Consumer.Functions.front().CountedRegions.size(), 1u);
+  EXPECT_EQ(Consumer.Functions.front().ExecutionCount, 0u);
+  EXPECT_EQ(Consumer.Functions.front().CountedRegions.front().ExecutionCount,
+            0u);
+  EXPECT_TRUE((*CoverageOrErr)->getCoveredFunctions().empty());
+}
+
+TEST(CoverageMappingTest, AllZeroStreamingPrefersFullMappingToPlaceholder) {
+  std::vector<OutputFunctionCoverageData> Functions;
+  Functions.reserve(2);
+
+  OutputFunctionCoverageData &Placeholder = Functions.emplace_back();
+  Placeholder.Name = "inline-function";
+  Placeholder.Hash = 1;
+  Placeholder.FilenamesStorage.push_back("header.h");
+  Placeholder.Filenames.push_back(Placeholder.FilenamesStorage.front());
+  Placeholder.Regions.push_back(
+      CounterMappingRegion::makeRegion(Counter::getZero(), 0, 1, 1, 1, 2));
+
+  OutputFunctionCoverageData &Definition = Functions.emplace_back();
+  Definition.Name = "inline-function";
+  Definition.Hash = 1;
+  Definition.FilenamesStorage.push_back("header.h");
+  Definition.Filenames.push_back(Definition.FilenamesStorage.front());
+  Definition.Regions.push_back(
+      CounterMappingRegion::makeRegion(Counter::getCounter(0), 0, 1, 1, 3, 2));
+  Definition.Regions.push_back(
+      CounterMappingRegion::makeRegion(Counter::getCounter(1), 0, 2, 3, 2, 8));
+
+  std::vector<std::unique_ptr<CoverageMappingReader>> MappingReaders;
+  MappingReaders.push_back(
+      std::make_unique<CoverageMappingReaderMock>(Functions));
+  std::optional<std::reference_wrapper<IndexedInstrProfReader>> Profile;
+
+  RecordingFunctionConsumer Consumer;
+  CoverageMappingLoadOptions Options;
+  Options.AllCountersZero = true;
+  Options.KeepFunctionRecords = false;
+  Options.FunctionRecordConsumer = &Consumer;
+  auto CoverageOrErr = CoverageMapping::load(MappingReaders, Profile, Options);
+  ASSERT_THAT_EXPECTED(CoverageOrErr, Succeeded());
+
+  ASSERT_EQ(Consumer.Functions.size(), 1u);
+  EXPECT_EQ(Consumer.RawNames.front(), "inline-function");
+  ASSERT_EQ(Consumer.Functions.front().CountedRegions.size(), 2u);
+  EXPECT_EQ(Consumer.Functions.front().CountedRegions[0].ExecutionCount, 0u);
+  EXPECT_EQ(Consumer.Functions.front().CountedRegions[1].ExecutionCount, 0u);
   EXPECT_TRUE((*CoverageOrErr)->getCoveredFunctions().empty());
 }
 
