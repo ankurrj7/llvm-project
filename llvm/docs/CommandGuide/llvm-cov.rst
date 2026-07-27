@@ -506,12 +506,91 @@ DESCRIPTION
 ^^^^^^^^^^^
 
 The :program:`llvm-cov export` command exports coverage data of the binaries
-*BIN*... using the profile data *PROFILE* in either JSON or lcov trace file
-format.
+*BIN*... using the profile data *PROFILE* in JSON, an lcov trace file, or the
+scalable text coverage format.
 
 When exporting JSON, the regions, functions, branches, expansions, and
 summaries of the coverage data will be exported. When exporting an lcov trace
 file, the line-based coverage, branch coverage, and summaries will be exported.
+
+The scalable text coverage format is versioned and intended for processing
+very large coverage mappings without retaining every decoded function. It has
+two modes:
+
+* ``-txtcvrgfull`` emits a complete baseline containing every mapped function
+  and region with zero counts. It does not accept a profile.
+* ``-txtcvrg`` with ``-instr-profile=<PROFILE>`` emits only functions with
+  executed root code regions and their source-owned expansion regions.
+
+Functions are streamed directly. Source-owned macro regions first pass through
+a bounded streaming aggregate and are then reduced using bounded recursive hash
+partitions. No global report sort is performed.
+Consequently, a filename may have more than one ``file`` record;
+consumers must merge file blocks with the same filename. A source file with no
+coverage mapping has no record in the baseline.
+
+Format 3 is tab-delimited. The header contains the version, mode, and optional
+features on one line:
+
+.. code-block:: text
+
+  txtcvrg\t3\t<baseline|execution>\tbranches=<0|1>\tmcdc=<0|1>
+
+Tabs delimit columns but do not indent records. A ``file`` record resets the
+current function. Regions before a ``function`` record are file-owned macro or
+otherwise unowned source; regions after a ``function`` record belong to that
+function until the next ``function`` or ``file`` record. Coordinates use
+``line.column``:
+
+.. code-block:: text
+
+  file\t"<root-file>"
+  function\t"<display-name>"\t<code-regions>\t<hit-code-regions>\
+  \t<percent>
+  <kind>\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<count>
+  branch\t"<source-file>"\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<true-count>\t<false-count>\
+  \t<true-folded>\t<false-folded>
+  mcdc-branch\t"<source-file>"\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<true-count>\t<false-count>\
+  \t<condition-id>\t<true-next-id>\t<false-next-id>\
+  \t<true-folded>\t<false-folded>
+  mcdc-decision\t"<source-file>"\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<true-decisions>\t<false-decisions>\
+  \t<conditions>\t<covered-conditions>\t<folded-conditions>
+  ...
+  file\t"<macro-or-unowned-source-file>"
+  <kind>\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<count>
+  end
+
+Raw profile names, function hashes, and entry counts are not emitted. Functions
+with the same display name remain separate ``function`` records.
+
+Function totals include code regions in the function's root file only. Macro
+body regions owned by another source file are emitted in a separate ``file``
+record and do not contribute to that root-only total. Expansion-site records
+remain inside the root function but are not code regions.
+
+Branch and MC/DC records are omitted by default. ``-include-branches`` emits
+branch records, and ``-include-mcdc`` emits MC/DC branch and decision records.
+Their explicit source filename preserves the owning source and distinguishes
+branches originating in macro expansions without requiring global source-file
+aggregation. MC/DC next-condition IDs use ``-1`` for a terminal outcome.
+
+Region kinds are compact numeric values:
+
+* ``1`` -- executable code region
+* ``2`` -- macro or include expansion site
+
+Skipped and gap regions are rendering metadata rather than independently
+coverable code and are not emitted.
+
+Only kind ``1`` contributes to function totals and percentages. The format
+preserves exact source ranges, but it is not itself a rendered line coverage
+report. Consumers that need rendered line status should use
+:program:`llvm-cov show`, the JSON export, or the lcov export.
 
 The exported data can optionally be filtered to only export the coverage
 for the files listed in *SOURCE*....
@@ -531,8 +610,32 @@ OPTIONS
 
 .. option:: -format=<FORMAT>
 
- Use the specified output format. The supported formats are: "text" (JSON),
- "lcov".
+ Use the specified output format. The supported formats are "text" (JSON) and
+ "lcov". The ``-txtcvrg`` and ``-txtcvrgfull`` modes select their own versioned
+ text format.
+
+.. option:: -txtcvrg
+
+ Export the versioned scalable text format while decoding only executed
+ functions. This option requires ``-instr-profile``. Source, function, summary,
+ demangler, and skip filters are not supported.
+
+.. option:: -txtcvrgfull
+
+ Export the complete all-zero scalable text baseline without loading or
+ evaluating a profile. This option does not accept ``-instr-profile`` or
+ ``-empty-profile``.
+
+.. option:: -include-branches
+
+ Include branch records in ``-txtcvrg`` or ``-txtcvrgfull`` output. Branch
+ records are not loaded or emitted by default.
+
+.. option:: -include-mcdc
+
+ Include MC/DC branch and decision records in ``-txtcvrg`` or
+ ``-txtcvrgfull`` output. MC/DC records and bitmap data are not loaded by
+ default.
 
 .. option:: -summary-only
 

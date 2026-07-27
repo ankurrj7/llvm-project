@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "CoverageExporterCoveredFunctions.h"
 #include "CoverageExporterJson.h"
 #include "CoverageExporterLcov.h"
 #include "CoverageFilters.h"
@@ -189,6 +190,9 @@ private:
 
   std::unique_ptr<object::BuildIDFetcher> BIDFetcher;
 
+  bool TextCoverage = false;
+  bool TextCoverageFull = false;
+  bool FormatSpecified = false;
   bool CheckBinaryIDs;
 };
 }
@@ -680,6 +684,14 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
       cl::desc("Use a synthetic profile with no data to generate "
                "baseline coverage"));
 
+  cl::opt<bool> TxtCvrg(
+      "txtcvrg", cl::Optional,
+      cl::desc("Export functions with executed coverage and source regions"));
+
+  cl::opt<bool> TxtCvrgFull(
+      "txtcvrgfull", cl::Optional,
+      cl::desc("Export an all-zero function and source-region baseline"));
+
   cl::list<std::string> Arches(
       "arch", cl::desc("architectures of the coverage mapping binaries"));
 
@@ -813,6 +825,9 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
 
   auto commandLineParser = [&, this](int argc, const char **argv) -> int {
     cl::ParseCommandLineOptions(argc, argv, "LLVM code coverage tool\n");
+    TextCoverage = TxtCvrg;
+    TextCoverageFull = TxtCvrgFull;
+    FormatSpecified = Format.getNumOccurrences() != 0;
     ViewOpts.Debug = DebugDump;
 
     // Initialize `Format` and `Colors` before any call to `error()` or
@@ -845,7 +860,31 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
     }
     this->CheckBinaryIDs = CheckBinaryIDs;
 
-    if (!PGOFilename.empty() == EmptyProfile) {
+    if (TxtCvrg && TxtCvrgFull) {
+      error("--txtcvrg and --txtcvrgfull cannot be used together");
+      return 1;
+    }
+    if ((TxtCvrg || TxtCvrgFull) && Cmd != Export) {
+      error("--txtcvrg and --txtcvrgfull can only be used with 'llvm-cov "
+            "export'");
+      return 1;
+    }
+    if (TxtCvrg) {
+      if (EmptyProfile) {
+        error("--txtcvrg does not accept --empty-profile");
+        return 1;
+      }
+      if (PGOFilename.empty()) {
+        error("--txtcvrg requires --instr-profile");
+        return 1;
+      }
+    } else if (TxtCvrgFull) {
+      if (!PGOFilename.empty() || EmptyProfile) {
+        error("--txtcvrgfull does not accept --instr-profile or "
+              "--empty-profile");
+        return 1;
+      }
+    } else if (!PGOFilename.empty() == EmptyProfile) {
       error(
           "exactly one of -instr-profile and -empty-profile must be specified");
       return 1;
@@ -1337,6 +1376,15 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
                "export"),
       cl::cat(ExportCategory));
 
+  cl::opt<bool> IncludeBranches(
+      "include-branches", cl::Optional,
+      cl::desc("Include branch records in txtcvrg output"),
+      cl::cat(ExportCategory));
+
+  cl::opt<bool> IncludeMCDC("include-mcdc", cl::Optional,
+                            cl::desc("Include MC/DC records in txtcvrg output"),
+                            cl::cat(ExportCategory));
+
   auto Err = commandLineParser(argc, argv);
   if (Err)
     return Err;
@@ -1349,8 +1397,13 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
 
   if (ViewOpts.Format != CoverageViewOptions::OutputFormat::Text &&
       ViewOpts.Format != CoverageViewOptions::OutputFormat::Lcov) {
-    error("coverage data can only be exported as textual JSON or an "
-          "lcov tracefile.");
+    error("coverage data can only be exported as textual JSON or an lcov "
+          "tracefile.");
+    return 1;
+  }
+  if ((IncludeBranches || IncludeMCDC) && !(TextCoverage || TextCoverageFull)) {
+    error("--include-branches and --include-mcdc require --txtcvrg or "
+          "--txtcvrgfull");
     return 1;
   }
 
@@ -1360,6 +1413,64 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
       error("could not read profile data!" + EC.message(), PGOFilename.value());
       return 1;
     }
+  }
+
+  if (TextCoverage || TextCoverageFull) {
+    if (FormatSpecified) {
+      error("txtcvrg export cannot be combined with --format");
+      return 1;
+    }
+    if (!SourceFiles.empty() || !Filters.empty() || ViewOpts.hasDemangler() ||
+        ViewOpts.ExportSummaryOnly || SkipExpansions || SkipFunctions ||
+        SkipBranches || ShowMCDCNonExecutedVectors) {
+      error("txtcvrg export does not support source, function, "
+            "summary, demangler, or skip filters");
+      return 1;
+    }
+
+    ArrayRef<std::pair<std::string, std::string>> Remappings;
+    if (PathRemappings)
+      Remappings = *PathRemappings;
+    CoveredFunctionsExportOptions ExportOptions;
+    ExportOptions.ExportMode =
+        TextCoverageFull ? CoveredFunctionsExportOptions::Mode::Baseline
+                         : CoveredFunctionsExportOptions::Mode::Execution;
+    ExportOptions.IncludeBranches = IncludeBranches;
+    ExportOptions.IncludeMCDC = IncludeMCDC;
+    CoverageExporterCoveredFunctions Exporter(outs(), Remappings,
+                                              FilenameFilters, ExportOptions);
+    CoverageMappingLoadOptions LoadOptions;
+    LoadOptions.LoadExecutedFunctionsOnly = TextCoverage;
+    LoadOptions.AllCountersZero = TextCoverageFull;
+    LoadOptions.KeepFunctionRecords = false;
+    LoadOptions.LoadBranchRecords = IncludeBranches;
+    LoadOptions.LoadMCDCRecords = IncludeMCDC;
+    LoadOptions.FunctionRecordConsumer = &Exporter;
+
+    auto FS = vfs::getRealFileSystem();
+    auto CoverageOrErr =
+        CoverageMapping::load(ObjectFilenames, PGOFilename, *FS, CoverageArches,
+                              ViewOpts.CompilationDirectory, BIDFetcher.get(),
+                              CheckBinaryIDs, LoadOptions);
+    if (Error E = CoverageOrErr.takeError()) {
+      error("failed to load coverage: " + toString(std::move(E)));
+      return 1;
+    }
+    std::unique_ptr<CoverageMapping> Coverage = std::move(*CoverageOrErr);
+    unsigned Mismatched = Coverage->getMismatchedCount();
+    if (Mismatched) {
+      warning(Twine(Mismatched) + " functions have mismatched data");
+      if (ViewOpts.Debug)
+        for (const auto &HashMismatch : Coverage->getHashMismatches())
+          errs() << "hash-mismatch: No profile record found for '"
+                 << HashMismatch.first << "' with hash = 0x"
+                 << Twine::utohexstr(HashMismatch.second) << '\n';
+    }
+    if (Error E = Exporter.finish()) {
+      error("failed to export text coverage: " + toString(std::move(E)));
+      return 1;
+    }
+    return 0;
   }
 
   auto Coverage = load();
