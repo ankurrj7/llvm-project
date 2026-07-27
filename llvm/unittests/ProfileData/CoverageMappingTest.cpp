@@ -1373,6 +1373,42 @@ TEST(CoverageMappingTest, SparseStreamingDoesNotRetainDecodedFunctions) {
   EXPECT_TRUE((*CoverageOrErr)->getCoveredFunctions().empty());
 }
 
+TEST(CoverageMappingTest,
+     StreamingDisplayNameStripsSPIUnitAndLocalFilePrefix) {
+  std::string RawName = getPGOFuncNameWithCoverageMappingSPIUnit(
+      "kdzc.c:local_function", "/build/kdzc.o");
+
+  OutputFunctionCoverageData Function;
+  Function.Name = RawName;
+  Function.Hash = 1;
+  Function.FilenamesStorage.reserve(2);
+  Function.FilenamesStorage.push_back("/include/shared.h");
+  Function.FilenamesStorage.push_back("/src/kdzc.c");
+  for (const std::string &Filename : Function.FilenamesStorage)
+    Function.Filenames.push_back(Filename);
+  Function.Regions.push_back(CounterMappingRegion::makeRegion(
+      Counter::getCounter(0), 0, 1, 1, 1, 2));
+  Function.Regions.push_back(CounterMappingRegion::makeRegion(
+      Counter::getCounter(0), 1, 1, 1, 1, 2));
+
+  std::vector<std::unique_ptr<CoverageMappingReader>> MappingReaders;
+  MappingReaders.push_back(
+      std::make_unique<CoverageMappingReaderMock>(ArrayRef(Function)));
+  std::optional<std::reference_wrapper<IndexedInstrProfReader>> Profile;
+
+  RecordingFunctionConsumer Consumer;
+  CoverageMappingLoadOptions Options;
+  Options.AllCountersZero = true;
+  Options.KeepFunctionRecords = false;
+  Options.FunctionRecordConsumer = &Consumer;
+  auto CoverageOrErr = CoverageMapping::load(MappingReaders, Profile, Options);
+  ASSERT_THAT_EXPECTED(CoverageOrErr, Succeeded());
+
+  ASSERT_EQ(Consumer.Functions.size(), 1u);
+  EXPECT_EQ(Consumer.RawNames.front(), RawName);
+  EXPECT_EQ(Consumer.Functions.front().Name, "local_function");
+}
+
 TEST(CoverageMappingTest, AllZeroStreamingAvoidsSyntheticCounterArray) {
   OutputFunctionCoverageData Function;
   Function.Name = "large-counter";

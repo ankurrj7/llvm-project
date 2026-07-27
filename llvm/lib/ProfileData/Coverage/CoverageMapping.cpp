@@ -936,16 +936,18 @@ struct CountedRegionEmitter {
 
 static StringRef getCoverageFunctionDisplayName(StringRef RawFunctionName,
                                                 ArrayRef<StringRef> Filenames) {
+  StringRef PGOFunctionName =
+      getPGOFuncNameWithoutCoverageMappingSPIUnit(RawFunctionName);
   for (StringRef Filename : Filenames) {
-    StringRef DisplayName = getFuncNameWithoutPrefix(RawFunctionName, Filename);
-    if (DisplayName != RawFunctionName)
+    StringRef DisplayName = getFuncNameWithoutPrefix(PGOFunctionName, Filename);
+    if (DisplayName != PGOFunctionName)
       return DisplayName;
   }
 
   // Current IR PGO names use an unambiguous semicolon delimiter.
-  if (size_t Separator = RawFunctionName.find(';');
+  if (size_t Separator = PGOFunctionName.find(';');
       Separator != StringRef::npos)
-    return RawFunctionName.drop_front(Separator + 1);
+    return PGOFunctionName.drop_front(Separator + 1);
 
   // Older names use a colon delimiter. Profile names commonly contain only
   // the compile unit's basename while coverage regions may belong exclusively
@@ -953,19 +955,19 @@ static StringRef getCoverageFunctionDisplayName(StringRef RawFunctionName,
   // Locate the first prefix which looks like a source filename. This also
   // avoids mistaking a Windows drive colon or an Objective-C method colon for
   // the compile-unit delimiter.
-  for (size_t Separator = RawFunctionName.find(':');
+  for (size_t Separator = PGOFunctionName.find(':');
        Separator != StringRef::npos;
-       Separator = RawFunctionName.find(':', Separator + 1)) {
-    StringRef Prefix = RawFunctionName.take_front(Separator);
+       Separator = PGOFunctionName.find(':', Separator + 1)) {
+    StringRef Prefix = PGOFunctionName.take_front(Separator);
     StringRef Basename = sys::path::filename(Prefix);
     if (Prefix == "<unknown>" || !sys::path::extension(Basename).empty())
-      return RawFunctionName.drop_front(Separator + 1);
+      return PGOFunctionName.drop_front(Separator + 1);
 
     for (StringRef Filename : Filenames)
       if (Basename == sys::path::filename(Filename))
-        return RawFunctionName.drop_front(Separator + 1);
+        return PGOFunctionName.drop_front(Separator + 1);
   }
-  return RawFunctionName;
+  return PGOFunctionName;
 }
 
 Error CoverageMapping::loadFunctionRecord(
