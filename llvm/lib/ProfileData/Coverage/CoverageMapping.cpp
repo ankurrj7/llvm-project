@@ -998,6 +998,7 @@ Error CoverageMapping::loadFunctionRecord(
     return make_error<CoverageMapError>(coveragemap_error::malformed,
                                         "record function name is empty");
   StringRef OrigFuncName = Record.FunctionName;
+
   // A coverage-mapping SPI unit prefix distinguishes separately compiled
   // logical objects. Keep it for provenance so records from distinct units are
   // not mistaken for duplicate COMDAT coverage records. The display name below
