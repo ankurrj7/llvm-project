@@ -5448,6 +5448,8 @@ void CowCompilerInvocation::visitMutPaths(
   // Codegen options.
   RETURN_IF(CodeGenOpts, CodeGenOpts->DebugCompilationDir);
   RETURN_IF(CodeGenOpts, CodeGenOpts->CoverageCompilationDir);
+  RETURN_IF(CodeGenOpts, CodeGenOpts->CoverageMappingSPIPath);
+  RETURN_IF(CodeGenOpts, CodeGenOpts->CoverageMappingSPIKey);
 
   // Sanitizer options.
   RETURN_IF_MANY(LangOpts, LangOpts->NoSanitizeFiles);

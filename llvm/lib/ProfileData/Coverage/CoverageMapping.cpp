@@ -873,6 +873,13 @@ Error CoverageMapping::loadFunctionRecord(
     return make_error<CoverageMapError>(coveragemap_error::malformed,
                                         "record function name is empty");
 
+  // A coverage-mapping SPI unit prefix distinguishes separately compiled
+  // logical objects. Keep it for provenance so records from distinct units are
+  // not mistaken for duplicate COMDAT coverage records. The display name below
+  // remains unprefixed.
+  const bool HasSPIUnit =
+      getPGOFuncNameWithoutCoverageMappingSPIUnit(OrigFuncName) != OrigFuncName;
+
   if (Record.Filenames.empty())
     OrigFuncName = getFuncNameWithoutPrefix(OrigFuncName);
   else
@@ -945,7 +952,10 @@ Error CoverageMapping::loadFunctionRecord(
 
   // Don't create records for (filenames, function) pairs we've already seen.
   auto FilenamesHash = hash_combine_range(Record.Filenames);
-  if (!RecordProvenance[FilenamesHash].insert(hash_value(OrigFuncName)).second)
+  const auto ProvenanceName = HasSPIUnit ? Record.FunctionName : OrigFuncName;
+  if (!RecordProvenance[FilenamesHash]
+           .insert(hash_value(ProvenanceName))
+           .second)
     return Error::success();
 
   Functions.push_back(std::move(Function));
@@ -1024,7 +1034,7 @@ Error CoverageMapping::loadFromFile(
   SmallVector<std::unique_ptr<MemoryBuffer>, 4> Buffers;
 
   SmallVector<object::BuildIDRef> BinaryIDs;
-  auto CoverageReadersOrErr = BinaryCoverageReader::create(
+  auto CoverageReadersOrErr = createCoverageMappingReaders(
       CovMappingBufRef, Arch, Buffers, CompilationDir,
       FoundBinaryIDs ? &BinaryIDs : nullptr);
   if (Error E = CoverageReadersOrErr.takeError()) {
@@ -1207,9 +1217,9 @@ class SegmentBuilder {
     // emit closing segments in sorted order.
     auto CompletedRegionsIt = ActiveRegions.begin() + FirstCompletedRegion;
     std::stable_sort(CompletedRegionsIt, ActiveRegions.end(),
-                      [](const CountedRegion *L, const CountedRegion *R) {
-                        return L->endLoc() < R->endLoc();
-                      });
+                     [](const CountedRegion *L, const CountedRegion *R) {
+                       return L->endLoc() < R->endLoc();
+                     });
 
     // Emit segments for all completed regions.
     for (unsigned I = FirstCompletedRegion + 1, E = ActiveRegions.size(); I < E;

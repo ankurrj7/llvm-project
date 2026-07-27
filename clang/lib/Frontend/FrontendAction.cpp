@@ -1407,7 +1407,10 @@ void FrontendAction::EndSourceFile() {
 
   // Cleanup the output streams, and erase the output files if instructed by the
   // FrontendAction.
-  CI.clearOutputFiles(/*EraseFiles=*/shouldEraseOutputFiles());
+  bool EraseOutputFiles = shouldEraseOutputFiles();
+  CI.clearOutputFiles(EraseOutputFiles);
+  if (!EraseOutputFiles && !CI.getDiagnostics().hasErrorOccurred())
+    EndSourceFileAfterOutputFiles();
 
   // The resources are owned by AST when the current file is AST.
   // So we reset the resources here to avoid users accessing it

@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ProfileData/InstrProf.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -676,6 +677,26 @@ TEST_F(InstrProfTest, test_pgo_function_name) {
   }
 }
 
+TEST_F(InstrProfTest, coverage_mapping_spi_unit_name) {
+  StringRef FunctionName = "source.c:internal";
+  std::string First = getPGOFuncNameWithCoverageMappingSPIUnit(
+      FunctionName, "/build/c_evaa2g.o");
+  std::string FirstRecompiled = getPGOFuncNameWithCoverageMappingSPIUnit(
+      FunctionName, "/build/c_evaa2g.o");
+  std::string Second =
+      getPGOFuncNameWithCoverageMappingSPIUnit(FunctionName, "/build/evaa2g.o");
+
+  EXPECT_EQ(First, FirstRecompiled);
+  EXPECT_NE(First, Second);
+  EXPECT_EQ(FunctionName, getPGOFuncNameWithoutCoverageMappingSPIUnit(First));
+  EXPECT_EQ("internal", getFuncNameWithoutPrefix(First, "source.c"));
+
+  std::string Invalid = "__llvm_covspi$1$" + std::string(64, 'g') + "$name";
+  EXPECT_EQ(Invalid, getPGOFuncNameWithoutCoverageMappingSPIUnit(Invalid));
+  EXPECT_EQ("ordinary",
+            getPGOFuncNameWithoutCoverageMappingSPIUnit("ordinary"));
+}
+
 TEST_F(InstrProfTest, test_irpgo_read_deprecated_names) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("MyModule.cpp", Ctx);
@@ -868,8 +889,8 @@ INSTANTIATE_TEST_SUITE_P(
 TEST_P(MaybeSparseInstrProfTest, annotate_vp_data) {
   NamedInstrProfRecord Record("caller", 0x1234, {1, 2});
   Record.reserveSites(IPVK_IndirectCallTarget, 1);
-  InstrProfValueData VD0[] = {{1000, 1}, {2000, 2}, {3000, 3}, {5000, 5},
-                              {4000, 4}, {6000, 6}};
+  InstrProfValueData VD0[] = {{1000, 1}, {2000, 2}, {3000, 3},
+                              {5000, 5}, {4000, 4}, {6000, 6}};
   Record.addValueData(IPVK_IndirectCallTarget, 0, VD0, nullptr);
   Writer.addRecord(std::move(Record), Err);
   auto Profile = Writer.writeBuffer();
@@ -934,8 +955,8 @@ TEST_P(MaybeSparseInstrProfTest, annotate_vp_data) {
   // Remove the MD_prof metadata
   Inst->setMetadata(LLVMContext::MD_prof, nullptr);
   // Annotate with 4 records.
-  InstrProfValueData VD0Sorted[] = {{1000, 6}, {2000, 5}, {3000, 4}, {4000, 3},
-                              {5000, 2}, {6000, 1}};
+  InstrProfValueData VD0Sorted[] = {{1000, 6}, {2000, 5}, {3000, 4},
+                                    {4000, 3}, {5000, 2}, {6000, 1}};
   annotateValueSite(*M, *Inst, ArrayRef(VD0Sorted).slice(2), 10,
                     IPVK_IndirectCallTarget, 5);
   ValueData = getValueProfDataFromInst(*Inst, IPVK_IndirectCallTarget, 5, T);
