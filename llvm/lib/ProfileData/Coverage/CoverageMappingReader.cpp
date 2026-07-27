@@ -1125,7 +1125,9 @@ public:
         new SPICoverageReader(std::move(Records), CompilationDir));
   }
 
-  Error readNextRecord(CoverageMappingRecord &Record) override {
+  Error readNextRecord(
+      CoverageMappingRecord &Record,
+      function_ref<Expected<bool>(StringRef, uint64_t)> ShouldRead) override {
     for (;;) {
       if (!CurrentReader) {
         if (NextRecord == Records.size())
@@ -1137,7 +1139,7 @@ public:
         CurrentReader = std::move(*Reader);
       }
 
-      Error E = CurrentReader->readNextRecord(Record);
+      Error E = CurrentReader->readNextRecord(Record, ShouldRead);
       if (!E)
         return Error::success();
 
@@ -1154,6 +1156,11 @@ public:
       assert(ReachedEnd && "coverage reader returned an unknown error type");
       CurrentReader.reset();
     }
+  }
+
+  Error readNextRecord(CoverageMappingRecord &Record) override {
+    return readNextRecord(
+        Record, [](StringRef, uint64_t) -> Expected<bool> { return true; });
   }
 };
 
