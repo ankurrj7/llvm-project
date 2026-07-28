@@ -7,10 +7,9 @@
 // RUN: test -s %t.spi
 // RUN: llvm-profdata merge %S/Inputs/coverage-mapping-spi.proftext \
 // RUN:   -o %t.profdata
-// RUN: llvm-cov export %t.spi -empty-profile -format=covered-functions \
+// RUN: llvm-cov export %t.spi --txtcvrgfull \
 // RUN:   | FileCheck %s --check-prefix=SPI-BASELINE
-// RUN: llvm-cov export %t.spi -coverage-only -format=covered-functions \
-// RUN:   -instr-profile=%t.profdata \
+// RUN: llvm-cov export %t.spi --txtcvrg -instr-profile=%t.profdata \
 // RUN:   | FileCheck %s --check-prefix=SPI-EXECUTION
 // RUN: rm -f %t.o %t.spi
 // RUN: not %clang_cc1 -triple x86_64-unknown-linux-gnu -emit-obj \
@@ -33,17 +32,13 @@
 // LATEST-NOT: first_only
 // LATEST: second_only
 
-// SPI-BASELINE:      covered-functions-format 3
-// SPI-BASELINE-NEXT: mode - baseline
-// SPI-BASELINE:      function - "main"
-// SPI-BASELINE-NEXT: function-id - "main" 0x0000000000000018
-// SPI-BASELINE-NEXT: entry-count - 0
+// SPI-BASELINE:      txtcvrg 3 baseline branches=0 mcdc=0
+// SPI-BASELINE:      function "main" 1 0 0.00
+// SPI-BASELINE-NEXT: 1 53.16 53.29 0
 
-// SPI-EXECUTION:      covered-functions-format 3
-// SPI-EXECUTION-NEXT: mode - execution
-// SPI-EXECUTION:      function - "main"
-// SPI-EXECUTION-NEXT: function-id - "main" 0x0000000000000018
-// SPI-EXECUTION-NEXT: entry-count - 1
+// SPI-EXECUTION:      txtcvrg 3 execution branches=0 mcdc=0
+// SPI-EXECUTION:      function "main" 1 1 100.00
+// SPI-EXECUTION-NEXT: 1 53.16 53.29 1
 
 #ifdef FAIL
 #error expected failure
