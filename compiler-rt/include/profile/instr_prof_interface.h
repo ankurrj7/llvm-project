@@ -73,11 +73,38 @@ void __llvm_profile_reset_counters(void);
  */
 int __llvm_profile_dump(void);
 
+/*!
+ * \brief Write profiling data for the executable and all currently loaded
+ * instrumented shared objects.
+ *
+ * Each instrumented image owns an independent copy of the profiling runtime.
+ * This interface invokes the dump operation in each loaded image. Profiles for
+ * images unloaded before this call are written by their existing unload
+ * handlers.
+ *
+ * The profile filename should contain the \c %m merge-pool specifier (for
+ * example, \c LLVM_PROFILE_FILE=run-%p-%m.profraw), or otherwise be unique per
+ * image. Without either, independent image runtimes can overwrite the same
+ * profile file.
+ *
+ * This interface has the same one-shot semantics as \c __llvm_profile_dump().
+ * On platforms without loaded-image enumeration support, it is equivalent to
+ * \c __llvm_profile_dump(). All instrumented images must be linked with a
+ * runtime that provides this interface.
+ *
+ * This interface is not async-signal-safe. Callers should serialize calls and
+ * quiesce dynamic-loader activity and counter updates when they require a
+ * coherent process-wide snapshot. It returns zero on success and a nonzero
+ * value if a dump or loaded-image snapshot fails.
+ */
+int __llvm_profile_dump_all(void);
+
 #else
 
 #define __llvm_profile_set_filename(Name)
 #define __llvm_profile_reset_counters()
 #define __llvm_profile_dump() (0)
+#define __llvm_profile_dump_all() (0)
 
 #endif
 

@@ -87,6 +87,7 @@ if (NOT COMPILER_RT_PROFILE_BAREMETAL)
   # - GCDA profiling, which is unrelated (GCDAProfiling.c)
   list(APPEND PROFILE_SOURCES
     GCDAProfiling.c
+    InstrProfilingDumpAll.c
     InstrProfilingFile.c
     InstrProfilingRuntime.cpp
     InstrProfilingUtil.c
@@ -190,4 +191,11 @@ else()
     SOURCES ${PROFILE_SOURCES}
     ADDITIONAL_HEADERS ${PROFILE_HEADERS}
     PARENT_TARGET profile)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT COMPILER_RT_PROFILE_BAREMETAL)
+  add_sanitizer_rt_symbols(clang_rt.profile
+    ARCHS ${PROFILE_SUPPORTED_ARCH}
+    PARENT_TARGET profile
+    EXTRA profile.syms.extra)
 endif()
