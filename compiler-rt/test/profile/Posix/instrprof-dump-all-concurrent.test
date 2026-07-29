@@ -1,0 +1,112 @@
+// REQUIRES: linux
+// RUN: rm -rf %t && split-file %s %t && cd %t
+// RUN: %clang_profgen -fPIC -shared library.c -o library.so
+// RUN: %clang_profgen main.c -ldl -pthread -o app
+// RUN: env LLVM_PROFILE_FILE=%t/profile-%%p-%m.profraw %run %t/app
+// RUN: llvm-profdata merge -sparse %t/profile-*.profraw -o %t/profile.profdata
+// RUN: llvm-profdata show --function=concurrent_function --counts \
+// RUN:   %t/profile.profdata | FileCheck %s
+//
+// CHECK: concurrent_function:
+// CHECK: Function count: 20
+
+//--- library.c
+void concurrent_function(void) {}
+
+//--- main.c
+#include <dlfcn.h>
+#include <pthread.h>
+#include <unistd.h>
+
+enum { Iterations = 20 };
+
+static pthread_cond_t Condition = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t Mutex = PTHREAD_MUTEX_INITIALIZER;
+static int Acknowledged;
+static int Completed;
+static int Failed;
+static int Proceed;
+static int Ready;
+
+typedef void (*ConcurrentFunction)(void);
+int __llvm_profile_dump_all(void);
+
+static void reportFailure(void) {
+  pthread_mutex_lock(&Mutex);
+  Failed = 1;
+  pthread_cond_broadcast(&Condition);
+  pthread_mutex_unlock(&Mutex);
+}
+
+static void *loadAndUnload(void *Unused) {
+  (void)Unused;
+
+  for (int I = 1; I <= Iterations; ++I) {
+    void *Handle = dlopen("./library.so", RTLD_NOW | RTLD_LOCAL);
+    if (!Handle) {
+      reportFailure();
+      return NULL;
+    }
+
+    ConcurrentFunction Function =
+        (ConcurrentFunction)dlsym(Handle, "concurrent_function");
+    if (!Function) {
+      reportFailure();
+      return NULL;
+    }
+    Function();
+
+    pthread_mutex_lock(&Mutex);
+    Ready = I;
+    pthread_cond_broadcast(&Condition);
+    while (Proceed < I)
+      pthread_cond_wait(&Condition, &Mutex);
+    pthread_mutex_unlock(&Mutex);
+
+    if (dlclose(Handle)) {
+      reportFailure();
+      return NULL;
+    }
+
+    pthread_mutex_lock(&Mutex);
+    Completed = I;
+    pthread_cond_broadcast(&Condition);
+    while (Acknowledged < I)
+      pthread_cond_wait(&Condition, &Mutex);
+    pthread_mutex_unlock(&Mutex);
+  }
+  return NULL;
+}
+
+int main(void) {
+  pthread_t Worker;
+  if (pthread_create(&Worker, NULL, loadAndUnload, NULL))
+    return 1;
+
+  for (int I = 1; I <= Iterations; ++I) {
+    pthread_mutex_lock(&Mutex);
+    while (Ready < I && !Failed)
+      pthread_cond_wait(&Condition, &Mutex);
+    int DidFail = Failed;
+    Proceed = I;
+    pthread_cond_broadcast(&Condition);
+    pthread_mutex_unlock(&Mutex);
+
+    if (DidFail || __llvm_profile_dump_all())
+      return 2;
+
+    pthread_mutex_lock(&Mutex);
+    while (Completed < I && !Failed)
+      pthread_cond_wait(&Condition, &Mutex);
+    DidFail = Failed;
+    Acknowledged = I;
+    pthread_cond_broadcast(&Condition);
+    pthread_mutex_unlock(&Mutex);
+    if (DidFail)
+      return 3;
+  }
+
+  if (pthread_join(Worker, NULL))
+    return 4;
+  _exit(0);
+}

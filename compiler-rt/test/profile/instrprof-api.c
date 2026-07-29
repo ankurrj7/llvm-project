@@ -35,8 +35,13 @@ int main() {
     return 2;
   // PROFGEN: %{{.*}} = call {{(arm_aapcs_vfpcc )?}}{{(signext )*}}i32 @__llvm_profile_dump()
   // PROFUSE-NOT: %{{.*}} = call {{(arm_aapcs_vfpcc )?}}{{(signext )*}}i32 @__llvm_profile_dump()
+  if (__llvm_profile_dump_all())
+    return 3;
+  // PROFGEN: %{{.*}} = call {{(arm_aapcs_vfpcc )?}}{{(signext )*}}i32 @__llvm_profile_dump_all()
+  // PROFUSE-NOT: %{{.*}} = call {{(arm_aapcs_vfpcc )?}}{{(signext )*}}i32 @__llvm_profile_dump_all()
   return z + bar() - 11;
 }
 
 // PROFUSE-NOT: declare void @__llvm_profile_set_filename(ptr noundef)
 // PROFUSE-NOT: declare signext i32 @__llvm_profile_dump()
+// PROFUSE-NOT: declare signext i32 @__llvm_profile_dump_all()

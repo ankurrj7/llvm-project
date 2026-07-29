@@ -27,6 +27,16 @@
 // CHECK-LINUX-X86-64: "{{.*}}/Inputs/resource_dir{{/|\\\\}}lib{{.*}}linux{{.*}}libclang_rt.profile.a" {{.*}} "-lc"
 //
 // RUN: %clang -### %s 2>&1 \
+// RUN:     --target=x86_64-unknown-linux -fprofile-instr-generate \
+// RUN:     -resource-dir=%S/Inputs/resource_dir \
+// RUN:     --sysroot=%S/Inputs/basic_linux_tree \
+// RUN:   | FileCheck --check-prefix=CHECK-LINUX-INSTRPROF %s
+//
+// CHECK-LINUX-INSTRPROF: "--dynamic-list={{.*}}libclang_rt.profile.a.syms"
+// CHECK-LINUX-INSTRPROF-SAME: "{{.*}}/Inputs/resource_dir{{/|\\\\}}lib{{.*}}linux{{.*}}libclang_rt.profile.a"
+// CHECK-LINUX-INSTRPROF-SAME: "--push-state" "--as-needed" "-ldl" "--pop-state"
+//
+// RUN: %clang -### %s 2>&1 \
 // RUN:     --target=x86_64-unknown-freebsd --coverage -fuse-ld=ld \
 // RUN:     -resource-dir=%S/Inputs/resource_dir \
 // RUN:     --sysroot=%S/Inputs/basic_freebsd64_tree \
