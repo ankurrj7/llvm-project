@@ -80,7 +80,9 @@ int __llvm_profile_dump(void);
  * Each instrumented image owns an independent copy of the profiling runtime.
  * This interface invokes the dump operation in each loaded image. Profiles for
  * images unloaded before this call are written by their existing unload
- * handlers.
+ * handlers. It is provided by the optional
+ * \c libclang_rt.profile_coverage.a runtime; the legacy
+ * \c libclang_rt.profile.a archive does not provide this symbol.
  *
  * The profile filename should contain the \c %m merge-pool specifier (for
  * example, \c LLVM_PROFILE_FILE=run-%p-%m.profraw), or otherwise be unique per

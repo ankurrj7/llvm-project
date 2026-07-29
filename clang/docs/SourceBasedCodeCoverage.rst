@@ -107,11 +107,38 @@ directory structure will be created.  Additionally, the following special
   Linux may be mostly complete but requires testing, and support for Windows
   may require more extensive changes: please get involved if you are interested
   in porting this feature.
-On Linux, the profile runtime uses sparse raw-profile dumping by default,
-independently of how the output filename is configured. If
-``LLVM_PROFILE_FILE`` is absent, the sparse profile is written to
-``default.profraw`` like a normal profile. Set ``LLVM_PROFILE_DENSE=1`` to opt
-into the previous dense serialization and ``%m`` online-merging behavior.
+On Linux, compiler-rt builds two instrumentation-profile archives:
+``libclang_rt.profile.a`` is the existing dense runtime, while
+``libclang_rt.profile_coverage.a`` adds process-wide DSO dumping and sparse
+raw-profile serialization. Clang continues to look for the canonical
+``libclang_rt.profile.a``; there is no new driver option. To use the coverage
+runtime, preserve the original archive and replace the canonical archive in
+the resource directory used for the final link with a copy of
+``libclang_rt.profile_coverage.a``. Copy its ``.syms`` companion to the
+canonical ``.syms`` name as well.
+
+For example, with ``RESOURCE_DIR=$(clang -print-resource-dir)`` and the target
+library directory in ``PROFILE_LIB_DIR``:
+
+.. code-block:: console
+
+    % PROFILE_LIB_DIR="$RESOURCE_DIR/lib/$(clang -print-target-triple)"
+    % cp "$PROFILE_LIB_DIR/libclang_rt.profile.a" \
+         /safe/path/libclang_rt.profile.legacy.a
+    % cp "$PROFILE_LIB_DIR/libclang_rt.profile_coverage.a" \
+         "$PROFILE_LIB_DIR/libclang_rt.profile.a"
+    % cp "$PROFILE_LIB_DIR/libclang_rt.profile_coverage.a.syms" \
+         "$PROFILE_LIB_DIR/libclang_rt.profile.a.syms"
+
+Use a copied resource directory when both variants must remain selectable at
+the same time. Every executable and instrumented shared object that uses
+``__llvm_profile_dump_all()`` must link the coverage runtime.
+
+The coverage runtime uses sparse raw-profile dumping by default, independently
+of how the output filename is configured. If ``LLVM_PROFILE_FILE`` is absent,
+the sparse profile is written to ``default.profraw`` like a normal profile. Set
+``LLVM_PROFILE_DENSE=1`` to opt into the previous dense serialization and
+``%m`` online-merging behavior.
 
 In sparse mode, the runtime omits a function record only when every counter for
 that function is zero. For each retained function, it writes the complete
