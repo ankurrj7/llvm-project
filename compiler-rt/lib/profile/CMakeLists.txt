@@ -88,7 +88,6 @@ if (NOT COMPILER_RT_PROFILE_BAREMETAL)
   # - GCDA profiling, which is unrelated (GCDAProfiling.c)
   list(APPEND PROFILE_SOURCES
     GCDAProfiling.c
-    InstrProfilingDumpAll.c
     InstrProfilingFile.c
     InstrProfilingRuntime.cpp
     InstrProfilingUtil.c
@@ -108,6 +107,14 @@ if(WIN32)
   list(APPEND PROFILE_SOURCES
     WindowsMMap.c
   )
+endif()
+
+# Keep clang_rt.profile compatible with the existing profile runtime.  The
+# coverage variant adds process-wide DSO dumping and sparse raw serialization;
+# callers select it by installing it under the canonical profile archive name.
+set(PROFILE_COVERAGE_SOURCES ${PROFILE_SOURCES})
+if (NOT COMPILER_RT_PROFILE_BAREMETAL)
+  list(APPEND PROFILE_COVERAGE_SOURCES InstrProfilingDumpAll.c)
 endif()
 
 include_directories(..)
@@ -206,6 +213,16 @@ if(APPLE)
     ADDITIONAL_HEADERS ${PROFILE_HEADERS}
     LINK_LIBS ${PROFILE_LINK_LIBS}
     PARENT_TARGET profile)
+
+  add_compiler_rt_runtime(clang_rt.profile_coverage
+    STATIC
+    OS ${PROFILE_SUPPORTED_OS}
+    ARCHS ${PROFILE_SUPPORTED_ARCH}
+    CFLAGS ${EXTRA_FLAGS} -DCOMPILER_RT_PROFILE_COVERAGE_RUNTIME=1
+    SOURCES ${PROFILE_COVERAGE_SOURCES}
+    ADDITIONAL_HEADERS ${PROFILE_HEADERS}
+    LINK_LIBS ${PROFILE_LINK_LIBS}
+    PARENT_TARGET profile)
 else()
   add_compiler_rt_runtime(clang_rt.profile
     STATIC
@@ -215,10 +232,23 @@ else()
     ADDITIONAL_HEADERS ${PROFILE_HEADERS}
     LINK_LIBS ${PROFILE_LINK_LIBS}
     PARENT_TARGET profile)
+
+  add_compiler_rt_runtime(clang_rt.profile_coverage
+    STATIC
+    ARCHS ${PROFILE_SUPPORTED_ARCH}
+    CFLAGS ${EXTRA_FLAGS} -DCOMPILER_RT_PROFILE_COVERAGE_RUNTIME=1
+    SOURCES ${PROFILE_COVERAGE_SOURCES}
+    ADDITIONAL_HEADERS ${PROFILE_HEADERS}
+    LINK_LIBS ${PROFILE_LINK_LIBS}
+    PARENT_TARGET profile)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT COMPILER_RT_PROFILE_BAREMETAL)
   add_sanitizer_rt_symbols(clang_rt.profile
+    ARCHS ${PROFILE_SUPPORTED_ARCH}
+    PARENT_TARGET profile
+    EXTRA profile.syms.extra)
+  add_sanitizer_rt_symbols(clang_rt.profile_coverage
     ARCHS ${PROFILE_SUPPORTED_ARCH}
     PARENT_TARGET profile
     EXTRA profile.syms.extra)

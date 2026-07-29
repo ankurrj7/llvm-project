@@ -353,7 +353,7 @@ static unsigned doMerging(void) {
 #define LPROF_DENSE_ENV "LLVM_PROFILE_DENSE"
 
 static int isDenseProfileEnabled(void) {
-#if defined(__linux__)
+#if defined(__linux__) && defined(COMPILER_RT_PROFILE_COVERAGE_RUNTIME)
   const char *Value = getenv(LPROF_DENSE_ENV);
   return Value && Value[0] && strcmp(Value, "0") != 0;
 #else

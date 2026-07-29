@@ -11,7 +11,7 @@ extern "C" {
 #include "InstrProfiling.h"
 #include "InstrProfilingInternal.h"
 
-#if defined(__linux__)
+#if defined(__linux__) && defined(COMPILER_RT_PROFILE_COVERAGE_RUNTIME)
 static volatile int ProfileDumpCurrentImageInProgress;
 
 COMPILER_RT_VISIBILITY int __llvm_profile_dump_current_image_impl(void) {
