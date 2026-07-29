@@ -19,7 +19,7 @@
 
 // Test __llvm_profile_set_file_object with mergin enabled and continuous mode disabled.
 // RUN: rm -rf %t.dir/profdir/
-// RUN: env LLVM_PROFILE_FILE="%t.dir/profdir/%mprofraw.old" %run  %t.dir/main.exe merge %t.dir/profdir/profraw.new 'LLVM_PROFILE_FILE=%t.dir/profdir/%m.profraw'
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE="%t.dir/profdir/%mprofraw.old" %run  %t.dir/main.exe merge %t.dir/profdir/profraw.new 'LLVM_PROFILE_FILE=%t.dir/profdir/%m.profraw'
 // RUN: llvm-profdata merge -o %t.dir/profdir/profdata %t.dir/profdir/profraw.new
 // RUN: llvm-profdata show --counts --all-functions %t.dir/profdir/profdata | FileCheck %s -check-prefix=MERGE
 // RUN: llvm-profdata show --counts --all-functions %t.dir/profdir/*profraw.old | FileCheck %s -check-prefix=ZERO
