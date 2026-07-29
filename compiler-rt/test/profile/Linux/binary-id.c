@@ -1,19 +1,19 @@
 // REQUIRES: linux
 // RUN: %clang_profgen -Wl,--build-id=none -O2 -o %t %s
-// RUN: env LLVM_PROFILE_FILE=%t.profraw %run %t
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE=%t.profraw %run %t
 // RUN: llvm-profdata show --binary-ids %t.profraw > %t.out
 // RUN: FileCheck %s --check-prefix=NO-BINARY-ID < %t.out
 // RUN: llvm-profdata merge -o %t.profdata %t.profraw
 
 // RUN: %clang_profgen -Wl,--build-id -O2 -o %t %s
-// RUN: env LLVM_PROFILE_FILE=%t.profraw %run %t
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE=%t.profraw %run %t
 // RUN: llvm-profdata show --binary-ids %t.profraw > %t.profraw.out
 // RUN: FileCheck %s --check-prefix=BINARY-ID-RAW-PROF < %t.profraw.out
 
 // RUN: rm -rf %t.profdir
-// RUN: env LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
-// RUN: env LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
-// RUN: env LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
 // RUN: llvm-profdata show --binary-ids  %t.profdir/default_*.profraw > %t.profraw.out
 // RUN: FileCheck %s --check-prefix=BINARY-ID-MERGE-PROF < %t.profraw.out
 

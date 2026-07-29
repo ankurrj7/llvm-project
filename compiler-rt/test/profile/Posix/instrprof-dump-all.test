@@ -3,8 +3,10 @@
 // RUN: %clang_profgen -fPIC -shared lib-linked.c -o lib-linked.so
 // RUN: %clang_profgen -fPIC -shared lib-loaded.c -o lib-loaded.so
 // RUN: %clang_profgen -fPIC -shared lib-unloaded.c -o lib-unloaded.so
+// RUN: %clang_profgen -fPIC -shared lib-unused.c -o lib-unused.so
 // RUN: %clang_profgen main.c -L. -Wl,-rpath,. -l-linked -ldl -o app-main
-// RUN: env LLVM_PROFILE_FILE=%t/main-%%p-%m.profraw %run %t/app-main
+// RUN: env LLVM_PROFILE_DENSE=1 \
+// RUN:   LLVM_PROFILE_FILE=%t/main-%%p-%m.profraw %run %t/app-main
 // RUN: llvm-profdata merge -sparse %t/main-*.profraw -o %t/main.profdata
 // RUN: llvm-profdata show --function=linked_function --counts \
 // RUN:   %t/main.profdata | FileCheck %s --check-prefix=LINKED
@@ -15,9 +17,22 @@
 // RUN: llvm-profdata show --function=main --counts %t/main.profdata | \
 // RUN:   FileCheck %s --check-prefix=MAIN
 //
+// RUN: env LLVM_PROFILE_FILE=%t/sparse-%%p-%m.profraw %run %t/app-main
+// RUN: llvm-profdata merge -sparse %t/sparse-*.profraw \
+// RUN:   -o %t/sparse.profdata
+// RUN: llvm-profdata show --function=linked_function --counts \
+// RUN:   %t/sparse.profdata | FileCheck %s --check-prefix=LINKED
+// RUN: llvm-profdata show --function=loaded_function --counts \
+// RUN:   %t/sparse.profdata | FileCheck %s --check-prefix=LOADED
+// RUN: llvm-profdata show --function=unloaded_function --counts \
+// RUN:   %t/sparse.profdata | FileCheck %s --check-prefix=UNLOADED
+// RUN: llvm-profdata show --function=main --counts %t/sparse.profdata | \
+// RUN:   FileCheck %s --check-prefix=MAIN
+//
 // RUN: %clang_profgen -DDUMP_FROM_DSO -no-pie main.c -L. -Wl,-rpath,. \
 // RUN:   -l-linked -ldl -o app-dso
-// RUN: env LLVM_PROFILE_FILE=%t/dso-%%p-%m.profraw %run %t/app-dso
+// RUN: env LLVM_PROFILE_DENSE=1 \
+// RUN:   LLVM_PROFILE_FILE=%t/dso-%%p-%m.profraw %run %t/app-dso
 // RUN: llvm-profdata merge -sparse %t/dso-*.profraw -o %t/dso.profdata
 // RUN: llvm-profdata show --function=main --counts %t/dso.profdata | \
 // RUN:   FileCheck %s --check-prefix=MAIN
@@ -44,6 +59,9 @@ int dump_all_from_loaded(void) { return __llvm_profile_dump_all(); }
 //--- lib-unloaded.c
 void unloaded_function(void) {}
 
+//--- lib-unused.c
+void unused_function(void) {}
+
 //--- main.c
 #include <dlfcn.h>
 #include <unistd.h>
@@ -66,30 +84,34 @@ int main(void) {
     return 2;
   Function();
 
+  void *UnusedHandle = dlopen("./lib-unused.so", RTLD_NOW | RTLD_LOCAL);
+  if (!UnusedHandle)
+    return 3;
+
   void *UnloadedHandle =
       dlopen("./lib-unloaded.so", RTLD_NOW | RTLD_LOCAL);
   if (!UnloadedHandle)
-    return 3;
+    return 4;
 
   LoadedFunction UnloadedFunction =
       (LoadedFunction)dlsym(UnloadedHandle, "unloaded_function");
   if (!UnloadedFunction)
-    return 4;
+    return 5;
   UnloadedFunction();
   if (dlclose(UnloadedHandle))
-    return 5;
-  if (chdir("/"))
     return 6;
+  if (chdir("/"))
+    return 7;
 
 #ifdef DUMP_FROM_DSO
   DumpAllFunction DumpAll =
       (DumpAllFunction)dlsym(Handle, "dump_all_from_loaded");
   if (!DumpAll)
-    return 7;
+    return 8;
   if (DumpAll())
 #else
   if (__llvm_profile_dump_all())
 #endif
-    return 8;
+    return 9;
   _exit(0);
 }
