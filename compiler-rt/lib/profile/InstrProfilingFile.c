@@ -111,8 +111,7 @@ typedef struct lprofFilename {
   ProfileNameSpecifier PNS;
 } lprofFilename;
 
-static lprofFilename lprofCurFilename = {0, 0, 0, {0}, NULL,       {0},
-                                         0, 0, 0, 0,   PNS_unknown};
+static lprofFilename lprofCurFilename = {0};
 
 static int ProfileMergeRequested = 0;
 static int getProfileFileSizeForMerging(FILE *ProfileFile,
@@ -351,6 +350,22 @@ static unsigned doMerging(void) {
   return lprofCurFilename.MergePoolSize || isProfileMergeRequested();
 }
 
+#define LPROF_DENSE_ENV "LLVM_PROFILE_DENSE"
+
+static int isDenseProfileEnabled(void) {
+#if defined(__linux__)
+  const char *Value = getenv(LPROF_DENSE_ENV);
+  return Value && Value[0] && strcmp(Value, "0") != 0;
+#else
+  return 1;
+#endif
+}
+
+static int shouldWriteSparseProfile(void) {
+  return !isDenseProfileEnabled() &&
+         !__llvm_profile_is_continuous_mode_enabled();
+}
+
 /* Return 1 if there is an error, otherwise return  0.  */
 static uint32_t fileWriter(ProfDataWriter *This, ProfDataIOVec *IOVecs,
                            uint32_t NumIOVecs) {
@@ -407,6 +422,253 @@ static void setupIOBuffer(void) {
     DynamicBufferIOBuffer = (uint8_t *)calloc(VPBufferSize, 1);
   }
 }
+
+#if defined(__linux__)
+static int getProfileDataSection(const __llvm_profile_data *Data,
+                                 const void *RelativePointer, uint64_t Size,
+                                 const char *SectionBegin,
+                                 const char *SectionEnd,
+                                 const char **DataBegin) {
+  uintptr_t BeginAddress = (uintptr_t)SectionBegin;
+  uintptr_t EndAddress = (uintptr_t)SectionEnd;
+  uintptr_t DataAddress = (uintptr_t)Data + (intptr_t)RelativePointer;
+
+  if (DataAddress < BeginAddress || DataAddress > EndAddress ||
+      Size > EndAddress - DataAddress)
+    return -1;
+
+  *DataBegin = (const char *)DataAddress;
+  return 0;
+}
+
+static int functionHasProfileData(const __llvm_profile_data *Data,
+                                  const char *CountersBegin,
+                                  const char *CountersEnd, uint64_t Version) {
+  const char *FunctionCounters;
+  size_t CounterSize = (Version & VARIANT_MASK_BYTE_COVERAGE)
+                           ? sizeof(uint8_t)
+                           : sizeof(uint64_t);
+  uint64_t FunctionCountersSize = Data->NumCounters * CounterSize;
+
+  if (getProfileDataSection(Data, Data->CounterPtr, FunctionCountersSize,
+                            CountersBegin, CountersEnd, &FunctionCounters))
+    return -1;
+
+  if (Version & VARIANT_MASK_BYTE_COVERAGE) {
+    uint32_t I;
+    for (I = 0; I < Data->NumCounters; ++I)
+      if ((uint8_t)FunctionCounters[I] == 0)
+        return 1;
+  } else {
+    uint32_t I;
+    for (I = 0; I < Data->NumCounters; ++I) {
+      uint64_t Counter;
+      memcpy(&Counter, FunctionCounters + I * sizeof(Counter), sizeof(Counter));
+      if (Counter != 0)
+        return 1;
+    }
+  }
+
+  return 0;
+}
+
+static void setProfileDataRelativePointer(__llvm_profile_data *Data,
+                                          size_t FieldOffset,
+                                          const void *Target) {
+  uintptr_t RelativePointer = (uintptr_t)Target - (uintptr_t)Data;
+  memcpy((char *)Data + FieldOffset, &RelativePointer, sizeof(RelativePointer));
+}
+
+static int writeDenseProfileSegment(ProfDataWriter *Writer,
+                                    VPDataReaderType *VPDataReader,
+                                    uint64_t Version) {
+  return lprofWriteDataImpl(
+      Writer, __llvm_profile_begin_data(), __llvm_profile_end_data(),
+      __llvm_profile_begin_counters(), __llvm_profile_end_counters(),
+      __llvm_profile_begin_bitmap(), __llvm_profile_end_bitmap(), NULL, NULL,
+      VPDataReader, __llvm_profile_begin_names(), __llvm_profile_end_names(),
+      __llvm_profile_begin_vtables(), __llvm_profile_end_vtables(),
+      __llvm_profile_begin_vtabnames(), __llvm_profile_end_vtabnames(), 0,
+      Version);
+}
+
+static int writeSparseProfileSegment(ProfDataWriter *Writer,
+                                     VPDataReaderType *VPDataReader) {
+  const __llvm_profile_data *DataBegin = __llvm_profile_begin_data();
+  const __llvm_profile_data *DataEnd = __llvm_profile_end_data();
+  const char *CountersBegin = __llvm_profile_begin_counters();
+  const char *CountersEnd = __llvm_profile_end_counters();
+  const char *BitmapBegin = __llvm_profile_begin_bitmap();
+  const char *BitmapEnd = __llvm_profile_end_bitmap();
+  const char *NamesBegin = __llvm_profile_begin_names();
+  const char *NamesEnd = __llvm_profile_end_names();
+  const VTableProfData *VTableBegin = __llvm_profile_begin_vtables();
+  const VTableProfData *VTableEnd = __llvm_profile_end_vtables();
+  const char *VNamesBegin = __llvm_profile_begin_vtabnames();
+  const char *VNamesEnd = __llvm_profile_end_vtabnames();
+  const uint64_t Version = __llvm_profile_get_version();
+  const uint64_t SparseVersion = Version | VARIANT_MASK_SPARSE_RAW;
+  const uint64_t NumData = __llvm_profile_get_num_data(DataBegin, DataEnd);
+  const size_t CounterSize = __llvm_profile_counter_entry_size();
+  __llvm_profile_data *SparseData = NULL;
+  char *SparseCounters = NULL;
+  char *SparseBitmap = NULL;
+  uint8_t *Selected = NULL;
+  uint64_t NumSparseCounters = 0;
+  uint64_t NumSparseBitmapBytes = 0;
+  uint64_t NumSparseData = 0;
+  uint64_t I;
+  int Result;
+
+  /*
+   * Correlated and temporal profiles have section-wide semantics. Value
+   * profiling also needs every function address in the data section to map
+   * indirect-call targets back to names. Preserve their existing dense
+   * representation until sparse variants of those formats are defined.
+   */
+  if (!NumData || NamesBegin == NamesEnd ||
+      (Version & VARIANT_MASK_TEMPORAL_PROF))
+    return writeDenseProfileSegment(Writer, VPDataReader, SparseVersion);
+
+  if (NumData > (uint64_t)SIZE_MAX)
+    return writeDenseProfileSegment(Writer, VPDataReader, SparseVersion);
+  Selected = (uint8_t *)calloc((size_t)NumData, sizeof(*Selected));
+  if (!Selected)
+    return writeDenseProfileSegment(Writer, VPDataReader, SparseVersion);
+
+  for (I = 0; I < NumData; ++I) {
+    const __llvm_profile_data *Data = DataBegin + I;
+    int HasData;
+    unsigned ValueKind;
+
+    for (ValueKind = 0; ValueKind <= IPVK_Last; ++ValueKind) {
+      if (Data->NumValueSites[ValueKind]) {
+        free(Selected);
+        return writeDenseProfileSegment(Writer, VPDataReader, SparseVersion);
+      }
+    }
+
+    HasData = functionHasProfileData(Data, CountersBegin, CountersEnd, Version);
+    if (HasData < 0) {
+      free(Selected);
+      return writeDenseProfileSegment(Writer, VPDataReader, SparseVersion);
+    }
+    if (!HasData)
+      continue;
+
+    if (UINT64_MAX - NumSparseCounters < Data->NumCounters ||
+        UINT64_MAX - NumSparseBitmapBytes < Data->NumBitmapBytes) {
+      free(Selected);
+      return writeDenseProfileSegment(Writer, VPDataReader, SparseVersion);
+    }
+    Selected[I] = 1;
+    ++NumSparseData;
+    NumSparseCounters += Data->NumCounters;
+    NumSparseBitmapBytes += Data->NumBitmapBytes;
+  }
+
+  if (!NumSparseData) {
+    static const __llvm_profile_data EmptyData = {0};
+    static const VTableProfData EmptyVTable = {0};
+    static const char EmptySection = 0;
+    free(Selected);
+    return lprofWriteDataImpl(Writer, &EmptyData, &EmptyData, &EmptySection,
+                              &EmptySection, &EmptySection, &EmptySection, NULL,
+                              NULL, NULL, &EmptySection, &EmptySection,
+                              &EmptyVTable, &EmptyVTable, &EmptySection,
+                              &EmptySection, 0, SparseVersion);
+  }
+
+  if (NumSparseData > SIZE_MAX / sizeof(*SparseData) ||
+      NumSparseCounters > SIZE_MAX / CounterSize ||
+      NumSparseBitmapBytes > SIZE_MAX) {
+    free(Selected);
+    return writeDenseProfileSegment(Writer, VPDataReader, SparseVersion);
+  }
+
+  SparseData = (__llvm_profile_data *)malloc((size_t)NumSparseData *
+                                             sizeof(*SparseData));
+  SparseCounters = (char *)malloc((size_t)NumSparseCounters * CounterSize);
+  if (NumSparseBitmapBytes)
+    SparseBitmap = (char *)malloc((size_t)NumSparseBitmapBytes);
+  if (!SparseData || !SparseCounters ||
+      (NumSparseBitmapBytes && !SparseBitmap)) {
+    free(SparseBitmap);
+    free(SparseCounters);
+    free(SparseData);
+    free(Selected);
+    return writeDenseProfileSegment(Writer, VPDataReader, SparseVersion);
+  }
+
+  {
+    uint64_t SparseDataIndex = 0;
+    uint64_t SparseCounterOffset = 0;
+    uint64_t SparseBitmapOffset = 0;
+
+    for (I = 0; I < NumData; ++I) {
+      const __llvm_profile_data *Data = DataBegin + I;
+      __llvm_profile_data *Destination;
+      const char *FunctionCounters;
+      const char *FunctionBitmap = NULL;
+      uint64_t FunctionCountersSize;
+
+      if (!Selected[I])
+        continue;
+
+      Destination = SparseData + SparseDataIndex++;
+      FunctionCountersSize = Data->NumCounters * CounterSize;
+      if (getProfileDataSection(Data, Data->CounterPtr, FunctionCountersSize,
+                                CountersBegin, CountersEnd,
+                                &FunctionCounters) ||
+          (Data->NumBitmapBytes &&
+           getProfileDataSection(Data, Data->BitmapPtr, Data->NumBitmapBytes,
+                                 BitmapBegin, BitmapEnd, &FunctionBitmap))) {
+        free(SparseBitmap);
+        free(SparseCounters);
+        free(SparseData);
+        free(Selected);
+        return writeDenseProfileSegment(Writer, VPDataReader, SparseVersion);
+      }
+
+      memcpy(Destination, Data, sizeof(*Destination));
+      /*
+       * Keep every counter for a selected function. Coverage mappings,
+       * including call-continuation expressions, address this vector by
+       * counter index.
+       */
+      memcpy(SparseCounters + SparseCounterOffset, FunctionCounters,
+             (size_t)FunctionCountersSize);
+      setProfileDataRelativePointer(Destination,
+                                    offsetof(__llvm_profile_data, CounterPtr),
+                                    SparseCounters + SparseCounterOffset);
+      SparseCounterOffset += FunctionCountersSize;
+
+      if (Data->NumBitmapBytes) {
+        memcpy(SparseBitmap + SparseBitmapOffset, FunctionBitmap,
+               Data->NumBitmapBytes);
+        setProfileDataRelativePointer(Destination,
+                                      offsetof(__llvm_profile_data, BitmapPtr),
+                                      SparseBitmap + SparseBitmapOffset);
+        SparseBitmapOffset += Data->NumBitmapBytes;
+      }
+    }
+  }
+
+  Result = lprofWriteDataImpl(
+      Writer, SparseData, SparseData + NumSparseData, SparseCounters,
+      SparseCounters + NumSparseCounters * CounterSize,
+      NumSparseBitmapBytes ? SparseBitmap : BitmapBegin,
+      NumSparseBitmapBytes ? SparseBitmap + NumSparseBitmapBytes : BitmapBegin,
+      NULL, NULL, VPDataReader, NamesBegin, NamesEnd, VTableBegin, VTableEnd,
+      VNamesBegin, VNamesEnd, 0, SparseVersion);
+
+  free(SparseBitmap);
+  free(SparseCounters);
+  free(SparseData);
+  free(Selected);
+  return Result;
+}
+#endif
 
 /* Get the size of the profile file. If there are any errors, print the
  * message under the assumption that the profile is being read for merging
@@ -567,14 +829,72 @@ static void closeFileObject(FILE *OutputFile) {
   }
 }
 
+static FILE *openFileForSparseAppend(const char *ProfileFileName,
+                                     uint64_t *SegmentOffset) {
+  FILE *ProfileFile = getProfileFile();
+  __llvm_profile_header Header;
+  long Offset;
+  if (ProfileFile)
+    lprofLockFileHandle(ProfileFile);
+  else {
+    createProfileDir(ProfileFileName);
+    ProfileFile = lprofOpenFileEx(ProfileFileName);
+  }
+  if (!ProfileFile)
+    return NULL;
+
+  if (fseek(ProfileFile, 0L, SEEK_END) == -1 ||
+      (Offset = ftell(ProfileFile)) == -1) {
+    goto Error;
+  }
+
+  if (Offset > 0) {
+    uint64_t ExpectedVersion =
+        __llvm_profile_get_version() | VARIANT_MASK_SPARSE_RAW;
+    if ((uint64_t)Offset < sizeof(Header) ||
+        fseek(ProfileFile, 0L, SEEK_SET) == -1 ||
+        fread(&Header, sizeof(Header), 1, ProfileFile) != 1 ||
+        Header.Magic != __llvm_profile_get_magic() ||
+        Header.Version != ExpectedVersion) {
+      PROF_ERR("Refusing to append sparse profile data to non-sparse or "
+               "incompatible file \"%s\".\n",
+               ProfileFileName);
+      errno = EINVAL;
+      goto Error;
+    }
+    if (fseek(ProfileFile, 0L, SEEK_END) == -1)
+      goto Error;
+  }
+
+  *SegmentOffset = (uint64_t)Offset;
+  return ProfileFile;
+
+Error:
+  lprofUnlockFileHandle(ProfileFile);
+  if (ProfileFile != getProfileFile())
+    fclose(ProfileFile);
+  return NULL;
+}
+
+static void closeSparseFileObject(FILE *OutputFile) {
+  fflush(OutputFile);
+  lprofUnlockFileHandle(OutputFile);
+  if (OutputFile != getProfileFile())
+    fclose(OutputFile);
+}
+
 /* Write profile data to file \c OutputName.  */
 static int writeFile(const char *OutputName) {
   int RetVal;
   FILE *OutputFile;
+  int SparseProfile = shouldWriteSparseProfile();
+  uint64_t SparseSegmentOffset = 0;
 
   int MergeDone = 0;
   VPMergeHook = &lprofMergeValueProfData;
-  if (doMerging())
+  if (SparseProfile)
+    OutputFile = openFileForSparseAppend(OutputName, &SparseSegmentOffset);
+  else if (doMerging())
     OutputFile = openFileForMerging(OutputName, &MergeDone);
   else
     OutputFile = getFileObject(OutputName);
@@ -586,9 +906,21 @@ static int writeFile(const char *OutputName) {
   setupIOBuffer();
   ProfDataWriter fileWriter;
   initFileWriter(&fileWriter, OutputFile);
-  RetVal = lprofWriteData(&fileWriter, lprofGetVPDataReader(), MergeDone);
+#if defined(__linux__)
+  if (SparseProfile)
+    RetVal = writeSparseProfileSegment(&fileWriter, lprofGetVPDataReader());
+  else
+#endif
+    RetVal = lprofWriteData(&fileWriter, lprofGetVPDataReader(), MergeDone);
 
-  closeFileObject(OutputFile);
+  if (SparseProfile) {
+    if (RetVal) {
+      fflush(OutputFile);
+      (void)COMPILER_RT_FTRUNCATE(OutputFile, SparseSegmentOffset);
+    }
+    closeSparseFileObject(OutputFile);
+  } else
+    closeFileObject(OutputFile);
   return RetVal;
 }
 
@@ -1239,7 +1571,7 @@ int __llvm_profile_write_file(void) {
 
 COMPILER_RT_VISIBILITY
 int __llvm_profile_dump(void) {
-  if (!doMerging())
+  if (!doMerging() && !shouldWriteSparseProfile())
     PROF_WARN("Later invocation of __llvm_profile_dump can lead to clobbering "
               " of previously dumped profile data : %s. Either use %%m "
               "in profile name or change profile name before dumping.\n",

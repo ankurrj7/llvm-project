@@ -5,9 +5,9 @@
 // RUN: FileCheck %s --check-prefix=RAW-PROF < %t.profraw.out
 
 // RUN: rm -rf %t.profdir
-// RUN: env LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
-// RUN: env LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
-// RUN: env LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE=%t.profdir/default_%m.profraw %run %t
 // RUN: llvm-profdata show --profile-version %t.profdir/default_*.profraw > %t.profraw.out
 // RUN: FileCheck %s --check-prefix=INDEXED-PROF < %t.profraw.out
 

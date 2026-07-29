@@ -1,10 +1,10 @@
 // A simple fork results in two processes writing to the same file
 // RUN: rm -fr %t.profdir
 // RUN: %clang_pgogen=%t.profdir -o %t -O2 %s
-// RUN: %run %t
+// RUN: env LLVM_PROFILE_DENSE=1 %run %t
 // RUN: llvm-profdata show --all-functions --counts %t.profdir/default_*.profraw  | FileCheck %s
 // RUN: rm -fr %t.profdir
-// RUN: env LLVM_PROFILE_NO_MMAP=1 %run %t
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_NO_MMAP=1 %run %t
 // RUN: llvm-profdata show --all-functions --counts %t.profdir/default_*.profraw  | FileCheck %s
 
 //
