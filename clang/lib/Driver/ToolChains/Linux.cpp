@@ -1029,7 +1029,24 @@ void Linux::addProfileRTLibs(const llvm::opt::ArgList &Args,
   if (needsProfileRT(Args))
     CmdArgs.push_back(Args.MakeArgString(
         Twine("-u", llvm::getInstrProfRuntimeHookVarName())));
+  if (needsProfileRT(Args) && !Args.hasArg(options::OPT_shared) &&
+      !Args.hasArg(options::OPT_r) && !Args.hasArg(options::OPT_static) &&
+      !Args.hasArg(options::OPT_static_pie)) {
+    SmallString<128> ProfileSymbols(getCompilerRT(Args, "profile"));
+    ProfileSymbols += ".syms";
+    if (getVFS().exists(ProfileSymbols))
+      CmdArgs.push_back(
+          Args.MakeArgString(Twine("--dynamic-list=") + ProfileSymbols));
+    else
+      CmdArgs.push_back("--export-dynamic");
+  }
   ToolChain::addProfileRTLibs(Args, CmdArgs);
+  if (needsProfileRT(Args) && !Args.hasArg(options::OPT_r)) {
+    CmdArgs.push_back("--push-state");
+    CmdArgs.push_back("--as-needed");
+    CmdArgs.push_back("-ldl");
+    CmdArgs.push_back("--pop-state");
+  }
 }
 
 void Linux::addExtraOpts(llvm::opt::ArgStringList &CmdArgs) const {
