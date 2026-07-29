@@ -195,6 +195,20 @@ void INSTR_PROF_INSTRUMENT_GPU_FUNC(uint64_t *Counter, uint64_t *Uniform,
  */
 int __llvm_profile_write_file(void);
 
+/*! \brief Write profile data for the current image and mark it as dumped. */
+int __llvm_profile_dump(void);
+
+/*! \brief Write profile data for the current image at most once. */
+#if defined(__linux__)
+int __llvm_profile_dump_current_image_impl(void);
+#endif
+
+/*!
+ * \brief Write profile data for the current executable and every currently
+ * loaded instrumented shared object.
+ */
+int __llvm_profile_dump_all(void);
+
 /*!
  * \brief Set the FILE object for writing instrumentation data. Return 0 if set
  * successfully or return 1 if failed.

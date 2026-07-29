@@ -1,0 +1,95 @@
+// REQUIRES: linux
+// RUN: rm -rf %t && split-file %s %t && cd %t
+// RUN: %clang_profgen -fPIC -shared lib-linked.c -o lib-linked.so
+// RUN: %clang_profgen -fPIC -shared lib-loaded.c -o lib-loaded.so
+// RUN: %clang_profgen -fPIC -shared lib-unloaded.c -o lib-unloaded.so
+// RUN: %clang_profgen main.c -L. -Wl,-rpath,. -l-linked -ldl -o app-main
+// RUN: env LLVM_PROFILE_FILE=%t/main-%%p-%m.profraw %run %t/app-main
+// RUN: llvm-profdata merge -sparse %t/main-*.profraw -o %t/main.profdata
+// RUN: llvm-profdata show --function=linked_function --counts \
+// RUN:   %t/main.profdata | FileCheck %s --check-prefix=LINKED
+// RUN: llvm-profdata show --function=loaded_function --counts \
+// RUN:   %t/main.profdata | FileCheck %s --check-prefix=LOADED
+// RUN: llvm-profdata show --function=unloaded_function --counts \
+// RUN:   %t/main.profdata | FileCheck %s --check-prefix=UNLOADED
+// RUN: llvm-profdata show --function=main --counts %t/main.profdata | \
+// RUN:   FileCheck %s --check-prefix=MAIN
+//
+// RUN: %clang_profgen -DDUMP_FROM_DSO -no-pie main.c -L. -Wl,-rpath,. \
+// RUN:   -l-linked -ldl -o app-dso
+// RUN: env LLVM_PROFILE_FILE=%t/dso-%%p-%m.profraw %run %t/app-dso
+// RUN: llvm-profdata merge -sparse %t/dso-*.profraw -o %t/dso.profdata
+// RUN: llvm-profdata show --function=main --counts %t/dso.profdata | \
+// RUN:   FileCheck %s --check-prefix=MAIN
+// RUN: llvm-profdata show --function=loaded_function --counts \
+// RUN:   %t/dso.profdata | FileCheck %s --check-prefix=LOADED
+//
+// LINKED: linked_function:
+// LINKED: Function count: 1
+// LOADED: loaded_function:
+// LOADED: Function count: 1
+// UNLOADED: unloaded_function:
+// UNLOADED: Function count: 1
+// MAIN: main:
+// MAIN: Function count: 1
+
+//--- lib-linked.c
+void linked_function(void) {}
+
+//--- lib-loaded.c
+void loaded_function(void) {}
+int __llvm_profile_dump_all(void);
+int dump_all_from_loaded(void) { return __llvm_profile_dump_all(); }
+
+//--- lib-unloaded.c
+void unloaded_function(void) {}
+
+//--- main.c
+#include <dlfcn.h>
+#include <unistd.h>
+
+void linked_function(void);
+int __llvm_profile_dump_all(void);
+
+typedef void (*LoadedFunction)(void);
+typedef int (*DumpAllFunction)(void);
+
+int main(void) {
+  linked_function();
+
+  void *Handle = dlopen("./lib-loaded.so", RTLD_NOW | RTLD_LOCAL);
+  if (!Handle)
+    return 1;
+
+  LoadedFunction Function = (LoadedFunction)dlsym(Handle, "loaded_function");
+  if (!Function)
+    return 2;
+  Function();
+
+  void *UnloadedHandle =
+      dlopen("./lib-unloaded.so", RTLD_NOW | RTLD_LOCAL);
+  if (!UnloadedHandle)
+    return 3;
+
+  LoadedFunction UnloadedFunction =
+      (LoadedFunction)dlsym(UnloadedHandle, "unloaded_function");
+  if (!UnloadedFunction)
+    return 4;
+  UnloadedFunction();
+  if (dlclose(UnloadedHandle))
+    return 5;
+  if (chdir("/"))
+    return 6;
+
+#ifdef DUMP_FROM_DSO
+  DumpAllFunction DumpAll =
+      (DumpAllFunction)dlsym(Handle, "dump_all_from_loaded");
+  if (!DumpAll)
+    return 7;
+  if (DumpAll())
+#else
+  if (__llvm_profile_dump_all())
+#endif
+    return 8;
+  _exit(0);
+}
