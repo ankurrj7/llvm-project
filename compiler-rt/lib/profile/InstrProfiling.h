@@ -181,7 +181,7 @@ int __llvm_profile_write_file(void);
 int __llvm_profile_dump(void);
 
 /*! \brief Write profile data for the current image at most once. */
-#if defined(__linux__)
+#if defined(__linux__) && defined(COMPILER_RT_PROFILE_COVERAGE_RUNTIME)
 int __llvm_profile_dump_current_image_impl(void);
 #endif
 
