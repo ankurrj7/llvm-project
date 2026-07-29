@@ -1,0 +1,56 @@
+// REQUIRES: linux
+// RUN: rm -rf %t && split-file %s %t && cd %t
+// RUN: %clang_profgen -fPIC -shared library.c -o library.so
+// RUN: %clang_profgen main.c -ldl -o app
+// RUN: env LLVM_PROFILE_FILE=%t/reload-%%p-%m.profraw %run %t/app
+// RUN: llvm-profdata merge -sparse %t/reload-*.profraw \
+// RUN:   -o %t/reload.profdata
+// RUN: llvm-profdata show --function=on_reload_a --counts \
+// RUN:   %t/reload.profdata | FileCheck %s --check-prefix=FUNCTION-A
+// RUN: llvm-profdata show --function=on_reload_b --counts \
+// RUN:   %t/reload.profdata | FileCheck %s --check-prefix=FUNCTION-B
+// RUN: llvm-profdata show --function=on_reload_c --counts \
+// RUN:   %t/reload.profdata | FileCheck %s --check-prefix=FUNCTION-C
+//
+// FUNCTION-A: on_reload_a:
+// FUNCTION-A: Function count: 10
+// FUNCTION-B: on_reload_b:
+// FUNCTION-B: Function count: 10
+// FUNCTION-C: on_reload_c:
+// FUNCTION-C: Function count: 10
+
+//--- library.c
+void on_reload_a(void) {}
+void on_reload_b(void) {}
+void on_reload_c(void) {}
+
+//--- main.c
+#include <dlfcn.h>
+#include <unistd.h>
+
+typedef void (*ReloadFunction)(void);
+
+int main(void) {
+  for (int I = 0; I < 30; ++I) {
+    void *Handle = dlopen("./library.so", RTLD_NOW | RTLD_LOCAL);
+    if (!Handle)
+      return 1;
+
+    const char *Name = I % 3 == 0   ? "on_reload_a"
+                       : I % 3 == 1 ? "on_reload_b"
+                                    : "on_reload_c";
+    ReloadFunction Function = (ReloadFunction)dlsym(Handle, Name);
+    if (!Function)
+      return 2;
+    Function();
+
+    if (dlclose(Handle))
+      return 3;
+  }
+
+  /*
+   * The main image deliberately does not dump. Each DSO instance must have
+   * written its own sparse segment from its unload handler.
+   */
+  _exit(0);
+}

@@ -5,8 +5,8 @@
 
 // Check that foo and bar have the same signatures.
 // RUN: rm -rf %t.profdir
-// RUN: env LLVM_PROFILE_FILE=%t.profdir/%m.profraw %run %t.dir/foo
-// RUN: env LLVM_PROFILE_FILE=%t.profdir/%m.profraw %run %t.dir/bar 2>&1 | FileCheck %s --check-prefix=MERGE-ERROR
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE=%t.profdir/%m.profraw %run %t.dir/foo
+// RUN: env LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE=%t.profdir/%m.profraw %run %t.dir/bar 2>&1 | FileCheck %s --check-prefix=MERGE-ERROR
 
 // Check that foo and bar have different binary IDs.
 // RUN: rm -rf %t.profdir %t.profdata
@@ -22,10 +22,10 @@
 // MERGE-ERROR: LLVM Profile Error: Profile Merging of file {{.*}}.profraw failed: File exists
 
 // BINARY-ID: Instrumentation level: Front-end
-// BINARY-ID-NEXT: Total functions: 3
+// BINARY-ID-NEXT: Total functions: 1
 // BINARY-ID-NEXT: Maximum function count: 2
 // BINARY-ID-NEXT: Maximum internal block count: 0
-// BINARY-ID-NEXT: Total number of blocks: 3
+// BINARY-ID-NEXT: Total number of blocks: 1
 // BINARY-ID-NEXT: Total count: 2
 // BINARY-ID-NEXT: Binary IDs:
 // BINARY-ID-NEXT: {{[0-9a-f]+}}

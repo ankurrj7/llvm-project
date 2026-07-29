@@ -8,19 +8,19 @@ RUN: %clang_pgogen -fprofile-update=atomic -shared foo2.o -o shr_foo2.o
 RUN: %clang_pgogen common.c -c
 
 RUN: %clang_pgogen test1.c common.o -Xclang -fprofile-instrument-path="default_test1_%m.profraw"
-RUN: ./a.out 2>&1 | FileCheck %s -check-prefix=CHECK-FOO
+RUN: env LLVM_PROFILE_DENSE=1 ./a.out 2>&1 | FileCheck %s -check-prefix=CHECK-FOO
 RUN: llvm-profdata show default_test1_*.profraw --counts --all-functions 2>&1 | \
 RUN:   FileCheck %s -check-prefix=CHECK-TEST1
 RUN: rm -f default*
 
 RUN: %clang_pgogen test2.c common.o -Xclang -fprofile-instrument-path="default_test2_%m.profraw"
-RUN: ./a.out 2>&1 | FileCheck %s -check-prefix=CHECK-FOO
+RUN: env LLVM_PROFILE_DENSE=1 ./a.out 2>&1 | FileCheck %s -check-prefix=CHECK-FOO
 RUN: llvm-profdata show default_test2_*.profraw --counts --all-functions 2>&1 | \
 RUN:   FileCheck %s -check-prefix=CHECK-TEST2
 RUN: rm -f default*
 
 RUN: %clangxx_pgogen -lpthread test3.cpp common.o -Xclang -fprofile-instrument-path="default_test3_%m.profraw"
-RUN: ./a.out 2>&1 | FileCheck %s -check-prefix=CHECK-FOO-FOUR-THREADS
+RUN: env LLVM_PROFILE_DENSE=1 ./a.out 2>&1 | FileCheck %s -check-prefix=CHECK-FOO-FOUR-THREADS
 
 CHECK-FOO:  foo:
 CHECK-FOO:    Block counts: [1]

@@ -99,7 +99,9 @@ Header
 ``Version``
   The lower 32 bits specify the actual version and the most significant 32 bits
   specify the variant types of the profile. IR-based instrumentation PGO and
-  context-sensitive IR-based instrumentation PGO are two variant types.
+  context-sensitive IR-based instrumentation PGO are two variant types. Sparse
+  raw-profile serialization sets a variant bit so the runtime can prevent dense
+  online merging from modifying a file containing sparse segments.
 
 ``BinaryIdsSize``
   The byte size of `binary id`_ section.

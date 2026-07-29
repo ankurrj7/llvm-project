@@ -2,16 +2,37 @@
 // RUN: rm -rf %t && split-file %s %t && cd %t
 // RUN: %clang_profgen -fPIC -shared library.c -o library.so
 // RUN: %clang_profgen main.c -ldl -pthread -o app
-// RUN: env LLVM_PROFILE_FILE=%t/profile-%%p-%m.profraw %run %t/app
+// RUN: env LLVM_PROFILE_DENSE=1 \
+// RUN:   LLVM_PROFILE_FILE=%t/profile-%%p-%m.profraw %run %t/app
 // RUN: llvm-profdata merge -sparse %t/profile-*.profraw -o %t/profile.profdata
-// RUN: llvm-profdata show --function=concurrent_function --counts \
-// RUN:   %t/profile.profdata | FileCheck %s
+// RUN: llvm-profdata show --function=concurrent_function_a --counts \
+// RUN:   %t/profile.profdata | FileCheck %s --check-prefix=FUNCTION-A
+// RUN: llvm-profdata show --function=concurrent_function_b --counts \
+// RUN:   %t/profile.profdata | FileCheck %s --check-prefix=FUNCTION-B
+// RUN: llvm-profdata show --function=concurrent_function_c --counts \
+// RUN:   %t/profile.profdata | FileCheck %s --check-prefix=FUNCTION-C
 //
-// CHECK: concurrent_function:
-// CHECK: Function count: 20
+// RUN: env LLVM_PROFILE_FILE=%t/sparse-%%p-%m.profraw %run %t/app
+// RUN: llvm-profdata merge -sparse %t/sparse-*.profraw \
+// RUN:   -o %t/sparse.profdata
+// RUN: llvm-profdata show --function=concurrent_function_a --counts \
+// RUN:   %t/sparse.profdata | FileCheck %s --check-prefix=FUNCTION-A
+// RUN: llvm-profdata show --function=concurrent_function_b --counts \
+// RUN:   %t/sparse.profdata | FileCheck %s --check-prefix=FUNCTION-B
+// RUN: llvm-profdata show --function=concurrent_function_c --counts \
+// RUN:   %t/sparse.profdata | FileCheck %s --check-prefix=FUNCTION-C
+//
+// FUNCTION-A: concurrent_function_a:
+// FUNCTION-A: Function count: 7
+// FUNCTION-B: concurrent_function_b:
+// FUNCTION-B: Function count: 7
+// FUNCTION-C: concurrent_function_c:
+// FUNCTION-C: Function count: 6
 
 //--- library.c
-void concurrent_function(void) {}
+void concurrent_function_a(void) {}
+void concurrent_function_b(void) {}
+void concurrent_function_c(void) {}
 
 //--- main.c
 #include <dlfcn.h>
@@ -48,8 +69,11 @@ static void *loadAndUnload(void *Unused) {
       return NULL;
     }
 
+    const char *FunctionName = I % 3 == 1   ? "concurrent_function_a"
+                               : I % 3 == 2 ? "concurrent_function_b"
+                                            : "concurrent_function_c";
     ConcurrentFunction Function =
-        (ConcurrentFunction)dlsym(Handle, "concurrent_function");
+        (ConcurrentFunction)dlsym(Handle, FunctionName);
     if (!Function) {
       reportFailure();
       return NULL;

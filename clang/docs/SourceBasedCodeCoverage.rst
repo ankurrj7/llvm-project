@@ -107,11 +107,36 @@ directory structure will be created.  Additionally, the following special
   Linux may be mostly complete but requires testing, and support for Windows
   may require more extensive changes: please get involved if you are interested
   in porting this feature.
+On Linux, the profile runtime uses sparse raw-profile dumping by default,
+independently of how the output filename is configured. If
+``LLVM_PROFILE_FILE`` is absent, the sparse profile is written to
+``default.profraw`` like a normal profile. Set ``LLVM_PROFILE_DENSE=1`` to opt
+into the previous dense serialization and ``%m`` online-merging behavior.
+
+In sparse mode, the runtime omits a function record only when every counter for
+that function is zero. For each retained function, it writes the complete
+counter vector, so counter indexes and exact nonzero counts are unchanged. The
+complete name section is retained to keep each raw-profile segment
+self-contained.
+
+Sparse mode appends each dump as a locked raw-profile segment. In particular,
+when a filename contains ``%m``, sparse mode uses concatenated segments instead
+of the normal in-process dense merge. ``llvm-profdata merge`` reads and combines
+these segments, including segments written by instrumented shared libraries.
+Sparse-mode segments are marked in the raw header. The runtime refuses to mix
+dense and sparse-mode segments in the same file, preventing a dense online
+merger from truncating appended sparse segments.
+Temporal profiles, profile correlation, and profiles containing value
+profiling sites currently retain their dense representation. Continuous mode
+does not use sparse dumping.
 
 .. code-block:: console
 
     # Step 2: Run the program.
     % LLVM_PROFILE_FILE="foo.profraw" ./foo
+
+    # Explicitly request the legacy dense representation when needed.
+    % LLVM_PROFILE_DENSE=1 LLVM_PROFILE_FILE="foo.profraw" ./foo
 
 Note that continuous mode is also used on Fuchsia where it's the only supported
 mode, but the implementation is different. The Darwin and Linux implementation
