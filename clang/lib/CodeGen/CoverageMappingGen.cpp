@@ -18,6 +18,7 @@
 #include "clang/Basic/DiagnosticFrontend.h"
 #include "clang/Lex/Lexer.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ProfileData/Coverage/CoverageMapping.h"
@@ -25,6 +26,7 @@
 #include "llvm/ProfileData/Coverage/CoverageMappingWriter.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include <optional>
 
 // This selects the coverage mapping format defined when `InstrProfData.inc`
@@ -373,6 +375,14 @@ public:
   /// Get the end of \c S ignoring macro arguments and builtin macros.
   SourceLocation getEnd(const Stmt *S) {
     SourceLocation Loc = S->getEndLoc();
+    while (SM.isMacroArgExpansion(Loc) || isInBuiltin(Loc))
+      Loc = SM.getImmediateExpansionRange(Loc).getBegin();
+    return getPreciseTokenLocEnd(Loc);
+  }
+
+  /// Get the end of \c D ignoring macro arguments and builtin macros.
+  SourceLocation getEnd(const Decl *D) {
+    SourceLocation Loc = D->getEndLoc();
     while (SM.isMacroArgExpansion(Loc) || isInBuiltin(Loc))
       Loc = SM.getImmediateExpansionRange(Loc).getBegin();
     return getPreciseTokenLocEnd(Loc);
@@ -912,7 +922,24 @@ struct CounterCoverageMappingBuilder
   llvm::DenseMap<const Stmt *, CounterPair> &CounterMap;
 
   /// The map of calls to counters reached only when the call returns.
-  llvm::DenseMap<const Stmt *, unsigned> *CallContinuationCounterMap;
+  CallContinuationCounterMap *CallContinuationCounters;
+  VLATypeEvaluationMap *VLATypeEvaluations;
+
+  /// Whether this constructor variant emits virtual-base initializers.
+  bool EmitVirtualBaseInitializers;
+
+  /// Whether the target's default C++ argument order is right-to-left.
+  bool ReverseDefaultCallArgs;
+
+  /// Condition declarations complete after contextual conversion and any
+  /// deferred decomposition bindings. Suppress the ordinary DeclStmt boundary
+  /// while visiting their initializer, then start it at that later point.
+  bool SuppressDeclarationContinuation = false;
+
+  /// True while traversing the implementation semantics of a written
+  /// pseudo-object expression. Implicit accessor messages are implementation
+  /// details and share the pseudo-object's single completion boundary.
+  bool InPseudoObjectSemantics = false;
 
   /// Used to expand an allocatd SkipCnt to Expression with known counters.
   /// Key: SkipCnt
@@ -976,13 +1003,34 @@ struct CounterCoverageMappingBuilder
     return Counter::getCounter(CounterMap[S].Executed);
   }
 
-  std::optional<Counter> getCallContinuationCounter(const Stmt *S) {
-    if (!CallContinuationCounterMap)
+  std::optional<Counter> getCallContinuationCounter(
+      CallContinuationOwner Owner,
+      CallContinuationKind Kind = CallContinuationKind::Call) {
+    if (!CallContinuationCounters)
       return std::nullopt;
-    auto I = CallContinuationCounterMap->find(S);
-    if (I == CallContinuationCounterMap->end())
+    auto I = CallContinuationCounters->find({Owner, Kind});
+    if (I == CallContinuationCounters->end())
       return std::nullopt;
     return Counter::getCounter(I->second);
+  }
+
+  ArrayRef<const Expr *>
+  getVLATypeEvaluationPlan(CallContinuationOwner Owner) const {
+    if (!VLATypeEvaluations)
+      return {};
+    auto I = VLATypeEvaluations->find(Owner);
+    if (I == VLATypeEvaluations->end())
+      return {};
+    return I->second;
+  }
+
+  void visitVLATypeEvaluation(CallContinuationOwner Owner,
+                              SourceLocation TypeEnd) {
+    for (const Expr *Expression : getVLATypeEvaluationPlan(Owner))
+      Visit(Expression);
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            Owner, CallContinuationKind::VLAEvaluation))
+      startCallContinuationRegion(TypeEnd, *ContinuationCounter);
   }
 
   struct BranchCounterPair {
@@ -1347,6 +1395,8 @@ struct CounterCoverageMappingBuilder
   /// This should be used after visiting any statements in non-source order.
   void adjustForOutOfOrderTraversal(SourceLocation EndLoc) {
     MostRecentLocation = EndLoc;
+    if (RegionStack.empty())
+      return;
     // The code region for a whole macro is created in handleFileExit() when
     // it detects exiting of the virtual file of that macro. If we visited
     // statements in non-source order, we might already have such a region
@@ -1457,11 +1507,16 @@ struct CounterCoverageMappingBuilder
     HasGapRegion = true;
   }
 
-  void startCallContinuationRegion(const Stmt *S, Counter ContinuationCount) {
-    SourceMappingRegion &Region = getRegion();
-    SourceLocation EndLoc = getEnd(S);
+  void startCallContinuationRegion(SourceLocation EndLoc,
+                                   Counter ContinuationCount) {
     if (EndLoc.isInvalid())
       return;
+    // Default arguments are mapped at their declaration but complete at a
+    // distinct use site. Finish any nested header/macro mapping before the
+    // continuation becomes the count at that use site.
+    handleFileExit(EndLoc);
+    adjustForOutOfOrderTraversal(EndLoc);
+    SourceMappingRegion &Region = getRegion();
 
     std::optional<SourceLocation> OriginalEndLoc =
         Region.hasEndLoc() ? std::optional<SourceLocation>(Region.getEndLoc())
@@ -1471,6 +1526,10 @@ struct CounterCoverageMappingBuilder
     CallContinuationRegionIndices.insert(Index);
     GapRegionCounter = ContinuationCount;
     HasGapRegion = true;
+  }
+
+  void startCallContinuationRegion(const Stmt *S, Counter ContinuationCount) {
+    startCallContinuationRegion(getEnd(S), ContinuationCount);
   }
 
   /// Find a valid gap range between \p AfterLoc and \p BeforeLoc.
@@ -1612,11 +1671,18 @@ struct CounterCoverageMappingBuilder
   CounterCoverageMappingBuilder(
       CoverageMappingModuleGen &CVM,
       llvm::DenseMap<const Stmt *, CounterPair> &CounterMap,
-      llvm::DenseMap<const Stmt *, unsigned> *CallContinuationCounterMap,
-      MCDC::State &MCDCState, SourceManager &SM, const LangOptions &LangOpts,
-      unsigned NextCounter)
+      CallContinuationCounterMap *CallContinuationCounters,
+      VLATypeEvaluationMap *VLATypeEvaluations, MCDC::State &MCDCState,
+      SourceManager &SM, const LangOptions &LangOpts, unsigned NextCounter,
+      bool EmitVirtualBaseInitializers)
       : CoverageMappingBuilder(CVM, SM, LangOpts), CounterMap(CounterMap),
-        CallContinuationCounterMap(CallContinuationCounterMap),
+        CallContinuationCounters(CallContinuationCounters),
+        VLATypeEvaluations(VLATypeEvaluations),
+        EmitVirtualBaseInitializers(EmitVirtualBaseInitializers),
+        ReverseDefaultCallArgs(CVM.getCodeGenModule()
+                                   .getTarget()
+                                   .getCXXABI()
+                                   .areArgsDestroyedLeftToRightInCallee()),
         NextCounterNum(NextCounter), MCDCState(MCDCState),
         MCDCBuilder(CVM.getCodeGenModule(), MCDCState) {}
 
@@ -1641,6 +1707,7 @@ struct CounterCoverageMappingBuilder
       extendRegion(S);
     const Stmt *LastStmt = nullptr;
     bool SaveGapRegion = HasGapRegion;
+    Counter SavedGapRegionCounter = GapRegionCounter;
     HasGapRegion = false;
     GapRegionCounter = Counter::getZero();
     for (const Stmt *Child : S->children())
@@ -1653,21 +1720,32 @@ struct CounterCoverageMappingBuilder
             fillGapAreaWithCount(Gap->getBegin(), Gap->getEnd(),
                                  GapRegionCounter);
           SaveGapRegion = true;
+          if (CallContinuationCounters)
+            SavedGapRegionCounter = GapRegionCounter;
           HasGapRegion = false;
         }
         this->Visit(Child);
         LastStmt = Child;
       }
-    if (SaveGapRegion)
+    if (SaveGapRegion && !HasGapRegion) {
       HasGapRegion = true;
+      if (CallContinuationCounters)
+        GapRegionCounter = SavedGapRegionCounter;
+    }
     handleFileExit(getEnd(S));
   }
 
   void VisitStmtExpr(const StmtExpr *E) {
     Visit(E->getSubStmt());
     // Any region transition within the statement expression has been handled by
-    // visiting the sub-statement. It cannot need a gap outside the expression.
-    HasGapRegion = false;
+    // visiting the sub-statement. A call-continuation region reached after an
+    // implicit cleanup, however, is also the count immediately after the
+    // statement expression and must cover the gap to the following source.
+    bool HasPendingCallContinuation =
+        !RegionStack.empty() &&
+        CallContinuationRegionIndices.count(RegionStack.size() - 1);
+    if (!HasPendingCallContinuation)
+      HasGapRegion = false;
   }
 
   void VisitDecl(const Decl *D) {
@@ -1689,15 +1767,38 @@ struct CounterCoverageMappingBuilder
       Defaulted = Method->isDefaulted();
     if (auto *Ctor = dyn_cast<CXXConstructorDecl>(D)) {
       for (auto *Initializer : Ctor->inits()) {
-        if (Initializer->isWritten()) {
+        bool MapInitializer =
+            CallContinuationCounters
+                ? (Initializer->isWritten() ||
+                   Initializer->isInClassMemberInitializer()) &&
+                      (!Initializer->isBaseInitializer() ||
+                       EmitVirtualBaseInitializers ||
+                       !Initializer->isBaseVirtual())
+                : Initializer->isWritten();
+        if (MapInitializer) {
           auto *Init = Initializer->getInit();
           // Written initializers run before the constructor body. Seed the
           // body with the initializer's exit count so a non-returning call in
           // the initializer does not make the body look covered.
-          if (getStart(Init).isValid() && getEnd(Init).isValid())
+          if (const auto *DIE = dyn_cast<CXXDefaultInitExpr>(Init)) {
+            const Expr *WrittenInit = DIE->getExpr();
+            if (getStart(WrittenInit).isValid() &&
+                getEnd(WrittenInit).isValid())
+              BodyCounter = propagateCounts(BodyCounter, WrittenInit);
+            if (std::optional<Counter> ContinuationCounter =
+                    getCallContinuationCounter(
+                        DIE, CallContinuationKind::DefaultInitializer))
+              BodyCounter = *ContinuationCounter;
+          } else if (getStart(Init).isValid() && getEnd(Init).isValid()) {
             BodyCounter = propagateCounts(BodyCounter, Init);
+          }
         }
       }
+      if (CallContinuationCounters)
+        adjustForOutOfOrderTraversal(getStart(Body));
+      if (std::optional<Counter> PrologueCounter = getCallContinuationCounter(
+              Body, CallContinuationKind::ConstructorPrologue))
+        BodyCounter = *PrologueCounter;
     }
 
     propagateCounts(BodyCounter, Body,
@@ -1714,7 +1815,15 @@ struct CounterCoverageMappingBuilder
 
   void VisitCoroutineBodyStmt(const CoroutineBodyStmt *S) {
     extendRegion(S);
-    Visit(S->getBody());
+    if (!CallContinuationCounters) {
+      Visit(S->getBody());
+      return;
+    }
+    Counter BodyCount = getRegion().getCounter();
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(S, CallContinuationKind::CoroutineBody))
+      BodyCount = *ContinuationCounter;
+    propagateCounts(BodyCount, S->getBody());
   }
 
   void VisitCoreturnStmt(const CoreturnStmt *S) {
@@ -1725,7 +1834,232 @@ struct CounterCoverageMappingBuilder
   }
 
   void VisitCoroutineSuspendExpr(const CoroutineSuspendExpr *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
     Visit(E->getOperand());
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::CoroutineSuspend))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitCXXDefaultArgExpr(const CXXDefaultArgExpr *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::DefaultArgument))
+      startCallContinuationRegion(E->getUsedLocation(), *ContinuationCounter);
+  }
+
+  void VisitCXXDefaultInitExpr(const CXXDefaultInitExpr *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    Visit(E->getExpr());
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::DefaultInitializer))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitDeclStmt(const DeclStmt *S) {
+    if (!CallContinuationCounters) {
+      VisitStmt(S);
+      return;
+    }
+    if (S->getBeginLoc().isValid())
+      extendRegion(S);
+    for (const Decl *D : S->decls()) {
+      if (const auto *TND = dyn_cast<TypedefNameDecl>(D)) {
+        if (!getVLATypeEvaluationPlan(TND).empty()) {
+          SourceLocation TypeEnd = TND->getLocation();
+          if (TypeSourceInfo *TSI = TND->getTypeSourceInfo())
+            TypeEnd = TSI->getTypeLoc().getEndLoc();
+          visitVLATypeEvaluation(TND, TypeEnd);
+        }
+        continue;
+      }
+
+      const auto *VD = dyn_cast<VarDecl>(D);
+      if (!VD || VD->hasExternalStorage())
+        continue;
+      if (!getVLATypeEvaluationPlan(VD).empty()) {
+        SourceLocation TypeEnd = VD->getLocation();
+        if (TypeSourceInfo *TSI = VD->getTypeSourceInfo())
+          TypeEnd = TSI->getTypeLoc().getEndLoc();
+        visitVLATypeEvaluation(VD, TypeEnd);
+      }
+      if (VD->hasInit() && !VD->hasConstantInitialization())
+        Visit(VD->getInit());
+      if (!SuppressDeclarationContinuation) {
+        if (std::optional<Counter> ContinuationCounter =
+                getCallContinuationCounter(VD,
+                                           CallContinuationKind::Declaration))
+          startCallContinuationRegion(getEnd(VD), *ContinuationCounter);
+      }
+    }
+  }
+
+  Counter propagateConditionDeclaration(Counter TopCount, const DeclStmt *S) {
+    bool OldSuppress = SuppressDeclarationContinuation;
+    SuppressDeclarationContinuation = true;
+    Counter ExitCount = propagateCounts(TopCount, S);
+    SuppressDeclarationContinuation = OldSuppress;
+    return ExitCount;
+  }
+
+  Counter completeConditionDeclaration(const DeclStmt *S,
+                                       Counter FallbackCount) {
+    assert(S->isSingleDecl() && "condition declaration must be singular");
+    const auto *VD = dyn_cast<VarDecl>(S->getSingleDecl());
+    assert(VD && "condition declaration must contain a variable");
+    if (!VD)
+      return FallbackCount;
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(VD, CallContinuationKind::Declaration)) {
+      startCallContinuationRegion(getEnd(VD), *ContinuationCounter);
+      return *ContinuationCounter;
+    }
+    return FallbackCount;
+  }
+
+  void VisitConstantExpr(const ConstantExpr *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    // ConstantExpr is evaluated by the frontend and has no run-time normal
+    // completion edge. Do not descend and invent continuations for calls that
+    // CodeGen can fold away (including discarded ?: / && / || operands).
+  }
+
+  void VisitCXXRewrittenBinaryOperator(const CXXRewrittenBinaryOperator *E) {
+    if (!CallContinuationCounters) {
+      VisitStmt(E);
+      return;
+    }
+    visitCallContinuationRewrittenOperatorChildren(
+        E, ReverseDefaultCallArgs, [&](const Stmt *Child) { Visit(Child); });
+    adjustForOutOfOrderTraversal(getEnd(E));
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::RewrittenOperator))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitObjCMessageExpr(const ObjCMessageExpr *E) {
+    if (!CallContinuationCounters) {
+      VisitStmt(E);
+      return;
+    }
+    visitCallContinuationObjCMessageChildren(
+        E, ReverseDefaultCallArgs, [&](const Stmt *Child) { Visit(Child); });
+    adjustForOutOfOrderTraversal(getEnd(E));
+    const ObjCMethodDecl *Method = E->getMethodDecl();
+    if (Method && Method->hasAttr<NoReturnAttr>()) {
+      terminateRegion(E);
+      return;
+    }
+    if (InPseudoObjectSemantics && E->isImplicit())
+      return;
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(E, CallContinuationKind::ObjCMessage))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitExprWithCleanups(const ExprWithCleanups *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    Visit(E->getSubExpr());
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(E, CallContinuationKind::FullExpression))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitCXXNewExpr(const CXXNewExpr *E) {
+    if (!CallContinuationCounters) {
+      VisitStmt(E);
+      return;
+    }
+    if (std::optional<const Expr *> ArraySize = E->getArraySize())
+      Visit(*ArraySize);
+
+    SmallVector<const Expr *, 4> PlacementArgs(E->placement_arguments());
+    if (ReverseDefaultCallArgs)
+      for (const Expr *Arg : llvm::reverse(PlacementArgs))
+        Visit(Arg);
+    else
+      for (const Expr *Arg : PlacementArgs)
+        Visit(Arg);
+
+    if (const Expr *Init = E->getInitializer()) {
+      if (std::optional<Counter> InitializerCounter =
+              getCallContinuationCounter(E,
+                                         CallContinuationKind::NewInitializer))
+        pushRegion(*InitializerCounter);
+      Visit(Init);
+    }
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(E, CallContinuationKind::NewExpression))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitCXXDeleteExpr(const CXXDeleteExpr *E) {
+    VisitStmt(E);
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::DeleteExpression))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitExplicitCastExpr(const ExplicitCastExpr *E) {
+    if (getVLATypeEvaluationPlan(E).empty()) {
+      VisitStmt(E);
+      return;
+    }
+    visitVLATypeEvaluation(E,
+                           E->getTypeInfoAsWritten()->getTypeLoc().getEndLoc());
+    Visit(E->getSubExpr());
+  }
+
+  void VisitCXXDynamicCastExpr(const CXXDynamicCastExpr *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    if (!getVLATypeEvaluationPlan(E).empty())
+      visitVLATypeEvaluation(
+          E, E->getTypeInfoAsWritten()->getTypeLoc().getEndLoc());
+    Visit(E->getSubExpr());
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(E, CallContinuationKind::DynamicCast))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitCompoundLiteralExpr(const CompoundLiteralExpr *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    if (!getVLATypeEvaluationPlan(E).empty())
+      visitVLATypeEvaluation(E,
+                             E->getTypeSourceInfo()->getTypeLoc().getEndLoc());
+    Visit(E->getInitializer());
+  }
+
+  void VisitVAArgExpr(const VAArgExpr *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    Visit(E->getSubExpr());
+    if (!getVLATypeEvaluationPlan(E).empty())
+      visitVLATypeEvaluation(E,
+                             E->getWrittenTypeInfo()->getTypeLoc().getEndLoc());
+  }
+
+  void VisitCXXTypeidExpr(const CXXTypeidExpr *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    if (!E->isTypeOperand() && E->isPotentiallyEvaluated())
+      Visit(E->getExprOperand());
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::TypeidExpression))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitCompoundStmt(const CompoundStmt *S) {
+    VisitStmt(S);
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            S, CallContinuationKind::CompoundFallthrough))
+      startCallContinuationRegion(S, *ContinuationCounter);
   }
 
   void VisitCXXThrowExpr(const CXXThrowExpr *E) {
@@ -1765,7 +2099,13 @@ struct CounterCoverageMappingBuilder
   }
 
   void VisitCallExpr(const CallExpr *E) {
-    VisitStmt(E);
+    if (CallContinuationCounters) {
+      visitCallContinuationCallChildren(
+          E, ReverseDefaultCallArgs, [&](const Stmt *Child) { Visit(Child); });
+      adjustForOutOfOrderTraversal(getEnd(E));
+    } else {
+      VisitStmt(E);
+    }
 
     // Terminate the region when we hit a noreturn function.
     // (This is helpful dealing with switch statements.)
@@ -1777,10 +2117,117 @@ struct CounterCoverageMappingBuilder
       startCallContinuationRegion(E, *ContinuationCounter);
   }
 
-  void VisitCXXConstructExpr(const CXXConstructExpr *E) {
+  void VisitCastExpr(const CastExpr *E) {
+    VisitStmt(E);
+    if (E->getCastKind() != CK_AtomicToNonAtomic)
+      return;
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::AtomicOperation))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitUnaryOperator(const UnaryOperator *E) {
+    VisitStmt(E);
+    if (E->isIncrementDecrementOp() &&
+        E->getSubExpr()->getType()->isAtomicType())
+      if (std::optional<Counter> ContinuationCounter =
+              getCallContinuationCounter(E,
+                                         CallContinuationKind::AtomicOperation))
+        startCallContinuationRegion(E, *ContinuationCounter);
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::OverflowOperation))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitAtomicExpr(const AtomicExpr *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    visitCallContinuationAtomicExprChildren(
+        E, [&](const Stmt *Child) { Visit(Child); });
+    adjustForOutOfOrderTraversal(getEnd(E));
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::AtomicOperation))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitDeclRefExpr(const DeclRefExpr *E) {
     VisitStmt(E);
     if (std::optional<Counter> ContinuationCounter =
-            getCallContinuationCounter(E))
+            getCallContinuationCounter(E, CallContinuationKind::TLSAccess))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitMemberExpr(const MemberExpr *E) {
+    VisitStmt(E);
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(E, CallContinuationKind::TLSAccess))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitBinaryOperator(const BinaryOperator *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    if (!E->isAssignmentOp()) {
+      VisitStmt(E);
+      if (std::optional<Counter> ContinuationCounter =
+              getCallContinuationCounter(
+                  E, CallContinuationKind::ComplexOperation))
+        startCallContinuationRegion(E, *ContinuationCounter);
+      if (std::optional<Counter> ContinuationCounter =
+              getCallContinuationCounter(
+                  E, CallContinuationKind::OverflowOperation))
+        startCallContinuationRegion(E, *ContinuationCounter);
+      return;
+    }
+    if (callContinuationAssignmentEvaluatesRHSFirst(
+            E, CVM.getCodeGenModule().getContext())) {
+      Visit(E->getRHS());
+      Visit(E->getLHS());
+    } else {
+      Visit(E->getLHS());
+      Visit(E->getRHS());
+    }
+    adjustForOutOfOrderTraversal(getEnd(E));
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(E, CallContinuationKind::Assignment))
+      startCallContinuationRegion(E, *ContinuationCounter);
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::OverflowOperation))
+      startCallContinuationRegion(E, *ContinuationCounter);
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::ComplexOperation))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitCompoundAssignOperator(const CompoundAssignOperator *E) {
+    if (!CallContinuationCounters)
+      return VisitStmt(E);
+    Visit(E->getRHS());
+    Visit(E->getLHS());
+    adjustForOutOfOrderTraversal(getEnd(E));
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(E, CallContinuationKind::Assignment))
+      startCallContinuationRegion(E, *ContinuationCounter);
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::ComplexOperation))
+      startCallContinuationRegion(E, *ContinuationCounter);
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            E, CallContinuationKind::OverflowOperation))
+      startCallContinuationRegion(E, *ContinuationCounter);
+  }
+
+  void VisitCXXConstructExpr(const CXXConstructExpr *E) {
+    if (CallContinuationCounters) {
+      visitCallContinuationConstructChildren(
+          E, ReverseDefaultCallArgs, [&](const Stmt *Child) { Visit(Child); });
+      adjustForOutOfOrderTraversal(getEnd(E));
+    } else {
+      VisitStmt(E);
+    }
+    if (E->getConstructor()->isNoReturn())
+      terminateRegion(E);
+    else if (std::optional<Counter> ContinuationCounter =
+                 getCallContinuationCounter(E, CallContinuationKind::Construct))
       startCallContinuationRegion(E, *ContinuationCounter);
   }
 
@@ -1806,11 +2253,21 @@ struct CounterCoverageMappingBuilder
         llvm::EnableSingleByteCoverage
             ? getRegionCounter(S->getCond())
             : addCounters(ParentCount, BackedgeCount, BC.ContinueCount);
+    if (std::optional<Counter> BackedgeCounter =
+            getCallContinuationCounter(S, CallContinuationKind::LoopBackedge))
+      CondCount = *BackedgeCounter;
+
+    if (CallContinuationCounters)
+      if (const DeclStmt *CondDecl = S->getConditionVariableDeclStmt())
+        CondCount = propagateConditionDeclaration(CondCount, CondDecl);
 
     Counter CondExitCount = propagateCounts(CondCount, S->getCond());
+    if (CallContinuationCounters)
+      if (const DeclStmt *CondDecl = S->getConditionVariableDeclStmt())
+        CondExitCount = completeConditionDeclaration(CondDecl, CondExitCount);
     adjustForOutOfOrderTraversal(getEnd(S));
     Counter BranchParentCount =
-        CallContinuationCounterMap ? CondExitCount : CondCount;
+        CallContinuationCounters ? CondExitCount : CondCount;
     auto BranchCount =
         llvm::EnableSingleByteCoverage
             ? getBranchCounterPair(S, BranchParentCount, getRegionCounter(S))
@@ -1827,10 +2284,14 @@ struct CounterCoverageMappingBuilder
         !llvm::EnableSingleByteCoverage ||
         (BC.BreakCount.isZero() && BranchCount.Skipped == getRegionCounter(S)));
     Counter OutCount = addCounters(BC.BreakCount, BranchCount.Skipped);
+    std::optional<Counter> ExitCounter =
+        getCallContinuationCounter(S, CallContinuationKind::LoopExit);
+    if (ExitCounter)
+      OutCount = *ExitCounter;
     if (!IsCounterEqual(OutCount, ParentCount)) {
       pushRegion(OutCount);
       GapRegionCounter = OutCount;
-      if (BodyHasGapRegion)
+      if (BodyHasGapRegion || ExitCounter)
         HasGapRegion = true;
     }
 
@@ -1865,10 +2326,13 @@ struct CounterCoverageMappingBuilder
     Counter CondCount = llvm::EnableSingleByteCoverage
                             ? getRegionCounter(S->getCond())
                             : addCounters(BackedgeCount, BC.ContinueCount);
+    if (std::optional<Counter> BackedgeCounter =
+            getCallContinuationCounter(S, CallContinuationKind::LoopBackedge))
+      CondCount = *BackedgeCounter;
 
     Counter CondExitCount = propagateCounts(CondCount, S->getCond());
     Counter BranchParentCount =
-        CallContinuationCounterMap ? CondExitCount : CondCount;
+        CallContinuationCounters ? CondExitCount : CondCount;
     auto BranchCount =
         llvm::EnableSingleByteCoverage
             ? getBranchCounterPair(S, BranchParentCount, getRegionCounter(S))
@@ -1880,10 +2344,14 @@ struct CounterCoverageMappingBuilder
         !llvm::EnableSingleByteCoverage ||
         (BC.BreakCount.isZero() && BranchCount.Skipped == getRegionCounter(S)));
     Counter OutCount = addCounters(BC.BreakCount, BranchCount.Skipped);
+    std::optional<Counter> ExitCounter =
+        getCallContinuationCounter(S, CallContinuationKind::LoopExit);
+    if (ExitCounter)
+      OutCount = *ExitCounter;
     if (!IsCounterEqual(OutCount, ParentCount)) {
       pushRegion(OutCount);
       GapRegionCounter = OutCount;
-      if (BodyHasGapRegion)
+      if (BodyHasGapRegion || ExitCounter)
         HasGapRegion = true;
     }
 
@@ -1919,6 +2387,9 @@ struct CounterCoverageMappingBuilder
     // the count for all the continue statements.
     BreakContinue IncrementBC;
     Counter IncrementCount = addCounters(BackedgeCount, BodyBC.ContinueCount);
+    if (std::optional<Counter> ContinueCounter =
+            getCallContinuationCounter(S, CallContinuationKind::LoopContinue))
+      IncrementCount = *ContinueCounter;
     Counter IncrementExitCount = IncrementCount;
     if (const Stmt *Inc = S->getInc()) {
       if (llvm::EnableSingleByteCoverage)
@@ -1936,14 +2407,24 @@ struct CounterCoverageMappingBuilder
             ? getRegionCounter(S->getCond())
             : addCounters(addCounters(ParentCount, IncrementExitCount),
                           IncrementBC.ContinueCount);
+    if (std::optional<Counter> BackedgeCounter =
+            getCallContinuationCounter(S, CallContinuationKind::LoopBackedge))
+      CondCount = *BackedgeCounter;
+
+    if (CallContinuationCounters)
+      if (const DeclStmt *CondDecl = S->getConditionVariableDeclStmt())
+        CondCount = propagateConditionDeclaration(CondCount, CondDecl);
 
     Counter CondExitCount = CondCount;
     if (const Expr *Cond = S->getCond()) {
       CondExitCount = propagateCounts(CondCount, Cond);
       adjustForOutOfOrderTraversal(getEnd(S));
     }
+    if (CallContinuationCounters)
+      if (const DeclStmt *CondDecl = S->getConditionVariableDeclStmt())
+        CondExitCount = completeConditionDeclaration(CondDecl, CondExitCount);
     Counter BranchParentCount =
-        CallContinuationCounterMap ? CondExitCount : CondCount;
+        CallContinuationCounters ? CondExitCount : CondCount;
     auto BranchCount =
         llvm::EnableSingleByteCoverage
             ? getBranchCounterPair(S, BranchParentCount, getRegionCounter(S))
@@ -1960,10 +2441,14 @@ struct CounterCoverageMappingBuilder
            (BodyBC.BreakCount.isZero() && IncrementBC.BreakCount.isZero()));
     Counter OutCount = addCounters(BodyBC.BreakCount, IncrementBC.BreakCount,
                                    BranchCount.Skipped);
+    std::optional<Counter> ExitCounter =
+        getCallContinuationCounter(S, CallContinuationKind::LoopExit);
+    if (ExitCounter)
+      OutCount = *ExitCounter;
     if (!IsCounterEqual(OutCount, ParentCount)) {
       pushRegion(OutCount);
       GapRegionCounter = OutCount;
-      if (BodyHasGapRegion)
+      if (BodyHasGapRegion || ExitCounter)
         HasGapRegion = true;
     }
 
@@ -1983,23 +2468,33 @@ struct CounterCoverageMappingBuilder
     Counter BodyCount = llvm::EnableSingleByteCoverage
                             ? getRegionCounter(S->getBody())
                             : getRegionCounter(S);
+    Counter BodySourceCount =
+        getCallContinuationCounter(S, CallContinuationKind::LoopBody)
+            .value_or(BodyCount);
 
     BreakContinueStack.push_back(BreakContinue());
     extendRegion(S->getBody());
-    Counter BackedgeCount = propagateCounts(BodyCount, S->getBody());
+    Counter BackedgeCount = propagateCounts(BodySourceCount, S->getBody());
     BreakContinue BC = BreakContinueStack.pop_back_val();
 
     bool BodyHasGapRegion = HasGapRegion;
     HasGapRegion = false;
 
-    // The body count applies to the area immediately after the range.
+    // The body source is reached only after the implicit dereference and loop
+    // variable initialization complete.
     auto Gap = findGapAreaBetween(S->getRParenLoc(), getStart(S->getBody()));
     if (Gap)
-      fillGapAreaWithCount(Gap->getBegin(), Gap->getEnd(), BodyCount);
+      fillGapAreaWithCount(Gap->getBegin(), Gap->getEnd(), BodySourceCount);
 
     Counter LoopCount =
         addCounters(ParentCount, BackedgeCount, BC.ContinueCount);
-    auto BranchCount = getBranchCounterPair(S, LoopCount, getRegionCounter(S));
+    if (std::optional<Counter> BackedgeCounter =
+            getCallContinuationCounter(S, CallContinuationKind::LoopBackedge))
+      LoopCount = *BackedgeCounter;
+    auto BranchCount =
+        llvm::EnableSingleByteCoverage
+            ? getBranchCounterPair(S, LoopCount, getRegionCounter(S))
+            : getBranchCounterPair(S, LoopCount);
     assert(BranchCount.Executed.isZero() || BranchCount.Executed == BodyCount ||
            llvm::EnableSingleByteCoverage);
     assert(
@@ -2007,10 +2502,14 @@ struct CounterCoverageMappingBuilder
         (BC.BreakCount.isZero() && BranchCount.Skipped == getRegionCounter(S)));
 
     Counter OutCount = addCounters(BC.BreakCount, BranchCount.Skipped);
+    std::optional<Counter> ExitCounter =
+        getCallContinuationCounter(S, CallContinuationKind::LoopExit);
+    if (ExitCounter)
+      OutCount = *ExitCounter;
     if (!IsCounterEqual(OutCount, ParentCount)) {
       pushRegion(OutCount);
       GapRegionCounter = OutCount;
-      if (BodyHasGapRegion)
+      if (BodyHasGapRegion || ExitCounter)
         HasGapRegion = true;
     }
 
@@ -2051,7 +2550,18 @@ struct CounterCoverageMappingBuilder
     extendRegion(S);
     if (S->getInit())
       Visit(S->getInit());
+    if (CallContinuationCounters) {
+      if (const DeclStmt *CondDecl = S->getConditionVariableDeclStmt()) {
+        bool OldSuppress = SuppressDeclarationContinuation;
+        SuppressDeclarationContinuation = true;
+        Visit(CondDecl);
+        SuppressDeclarationContinuation = OldSuppress;
+      }
+    }
     Visit(S->getCond());
+    if (CallContinuationCounters)
+      if (const DeclStmt *CondDecl = S->getConditionVariableDeclStmt())
+        completeConditionDeclaration(CondDecl, getRegion().getCounter());
 
     BreakContinueStack.push_back(BreakContinue());
 
@@ -2195,6 +2705,7 @@ struct CounterCoverageMappingBuilder
     // I'm using 'propagateCounts' later as new region is better and allows me
     // to properly calculate line coverage in llvm-cov utility
     const Counter ParentCount = getRegion().getCounter();
+    Counter SelectedCount = ParentCount;
 
     // ignore 'if constexpr ('
     SourceLocation startOfSkipped = S->getIfLoc();
@@ -2207,18 +2718,21 @@ struct CounterCoverageMappingBuilder
       // location won't crash it
       if (start.isValid() && end.isValid()) {
         markSkipped(startOfSkipped, start);
-        propagateCounts(ParentCount, Init);
         startOfSkipped = getEnd(Init);
       }
+      Counter InitExitCount = propagateCounts(ParentCount, Init);
+      if (CallContinuationCounters)
+        SelectedCount = InitExitCount;
     }
 
     const auto *Then = S->getThen();
     const auto *Else = S->getElse();
+    Counter OutCount = SelectedCount;
 
     if (isTrue) {
       // ignore '<condition>)'
       markSkipped(startOfSkipped, getStart(Then));
-      propagateCounts(ParentCount, Then);
+      OutCount = propagateCounts(SelectedCount, Then);
 
       if (Else)
         // ignore 'else <else>'
@@ -2228,32 +2742,59 @@ struct CounterCoverageMappingBuilder
       markSkipped(startOfSkipped, Else ? getStart(Else) : getEnd(Then));
 
       if (Else)
-        propagateCounts(ParentCount, Else);
+        OutCount = propagateCounts(SelectedCount, Else);
+    }
+
+    if (CallContinuationCounters && !IsCounterEqual(OutCount, ParentCount)) {
+      pushRegion(OutCount);
+      GapRegionCounter = OutCount;
     }
   }
 
   void VisitIfStmt(const IfStmt *S) {
     // "if constexpr" and "if consteval" are not normal conditional statements,
     // their discarded statement should be skipped
-    if (S->isConsteval())
-      return coverIfConsteval(S);
-    else if (S->isConstexpr())
-      return coverIfConstexpr(S);
+    if (S->isConsteval()) {
+      coverIfConsteval(S);
+      if (std::optional<Counter> ExitCounter =
+              getCallContinuationCounter(S, CallContinuationKind::IfExit))
+        startCallContinuationRegion(S, *ExitCounter);
+      return;
+    }
+    if (S->isConstexpr()) {
+      coverIfConstexpr(S);
+      if (std::optional<Counter> ExitCounter =
+              getCallContinuationCounter(S, CallContinuationKind::IfExit))
+        startCallContinuationRegion(S, *ExitCounter);
+      return;
+    }
 
     extendRegion(S);
     if (S->getInit())
       Visit(S->getInit());
 
+    Counter ParentCount = getRegion().getCounter();
+    Counter ConditionCount = ParentCount;
+    if (CallContinuationCounters)
+      if (const DeclStmt *CondDecl = S->getConditionVariableDeclStmt())
+        ConditionCount = propagateConditionDeclaration(ParentCount, CondDecl);
+
     // Extend into the condition before we propagate through it below - this is
     // needed to handle macros that generate the "if" but not the condition.
     extendRegion(S->getCond());
 
-    Counter ParentCount = getRegion().getCounter();
     // Emitting a counter for the condition makes it easier to interpret the
     // counter for the body when looking at the coverage.
-    Counter CondExitCount = propagateCounts(ParentCount, S->getCond());
+    Counter CondExitCount = propagateCounts(ConditionCount, S->getCond());
     Counter BranchParentCount =
-        CallContinuationCounterMap ? CondExitCount : ParentCount;
+        CallContinuationCounters ? CondExitCount : ParentCount;
+    if (CallContinuationCounters)
+      if (const DeclStmt *CondDecl = S->getConditionVariableDeclStmt())
+        if (const auto *VD = dyn_cast<VarDecl>(CondDecl->getSingleDecl()))
+          if (std::optional<Counter> ContinuationCounter =
+                  getCallContinuationCounter(VD,
+                                             CallContinuationKind::Declaration))
+            BranchParentCount = *ContinuationCounter;
     auto [ThenCount, ElseCount] =
         (llvm::EnableSingleByteCoverage
              ? BranchCounterPair{getRegionCounter(S->getThen()),
@@ -2292,7 +2833,7 @@ struct CounterCoverageMappingBuilder
     if (llvm::EnableSingleByteCoverage)
       OutCount = getRegionCounter(S);
 
-    if (!IsCounterEqual(OutCount, BranchParentCount)) {
+    if (!IsCounterEqual(OutCount, ParentCount)) {
       pushRegion(OutCount);
       GapRegionCounter = OutCount;
     }
@@ -2300,6 +2841,9 @@ struct CounterCoverageMappingBuilder
     if (!llvm::EnableSingleByteCoverage)
       // Create Branch Region around condition.
       createBranchRegion(S->getCond(), ThenCount, ElseCount);
+    if (std::optional<Counter> ExitCounter =
+            getCallContinuationCounter(S, CallContinuationKind::IfExit))
+      startCallContinuationRegion(S, *ExitCounter);
   }
 
   void VisitCXXTryStmt(const CXXTryStmt *S) {
@@ -2329,7 +2873,7 @@ struct CounterCoverageMappingBuilder
     if (const auto *BCO = dyn_cast<BinaryConditionalOperator>(E)) {
       Counter CondExitCount = propagateCounts(ParentCount, BCO->getCommon());
       Counter BranchParentCount =
-          CallContinuationCounterMap ? CondExitCount : ParentCount;
+          CallContinuationCounters ? CondExitCount : ParentCount;
       auto [TrueCount, FalseCount] =
           (llvm::EnableSingleByteCoverage
                ? BranchCounterPair{getRegionCounter(E->getTrueExpr()),
@@ -2354,7 +2898,7 @@ struct CounterCoverageMappingBuilder
 
     Counter CondExitCount = propagateCounts(ParentCount, E->getCond());
     Counter BranchParentCount =
-        CallContinuationCounterMap ? CondExitCount : ParentCount;
+        CallContinuationCounters ? CondExitCount : ParentCount;
     auto [TrueCount, FalseCount] =
         (llvm::EnableSingleByteCoverage
              ? BranchCounterPair{getRegionCounter(E->getTrueExpr()),
@@ -2496,18 +3040,18 @@ struct CounterCoverageMappingBuilder
 
     // Extract the RHS's Execution Counter.
     Counter LHSBranchParentCnt =
-        CallContinuationCounterMap ? LHSExitCnt : getRegion().getCounter();
+        CallContinuationCounters ? LHSExitCnt : getRegion().getCounter();
     auto [RHSExecCnt, LHSFalseCnt] =
         getBranchCounterPair(E, LHSBranchParentCnt);
     Counter RHSExitCnt = propagateCounts(RHSExecCnt, E->getRHS());
 
     // Extract the RHS's "True" Instance Counter.
     Counter RHSBranchParentCnt =
-        CallContinuationCounterMap ? RHSExitCnt : RHSExecCnt;
+        CallContinuationCounters ? RHSExitCnt : RHSExecCnt;
     auto [RHSTrueCnt, RHSFalseCnt] =
         getBranchCounterPair(E->getRHS(), RHSBranchParentCnt);
 
-    if (CallContinuationCounterMap) {
+    if (CallContinuationCounters) {
       Counter OutCount = addCounters(LHSFalseCnt, RHSExitCnt);
       if (!IsCounterEqual(OutCount, ParentCnt)) {
         getRegion().setCounter(OutCount);
@@ -2575,13 +3119,13 @@ struct CounterCoverageMappingBuilder
 
     // Extract the RHS's Execution Counter.
     Counter LHSBranchParentCnt =
-        CallContinuationCounterMap ? LHSExitCnt : getRegion().getCounter();
+        CallContinuationCounters ? LHSExitCnt : getRegion().getCounter();
     auto [RHSExecCnt, LHSTrueCnt] = getBranchCounterPair(E, LHSBranchParentCnt);
     Counter RHSExitCnt = propagateCounts(RHSExecCnt, E->getRHS());
 
     // Extract the RHS's "False" Instance Counter.
     Counter RHSBranchParentCnt =
-        CallContinuationCounterMap ? RHSExitCnt : RHSExecCnt;
+        CallContinuationCounters ? RHSExitCnt : RHSExecCnt;
     auto [RHSFalseCnt, RHSTrueCnt] =
         getBranchCounterPair(E->getRHS(), RHSBranchParentCnt);
 
@@ -2589,7 +3133,7 @@ struct CounterCoverageMappingBuilder
       GapRegionCounter = LHSExitCnt;
     }
 
-    if (CallContinuationCounterMap) {
+    if (CallContinuationCounters) {
       Counter OutCount = addCounters(LHSTrueCnt, RHSExitCnt);
       if (!IsCounterEqual(OutCount, ParentCnt)) {
         getRegion().setCounter(OutCount);
@@ -2609,17 +3153,65 @@ struct CounterCoverageMappingBuilder
   }
 
   void VisitLambdaExpr(const LambdaExpr *LE) {
-    // Lambdas are treated as their own functions for now, so we shouldn't
-    // propagate counts into them.
+    // The lambda body is a separate function, but capture initializers execute
+    // in the enclosing function and can contain throwing or non-returning
+    // calls. Match EvaluatedExprVisitor and AggExprEmitter exactly.
+    if (!CallContinuationCounters)
+      return;
+    for (const Expr *Init : LE->capture_inits())
+      if (Init)
+        Visit(Init);
+  }
+
+  void VisitBlockExpr(const BlockExpr *BE) {
+    if (!CallContinuationCounters)
+      return VisitStmt(BE);
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(BE, CallContinuationKind::BlockLiteral))
+      startCallContinuationRegion(BE, *ContinuationCounter);
   }
 
   void VisitArrayInitLoopExpr(const ArrayInitLoopExpr *AILE) {
     Visit(AILE->getCommonExpr()->getSourceExpr());
+    if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
+            AILE, CallContinuationKind::ArrayInitialization))
+      startCallContinuationRegion(AILE, *ContinuationCounter);
+  }
+
+  void VisitUnaryExprOrTypeTraitExpr(const UnaryExprOrTypeTraitExpr *E) {
+    if (!CallContinuationCounters) {
+      VisitStmt(E);
+      return;
+    }
+    if (!callContinuationEvaluatesVLAExtent(
+            E, CVM.getCodeGenModule().getContext()))
+      return;
+    if (E->isArgumentType()) {
+      if (!getVLATypeEvaluationPlan(E).empty())
+        visitVLATypeEvaluation(E, getEnd(E));
+      return;
+    }
+    Visit(E->getArgumentExpr());
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(E, CallContinuationKind::VLAEvaluation))
+      startCallContinuationRegion(E, *ContinuationCounter);
   }
 
   void VisitPseudoObjectExpr(const PseudoObjectExpr *POE) {
-    // Just visit syntatic expression as this is what users actually write.
-    VisitStmt(POE->getSyntacticForm());
+    if (!CallContinuationCounters) {
+      // Preserve the legacy source-oriented traversal when the feature is off.
+      VisitStmt(POE->getSyntacticForm());
+      return;
+    }
+
+    llvm::SaveAndRestore<bool> SavePseudoObjectState(InPseudoObjectSemantics,
+                                                     true);
+    visitCallContinuationPseudoObjectSemantics(
+        POE, [&](const Expr *Semantic) { Visit(Semantic); });
+    adjustForOutOfOrderTraversal(getEnd(POE));
+    if (std::optional<Counter> ContinuationCounter =
+            getCallContinuationCounter(POE, CallContinuationKind::PseudoObject))
+      startCallContinuationRegion(POE, *ContinuationCounter);
   }
 
   void VisitOpaqueValueExpr(const OpaqueValueExpr* OVE) {
@@ -2879,9 +3471,9 @@ unsigned CoverageMappingModuleGen::getFileID(FileEntryRef File) {
 void CoverageMappingGen::emitCounterMapping(const Decl *D,
                                             llvm::raw_ostream &OS) {
   assert(CounterMap && MCDCState);
-  CounterCoverageMappingBuilder Walker(CVM, *CounterMap,
-                                       CallContinuationCounterMap, *MCDCState,
-                                       SM, LangOpts, NextCounter);
+  CounterCoverageMappingBuilder Walker(
+      CVM, *CounterMap, CallContinuationCounters, VLATypeEvaluations,
+      *MCDCState, SM, LangOpts, NextCounter, EmitVirtualBaseInitializers);
   Walker.VisitDecl(D);
   Walker.write(OS);
 }

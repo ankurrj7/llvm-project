@@ -1220,6 +1220,10 @@ void CodeGenFunction::ExitCXXTryStmt(const CXXTryStmt &S, bool IsFnTryBlock) {
   if (!CatchScope.hasEHBranches()) {
     CatchScope.clearHandlerBlocks();
     EHStack.popCatch();
+    // The ordinary CXXTryStmt counter is also the mapping's post-try count.
+    // Keep it live when no potentially-throwing operation required dispatch.
+    if (CGM.getCodeGenOpts().CoverageCallContinuations)
+      incrementProfileCounter(&S);
     return;
   }
 

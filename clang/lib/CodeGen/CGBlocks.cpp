@@ -1107,6 +1107,9 @@ llvm::Value *CodeGenFunction::EmitBlockLiteral(const CGBlockInfo &blockInfo) {
                                   useArrayEHCleanup);
   }
 
+  incrementCallContinuationProfileCounter(blockInfo.getBlockExpr(),
+                                          CallContinuationKind::BlockLiteral);
+
   // Cast to the converted block-pointer type, which happens (somewhat
   // unfortunately) to be a pointer to function type.
   llvm::Value *result = Builder.CreatePointerCast(

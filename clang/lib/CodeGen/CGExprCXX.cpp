@@ -19,6 +19,7 @@
 #include "TargetInfo.h"
 #include "clang/Basic/CodeGenOptions.h"
 #include "clang/CodeGen/CGFunctionInfo.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/IR/Intrinsics.h"
 
 using namespace clang;
@@ -674,7 +675,7 @@ CodeGenFunction::EmitCXXConstructExpr(const CXXConstructExpr *E,
      EmitCXXConstructorCall(CD, Type, ForVirtualBase, Delegating, Dest, E);
   }
 
-  incrementCallContinuationProfileCounter(E);
+  incrementCallContinuationProfileCounter(E, CallContinuationKind::Construct);
 }
 
 void CodeGenFunction::EmitSynthesizedCXXCopyCtor(Address Dest, Address Src,
@@ -1768,6 +1769,8 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
                 result, allocType, result.getAlignment(), SkippedChecks,
                 numElements);
 
+  incrementCallContinuationProfileCounter(E,
+                                          CallContinuationKind::NewInitializer);
   EmitNewInitializer(*this, E, allocType, elementTy, result, numElements,
                      allocSizeWithoutCookie);
   llvm::Value *resultPtr = result.emitRawPointer(*this);
@@ -1793,6 +1796,8 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
     resultPtr = PHI;
   }
 
+  incrementCallContinuationProfileCounter(E,
+                                          CallContinuationKind::NewExpression);
   return resultPtr;
 }
 
@@ -2085,6 +2090,11 @@ static void EmitArrayDelete(CodeGenFunction &CGF,
 }
 
 void CodeGenFunction::EmitCXXDeleteExpr(const CXXDeleteExpr *E) {
+  llvm::scope_exit EmitContinuation([&] {
+    incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::DeleteExpression);
+  });
+
   const Expr *Arg = E->getArgument();
   Address Ptr = EmitPointerWithAlignment(Arg);
 
@@ -2206,6 +2216,10 @@ static llvm::Value *EmitTypeidFromVTable(CodeGenFunction &CGF, const Expr *E,
 }
 
 llvm::Value *CodeGenFunction::EmitCXXTypeidExpr(const CXXTypeidExpr *E) {
+  llvm::scope_exit EmitContinuation([&] {
+    incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::TypeidExpression);
+  });
   // Ideally, we would like to use GlobalsInt8PtrTy here, however, we cannot,
   // primarily because the result of applying typeid is a value of type
   // type_info, which is declared & defined by the standard library
@@ -2257,6 +2271,10 @@ static llvm::Value *EmitDynamicCastToNull(CodeGenFunction &CGF,
 
 llvm::Value *CodeGenFunction::EmitDynamicCast(Address ThisAddr,
                                               const CXXDynamicCastExpr *DCE) {
+  llvm::scope_exit EmitContinuation([&] {
+    incrementCallContinuationProfileCounter(DCE,
+                                            CallContinuationKind::DynamicCast);
+  });
   CGM.EmitExplicitCastExprType(DCE, this);
   QualType DestTy = DCE->getTypeAsWritten();
 

@@ -24,6 +24,7 @@
 #include "clang/Basic/Diagnostic.h"
 #include "clang/CodeGen/CGFunctionInfo.h"
 #include "clang/CodeGen/CodeGenABITypes.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Analysis/ObjCARCUtil.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/IR/Constants.h"
@@ -522,7 +523,8 @@ CGObjCRuntime::GetRuntimeProtocolList(ObjCProtocolDecl::protocol_iterator begin,
 /// 'objc_alloc_init(MyClass)'. This provides a code size improvement on the
 /// caller side, as well as the optimized objc_alloc.
 static std::optional<llvm::Value *>
-tryEmitSpecializedAllocInit(CodeGenFunction &CGF, const ObjCMessageExpr *OME) {
+tryEmitSpecializedAllocInit(CodeGenFunction &CGF, const ObjCMessageExpr *OME,
+                            const ObjCMessageExpr **AllocMessage) {
   auto &Runtime = CGF.getLangOpts().ObjCRuntime;
   if (!Runtime.shouldUseRuntimeFunctionForCombinedAllocInit())
     return std::nullopt;
@@ -567,11 +569,17 @@ tryEmitSpecializedAllocInit(CodeGenFunction &CGF, const ObjCMessageExpr *OME) {
     return std::nullopt;
   }
 
+  if (AllocMessage)
+    *AllocMessage = SubOME;
   return CGF.EmitObjCAllocInit(Receiver, CGF.ConvertType(OME->getType()));
 }
 
 RValue CodeGenFunction::EmitObjCMessageExpr(const ObjCMessageExpr *E,
                                             ReturnValueSlot Return) {
+  llvm::scope_exit EmitContinuation([&] {
+    incrementCallContinuationProfileCounter(E,
+                                            CallContinuationKind::ObjCMessage);
+  });
   // Only the lookup mechanism and first two arguments of the method
   // implementation vary between runtimes.  We can get the receiver and
   // arguments in generic code.
@@ -591,8 +599,13 @@ RValue CodeGenFunction::EmitObjCMessageExpr(const ObjCMessageExpr *E,
     }
   }
 
-  if (std::optional<llvm::Value *> Val = tryEmitSpecializedAllocInit(*this, E))
+  const ObjCMessageExpr *CombinedAllocMessage = nullptr;
+  if (std::optional<llvm::Value *> Val =
+          tryEmitSpecializedAllocInit(*this, E, &CombinedAllocMessage)) {
+    incrementCallContinuationProfileCounter(CombinedAllocMessage,
+                                            CallContinuationKind::ObjCMessage);
     return AdjustObjCObjectType(*this, E->getType(), RValue::get(*Val));
+  }
 
   // We don't retain the receiver in delegate init calls, and this is
   // safe because the receiver value is always loaded from 'self',
@@ -3220,6 +3233,8 @@ ARCExprEmitter<Impl,Result>::visitPseudoObjectExpr(const PseudoObjectExpr *E) {
   for (CodeGenFunction::OpaqueValueMappingData &opaque : opaques)
     opaque.unbind(CGF);
 
+  CGF.incrementCallContinuationProfileCounter(
+      E, CallContinuationKind::PseudoObject);
   return result;
 }
 
@@ -3493,6 +3508,10 @@ static llvm::Value *emitARCRetainLoadOfScalar(CodeGenFunction &CGF,
 llvm::Value *CodeGenFunction::EmitARCRetainScalarExpr(const Expr *e) {
   // The retain needs to happen within the full-expression.
   if (const ExprWithCleanups *cleanups = dyn_cast<ExprWithCleanups>(e)) {
+    llvm::scope_exit EmitContinuation([&] {
+      incrementCallContinuationProfileCounter(
+          cleanups, CallContinuationKind::FullExpression);
+    });
     RunCleanupsScope scope(*this);
     return EmitARCRetainScalarExpr(cleanups->getSubExpr());
   }
@@ -3508,6 +3527,10 @@ llvm::Value *
 CodeGenFunction::EmitARCRetainAutoreleaseScalarExpr(const Expr *e) {
   // The retain needs to happen within the full-expression.
   if (const ExprWithCleanups *cleanups = dyn_cast<ExprWithCleanups>(e)) {
+    llvm::scope_exit EmitContinuation([&] {
+      incrementCallContinuationProfileCounter(
+          cleanups, CallContinuationKind::FullExpression);
+    });
     RunCleanupsScope scope(*this);
     return EmitARCRetainAutoreleaseScalarExpr(cleanups->getSubExpr());
   }
@@ -3618,6 +3641,10 @@ static llvm::Value *emitARCUnsafeUnretainedScalarExpr(CodeGenFunction &CGF,
 llvm::Value *CodeGenFunction::EmitARCUnsafeUnretainedScalarExpr(const Expr *e) {
   // Look through full-expressions.
   if (const ExprWithCleanups *cleanups = dyn_cast<ExprWithCleanups>(e)) {
+    llvm::scope_exit EmitContinuation([&] {
+      incrementCallContinuationProfileCounter(
+          cleanups, CallContinuationKind::FullExpression);
+    });
     RunCleanupsScope scope(*this);
     return emitARCUnsafeUnretainedScalarExpr(*this, cleanups->getSubExpr());
   }

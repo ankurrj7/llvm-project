@@ -16,6 +16,7 @@
 #include "CGBuilder.h"
 #include "CodeGenModule.h"
 #include "CodeGenTypes.h"
+#include "CoverageCallContinuations.h"
 #include "MCDCState.h"
 #include "llvm/ProfileData/InstrProfReader.h"
 #include <array>
@@ -36,8 +37,8 @@ private:
   unsigned NumRegionCounters;
   uint64_t FunctionHash;
   std::unique_ptr<llvm::DenseMap<const Stmt *, CounterPair>> RegionCounterMap;
-  std::unique_ptr<llvm::DenseMap<const Stmt *, unsigned>>
-      CallContinuationCounterMap;
+  std::unique_ptr<CallContinuationCounterMap> CallContinuationCounters;
+  std::unique_ptr<VLATypeEvaluationMap> VLATypeEvaluations;
   std::unique_ptr<llvm::DenseMap<const Stmt *, uint64_t>> StmtCountMap;
   std::unique_ptr<llvm::InstrProfRecord> ProfRecord;
   std::unique_ptr<MCDC::State> RegionMCDCState;
@@ -101,14 +102,14 @@ public:
 private:
   void setFuncName(llvm::Function *Fn);
   void setFuncName(StringRef Name, llvm::GlobalValue::LinkageTypes Linkage);
-  void mapRegionCounters(const Decl *D);
+  void mapRegionCounters(GlobalDecl GD, bool IsSwiftAsyncFunction);
   void computeRegionCounts(const Decl *D);
   void applyFunctionAttributes(llvm::IndexedInstrProfReader *PGOReader,
                                llvm::Function *Fn);
   void loadRegionCounts(llvm::IndexedInstrProfReader *PGOReader,
                         bool IsInMainFile);
   bool skipRegionMappingForDecl(const Decl *D);
-  void emitCounterRegionMapping(const Decl *D);
+  void emitCounterRegionMapping(GlobalDecl GD);
   bool canEmitMCDCCoverage(const CGBuilderTy &Builder);
 
 public:
@@ -116,7 +117,9 @@ public:
   void emitCounterSetOrIncrement(CGBuilderTy &Builder, const Stmt *S,
                                  bool UseFalsePath, bool UseBoth,
                                  llvm::Value *StepV);
-  void emitCallContinuationCounter(CGBuilderTy &Builder, const Stmt *S);
+  void emitCallContinuationCounter(CGBuilderTy &Builder,
+                                   CallContinuationOwner Owner,
+                                   CallContinuationKind Kind);
   void emitMCDCTestVectorBitmapUpdate(CGBuilderTy &Builder, const Expr *S,
                                       Address MCDCCondBitmapAddr,
                                       CodeGenFunction &CGF);

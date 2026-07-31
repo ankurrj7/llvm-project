@@ -17,6 +17,7 @@
 #include "CGLoopInfo.h"
 #include "CGValue.h"
 #include "CodeGenModule.h"
+#include "CoverageCallContinuations.h"
 #include "EHScopeStack.h"
 #include "SanitizerHandler.h"
 #include "VarBypassDetector.h"
@@ -66,6 +67,7 @@ class LabelDecl;
 class FunctionDecl;
 class FunctionProtoType;
 class LabelStmt;
+class ReturnStmt;
 class ObjCContainerDecl;
 class ObjCInterfaceDecl;
 class ObjCIvarDecl;
@@ -102,6 +104,11 @@ class RegionCodeGenTy;
 class TargetCodeGenInfo;
 struct OMPTaskDataTy;
 struct CGCoroData;
+
+/// Return the call which statement emission will mark as an implicit musttail
+/// call under the swiftasynccall rules, or null when the return is ordinary.
+const CallExpr *getImplicitSwiftAsyncMustTailCall(const ReturnStmt &S,
+                                                  bool IsSwiftAsyncCaller);
 
 // clang-format off
 /// The kind of evaluation to perform on values of a particular
@@ -1687,7 +1694,10 @@ public:
   void incrementProfileCounter(CounterForIncrement ExecSkip, const Stmt *S,
                                bool UseBoth = false,
                                llvm::Value *StepV = nullptr);
-  void incrementCallContinuationProfileCounter(const Stmt *S);
+  void incrementCallContinuationProfileCounter(
+      const Stmt *S, CallContinuationKind Kind = CallContinuationKind::Call);
+  void incrementCallContinuationProfileCounter(const Decl *D,
+                                               CallContinuationKind Kind);
 
   bool isMCDCCoverageEnabled() const {
     return (CGM.getCodeGenOpts().hasProfileClangInstr() &&

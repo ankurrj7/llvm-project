@@ -1382,8 +1382,11 @@ EmitComplexPrePostIncDec(const UnaryOperator *E, LValue LV,
 void CodeGenModule::EmitExplicitCastExprType(const ExplicitCastExpr *E,
                                              CodeGenFunction *CGF) {
   // Bind VLAs in the cast type.
-  if (CGF && E->getType()->isVariablyModifiedType())
+  if (CGF && E->getType()->isVariablyModifiedType()) {
     CGF->EmitVariablyModifiedType(E->getType());
+    CGF->incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::VLAEvaluation);
+  }
 
   if (CGDebugInfo *DI = getModuleDebugInfo())
     DI->EmitExplicitCastType(E->getType());
@@ -1740,9 +1743,14 @@ LValue CodeGenFunction::EmitLValueHelper(const Expr *E,
   case Expr::CXXOperatorCallExprClass:
   case Expr::UserDefinedLiteralClass:
     return EmitCallExprLValue(cast<CallExpr>(E));
-  case Expr::CXXRewrittenBinaryOperatorClass:
-    return EmitLValue(cast<CXXRewrittenBinaryOperator>(E)->getSemanticForm(),
-                      IsKnownNonNull);
+  case Expr::CXXRewrittenBinaryOperatorClass: {
+    const auto *RBO = cast<CXXRewrittenBinaryOperator>(E);
+    llvm::scope_exit EmitContinuation([&] {
+      incrementCallContinuationProfileCounter(
+          RBO, CallContinuationKind::RewrittenOperator);
+    });
+    return EmitLValue(RBO->getSemanticForm(), IsKnownNonNull);
+  }
   case Expr::VAArgExprClass:
     return EmitVAArgExprLValue(cast<VAArgExpr>(E));
   case Expr::DeclRefExprClass:
@@ -1780,6 +1788,10 @@ LValue CodeGenFunction::EmitLValueHelper(const Expr *E,
 
   case Expr::ExprWithCleanupsClass: {
     const auto *cleanups = cast<ExprWithCleanups>(E);
+    llvm::scope_exit EmitContinuation([&] {
+      incrementCallContinuationProfileCounter(
+          cleanups, CallContinuationKind::FullExpression);
+    });
     RunCleanupsScope Scope(*this);
     LValue LV = EmitLValue(cleanups->getSubExpr(), IsKnownNonNull);
     if (LV.isSimple()) {
@@ -1799,11 +1811,19 @@ LValue CodeGenFunction::EmitLValueHelper(const Expr *E,
 
   case Expr::CXXDefaultArgExprClass: {
     auto *DAE = cast<CXXDefaultArgExpr>(E);
+    llvm::scope_exit EmitContinuation([&] {
+      incrementCallContinuationProfileCounter(
+          DAE, CallContinuationKind::DefaultArgument);
+    });
     CXXDefaultArgExprScope Scope(*this, DAE);
     return EmitLValue(DAE->getExpr(), IsKnownNonNull);
   }
   case Expr::CXXDefaultInitExprClass: {
     auto *DIE = cast<CXXDefaultInitExpr>(E);
+    llvm::scope_exit EmitContinuation([&] {
+      incrementCallContinuationProfileCounter(
+          DIE, CallContinuationKind::DefaultInitializer);
+    });
     CXXDefaultInitExprScope Scope(*this, DIE);
     return EmitLValue(DIE->getExpr(), IsKnownNonNull);
   }
@@ -3264,12 +3284,19 @@ LValue CodeGenFunction::EmitLoadOfPointerLValue(Address PtrAddr,
 
 static LValue EmitGlobalVarDeclLValue(CodeGenFunction &CGF,
                                       const Expr *E, const VarDecl *VD) {
+  llvm::scope_exit EmitTLSContinuation([&] {
+    if (callContinuationTLSAccessNeedsCounter(E, CGF.CGM))
+      CGF.incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::TLSAccess);
+  });
   QualType T = E->getType();
 
   // If it's thread_local, emit a call to its wrapper function instead.
   if (VD->getTLSKind() == VarDecl::TLS_Dynamic &&
-      CGF.CGM.getCXXABI().usesThreadWrapperFunction(VD))
-    return CGF.CGM.getCXXABI().EmitThreadLocalVarDeclLValue(CGF, VD, T);
+      CGF.CGM.getCXXABI().usesThreadWrapperFunction(VD)) {
+    LValue LV = CGF.CGM.getCXXABI().EmitThreadLocalVarDeclLValue(CGF, VD, T);
+    return LV;
+  }
   // Check if the variable is marked as declare target with link clause in
   // device codegen.
   if (CGF.getLangOpts().OpenMPIsTargetDevice) {
@@ -5327,7 +5354,11 @@ bool CodeGenFunction::isUnderlyingBasePointerConstantNull(const Expr *E) {
 LValue CodeGenFunction::EmitMemberExpr(const MemberExpr *E) {
   if (DeclRefExpr *DRE = tryToConvertMemberExprToDeclRefExpr(*this, E)) {
     EmitIgnoredExpr(E->getBase());
-    return EmitDeclRefLValue(DRE);
+    LValue LV = EmitDeclRefLValue(DRE);
+    if (callContinuationTLSAccessNeedsCounter(E, CGM))
+      incrementCallContinuationProfileCounter(E,
+                                              CallContinuationKind::TLSAccess);
+    return LV;
   }
   if (getLangOpts().HLSL &&
       E->getType().getAddressSpace() == LangAS::hlsl_constant) {
@@ -5718,9 +5749,12 @@ LValue CodeGenFunction::EmitCompoundLiteralLValue(const CompoundLiteralExpr *E){
     ConstantAddress GlobalPtr = CGM.GetAddrOfConstantCompoundLiteral(E);
     return MakeAddrLValue(GlobalPtr, E->getType(), AlignmentSource::Decl);
   }
-  if (E->getType()->isVariablyModifiedType())
+  if (E->getType()->isVariablyModifiedType()) {
     // make sure to emit the VLA size.
     EmitVariablyModifiedType(E->getType());
+    incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::VLAEvaluation);
+  }
 
   Address DeclPtr = CreateMemTemp(E->getType(), ".compoundliteral");
   const Expr *InitExpr = E->getInitializer();
@@ -6432,6 +6466,10 @@ LValue CodeGenFunction::EmitBinaryOperatorLValue(const BinaryOperator *E) {
 
   switch (getEvaluationKind(E->getType())) {
   case TEK_Scalar: {
+    llvm::scope_exit EmitContinuation([&] {
+      incrementCallContinuationProfileCounter(E,
+                                              CallContinuationKind::Assignment);
+    });
     if (PointerAuthQualifier PtrAuth =
             E->getLHS()->getType().getPointerAuth()) {
       LValue LV = EmitCheckedLValue(E->getLHS(), TCK_Store);
@@ -7053,6 +7091,8 @@ static LValueOrRValue emitPseudoObjectExpr(CodeGenFunction &CGF,
   for (CodeGenFunction::OpaqueValueMappingData &opaque : opaques)
     opaque.unbind(CGF);
 
+  CGF.incrementCallContinuationProfileCounter(
+      E, CallContinuationKind::PseudoObject);
   return result;
 }
 

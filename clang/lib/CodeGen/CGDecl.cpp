@@ -34,6 +34,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/CodeGen/CGFunctionInfo.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/DataLayout.h"
@@ -191,8 +192,11 @@ void CodeGenFunction::EmitDecl(const Decl &D, bool EvaluateConditionDecl) {
     QualType Ty = cast<TypedefNameDecl>(D).getUnderlyingType();
     if (CGDebugInfo *DI = getDebugInfo())
       DI->EmitAndRetainType(Ty);
-    if (Ty->isVariablyModifiedType())
+    if (Ty->isVariablyModifiedType()) {
       EmitVariablyModifiedType(Ty);
+      incrementCallContinuationProfileCounter(
+          &D, CallContinuationKind::VLAEvaluation);
+    }
     return;
   }
   }
@@ -417,8 +421,11 @@ void CodeGenFunction::EmitStaticVarDecl(const VarDecl &D,
   // We can't have a VLA here, but we can have a pointer to a VLA,
   // even though that doesn't really make any sense.
   // Make sure to evaluate VLA bounds now so that we have them for later.
-  if (D.getType()->isVariablyModifiedType())
+  if (D.getType()->isVariablyModifiedType()) {
     EmitVariablyModifiedType(D.getType());
+    incrementCallContinuationProfileCounter(
+        &D, CallContinuationKind::VLAEvaluation);
+  }
 
   // Save the type in case adding the initializer forces a type change.
   llvm::Type *expectedType = addr->getType();
@@ -802,12 +809,21 @@ void CodeGenFunction::EmitScalarInit(const Expr *init, const ValueDecl *D,
     return;
   }
 
-  if (const CXXDefaultInitExpr *DIE = dyn_cast<CXXDefaultInitExpr>(init))
-    init = DIE->getExpr();
+  if (const auto *DIE = dyn_cast<CXXDefaultInitExpr>(init)) {
+    llvm::scope_exit EmitContinuation([&] {
+      incrementCallContinuationProfileCounter(
+          DIE, CallContinuationKind::DefaultInitializer);
+    });
+    return EmitScalarInit(DIE->getExpr(), D, lvalue, capturedByInit);
+  }
 
   // If we're emitting a value with lifetime, we have to do the
   // initialization *before* we leave the cleanup scopes.
   if (auto *EWC = dyn_cast<ExprWithCleanups>(init)) {
+    llvm::scope_exit EmitContinuation([&] {
+      incrementCallContinuationProfileCounter(
+          EWC, CallContinuationKind::FullExpression);
+    });
     CodeGenFunction::RunCleanupsScope Scope(*this);
     return EmitScalarInit(EWC->getSubExpr(), D, lvalue, capturedByInit);
   }
@@ -1493,8 +1509,11 @@ CodeGenFunction::EmitAutoVarAlloca(const VarDecl &D) {
   CharUnits alignment = getContext().getDeclAlign(&D);
 
   // If the type is variably-modified, emit all the VLA sizes for it.
-  if (Ty->isVariablyModifiedType())
+  if (Ty->isVariablyModifiedType()) {
     EmitVariablyModifiedType(Ty);
+    incrementCallContinuationProfileCounter(
+        &D, CallContinuationKind::VLAEvaluation);
+  }
 
   auto *DI = getDebugInfo();
   bool EmitDebugInfo = DI && CGM.getCodeGenOpts().hasReducedDebugInfo();
