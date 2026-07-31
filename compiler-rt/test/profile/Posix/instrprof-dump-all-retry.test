@@ -1,0 +1,60 @@
+// REQUIRES: linux
+// RUN: rm -rf %t && split-file %s %t && cd %t
+// RUN: %clang_profgen main.c -o app
+// RUN: env LLVM_PROFILE_FILE=%t/initial-%%p-%m.profraw \
+// RUN:   %run %t/app retry %t/retry-%%p-%m.profraw
+// RUN: llvm-profdata show --function=covered --counts %t/retry-*.profraw | \
+// RUN:   FileCheck %s --check-prefix=COVERED
+// RUN: env LLVM_PROFILE_FILE=%t/terminal-%%p-%m.profraw \
+// RUN:   %run %t/app terminal %t/recovered-%%p-%m.profraw
+// RUN: llvm-profdata show --function=covered --counts \
+// RUN:   %t/recovered-*.profraw | FileCheck %s --check-prefix=COVERED
+//
+// COVERED: covered:
+// COVERED: Function count: 1
+
+//--- main.c
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int __llvm_profile_dump_all(void);
+void __llvm_profile_set_filename(const char *);
+int __llvm_profile_set_file_object(FILE *, int);
+int __llvm_profile_write_file(void);
+
+__attribute__((noinline)) static void covered(void) {}
+
+int main(int argc, char **argv) {
+  if (argc != 3)
+    return 1;
+  covered();
+
+  if (!strcmp(argv[1], "retry")) {
+    __llvm_profile_set_filename("/dev/null/profile.profraw");
+    if (__llvm_profile_dump_all() == 0)
+      return 2;
+    __llvm_profile_set_filename(argv[2]);
+    if (__llvm_profile_dump_all() != 0)
+      return 3;
+    _exit(0);
+  }
+
+  if (strcmp(argv[1], "terminal"))
+    return 4;
+  static char FullBuffer[1024 * 1024];
+  FILE *Full = fopen("/dev/full", "wb");
+  if (!Full || setvbuf(Full, FullBuffer, _IOFBF, sizeof(FullBuffer)) ||
+      __llvm_profile_set_file_object(Full, 0))
+    return 5;
+  if (__llvm_profile_dump_all() == 0)
+    return 6;
+  if (__llvm_profile_set_file_object(NULL, 0))
+    return 7;
+  __llvm_profile_set_filename(argv[2]);
+  if (__llvm_profile_write_file() != 0)
+    return 8;
+  if (__llvm_profile_dump_all() == 0)
+    return 9;
+  _exit(0);
+}

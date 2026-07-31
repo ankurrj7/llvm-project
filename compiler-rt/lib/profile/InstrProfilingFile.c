@@ -500,7 +500,8 @@ static void createProfileDir(const char *Filename) {
  * dumper. With profile merging enabled, each executable as well as any of
  * its instrumented shared libraries dump profile data into their own data file.
  */
-static FILE *openFileForMerging(const char *ProfileFileName, int *MergeDone) {
+static FILE *openFileForMerging(const char *ProfileFileName, int *MergeDone,
+                                int *FailureBeforeWrite) {
   FILE *ProfileFile = getProfileFile();
   int rc;
   // initializeProfileForContinuousMode will lock the profile, but if
@@ -513,8 +514,11 @@ static FILE *openFileForMerging(const char *ProfileFileName, int *MergeDone) {
     createProfileDir(ProfileFileName);
     ProfileFile = lprofOpenFileEx(ProfileFileName);
   }
-  if (!ProfileFile)
+  if (!ProfileFile) {
+    if (FailureBeforeWrite)
+      *FailureBeforeWrite = 1;
     return NULL;
+  }
 
   rc = doProfileMerging(ProfileFile, MergeDone);
   if (rc || (!*MergeDone && COMPILER_RT_FTRUNCATE(ProfileFile, 0L)) ||
@@ -537,31 +541,38 @@ static FILE *getFileObject(const char *OutputName) {
   return fopen(OutputName, "ab");
 }
 
-static void closeFileObject(FILE *OutputFile) {
+static int closeFileObject(FILE *OutputFile) {
+  int Result;
   if (OutputFile == getProfileFile()) {
-    fflush(OutputFile);
+    Result = fflush(OutputFile);
     if (doMerging() && !__llvm_profile_is_continuous_mode_enabled()) {
       lprofUnlockFileHandle(OutputFile);
     }
   } else {
-    fclose(OutputFile);
+    Result = fclose(OutputFile);
   }
+  return Result;
 }
 
-/* Write profile data to file \c OutputName.  */
-static int writeFile(const char *OutputName) {
+/* Write profile data to file \c OutputName. Set \c FailureBeforeWrite only
+ * when the destination could not be acquired and no profile bytes could have
+ * been changed, making a later dump attempt safe. */
+static int writeFile(const char *OutputName, int *FailureBeforeWrite) {
   int RetVal;
   FILE *OutputFile;
 
   int MergeDone = 0;
   VPMergeHook = &lprofMergeValueProfData;
   if (doMerging())
-    OutputFile = openFileForMerging(OutputName, &MergeDone);
+    OutputFile = openFileForMerging(OutputName, &MergeDone, FailureBeforeWrite);
   else
     OutputFile = getFileObject(OutputName);
 
-  if (!OutputFile)
+  if (!OutputFile) {
+    if (FailureBeforeWrite && !doMerging())
+      *FailureBeforeWrite = 1;
     return -1;
+  }
 
   FreeHook = &free;
   setupIOBuffer();
@@ -569,7 +580,9 @@ static int writeFile(const char *OutputName) {
   initFileWriter(&fileWriter, OutputFile);
   RetVal = lprofWriteData(&fileWriter, lprofGetVPDataReader(), MergeDone);
 
-  closeFileObject(OutputFile);
+  int CloseResult = closeFileObject(OutputFile);
+  if (!RetVal && CloseResult)
+    RetVal = 1;
   return RetVal;
 }
 
@@ -618,7 +631,7 @@ static void truncateCurrentFile(void) {
  * the open file object \p File. */
 static int writeProfileWithFileObject(const char *Filename, FILE *File) {
   setProfileFile(File);
-  int rc = writeFile(Filename);
+  int rc = writeFile(Filename, NULL);
   if (rc)
     PROF_ERR("Failed to write file \"%s\": %s\n", Filename, strerror(errno));
   setProfileFile(NULL);
@@ -1150,12 +1163,26 @@ void __llvm_profile_set_filename(const char *FilenamePat) {
   parseAndSetFilename(FilenamePat, PNS_runtime_api, 1);
 }
 
+COMPILER_RT_VISIBILITY
+void lprofUpdateProfileNameForCurrentProcess(void) {
+  if (!lprofCurFilename.NumPids)
+    return;
+  char PidChars[MAX_PID_SIZE];
+  int Length = snprintf(PidChars, sizeof(PidChars), "%ld", (long)getpid());
+  if (Length <= 0 || Length >= (int)sizeof(PidChars))
+    return;
+  memcpy(lprofCurFilename.PidChars, PidChars, (size_t)Length + 1);
+  /* A cached prefix may contain the old PID. Recompute it on demand. Do not
+   * free the inherited allocation because fork may have interrupted allocator
+   * state in another thread. */
+  lprofCurFilename.ProfilePathPrefix = NULL;
+}
+
 /* The public API for writing profile data into the file with name
  * set by previous calls to __llvm_profile_set_filename or
  * __llvm_profile_override_default_filename or
  * __llvm_profile_initialize_file. */
-COMPILER_RT_VISIBILITY
-int __llvm_profile_write_file(void) {
+static int writeProfileFile(int *FailureBeforeWrite) {
   int rc, Length;
   const char *Filename;
   char *FilenameBuf;
@@ -1177,6 +1204,8 @@ int __llvm_profile_write_file(void) {
   /* Check the filename. */
   if (!Filename) {
     PROF_ERR("Failed to write file : %s\n", "Filename not set");
+    if (FailureBeforeWrite)
+      *FailureBeforeWrite = 1;
     if (PDeathSig == 1)
       lprofRestoreSigKill();
     return -1;
@@ -1194,7 +1223,7 @@ int __llvm_profile_write_file(void) {
   }
 
   /* Write profile data to the file. */
-  rc = writeFile(Filename);
+  rc = writeFile(Filename, FailureBeforeWrite);
   if (rc)
     PROF_ERR("Failed to write file \"%s\": %s\n", Filename, strerror(errno));
 
@@ -1206,14 +1235,30 @@ int __llvm_profile_write_file(void) {
 }
 
 COMPILER_RT_VISIBILITY
+int __llvm_profile_write_file(void) { return writeProfileFile(NULL); }
+
+COMPILER_RT_VISIBILITY
 int __llvm_profile_dump(void) {
   if (!doMerging())
     PROF_WARN("Later invocation of __llvm_profile_dump can lead to clobbering "
               " of previously dumped profile data : %s. Either use %%m "
               "in profile name or change profile name before dumping.\n",
               "online profile merging is not on");
-  int rc = __llvm_profile_write_file();
-  lprofSetProfileDumped(1);
+  int PreviousFailure = lprofProfileDumpFailed();
+  if (PreviousFailure) {
+    PROF_NOTE("Profile data not written to file: %s.\n",
+              "previous dump failed");
+    return PreviousFailure;
+  }
+  int FailureBeforeWrite = 0;
+  int rc = writeProfileFile(&FailureBeforeWrite);
+  if (!rc)
+    lprofSetProfileDumped(1);
+  /* A dense or merged write may have changed the file before failing. Preserve
+   * that result instead of risking an unsafe retry or reporting a later no-op
+   * as success. */
+  else if (!FailureBeforeWrite)
+    lprofSetProfileDumpFailed(rc);
   return rc;
 }
 
@@ -1379,7 +1424,8 @@ int __llvm_write_custom_profile(const char *Target,
       lprofWriteDataImpl(&fileWriter, DataBegin, DataEnd, CountersBegin,
                          CountersEnd, NULL, NULL, lprofGetVPDataReader(), NULL,
                          NULL, NULL, NULL, NamesBegin, NamesEnd, 0, Version);
-  closeFileObject(OutputFile);
+  if (!ReturnValue && closeFileObject(OutputFile))
+    ReturnValue = 1;
 
   // Restore SIGKILL.
   if (PDeathSig == 1)

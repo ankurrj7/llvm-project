@@ -44,6 +44,26 @@ typedef struct {
 } ProfileDumpAllContext;
 
 static volatile int ProfileDumpAllInProgress;
+static volatile int ProfileDumpAllProcess;
+
+static void updateDumpAllStateForProcess(void) {
+  int CurrentProcess = (int)getpid();
+  for (;;) {
+    int Process = __sync_val_compare_and_swap(&ProfileDumpAllProcess, 0, 0);
+    if (Process == CurrentProcess)
+      return;
+    if (Process == -CurrentProcess)
+      continue;
+    if (__sync_val_compare_and_swap(&ProfileDumpAllProcess, Process,
+                                    -CurrentProcess) != Process)
+      continue;
+
+    /* No parent thread survives in the child to release an inherited guard. */
+    __sync_lock_release(&ProfileDumpAllInProgress);
+    __sync_lock_test_and_set(&ProfileDumpAllProcess, CurrentProcess);
+    return;
+  }
+}
 
 static int getImageAddressRange(const struct dl_phdr_info *Info,
                                 uintptr_t *AddressBegin,
@@ -235,6 +255,7 @@ static void releaseSnapshot(ProfileDumpAllContext *Context) {
 
 COMPILER_RT_VISIBILITY int __llvm_profile_dump_all(void) {
 #if defined(__linux__)
+  updateDumpAllStateForProcess();
   if (__sync_lock_test_and_set(&ProfileDumpAllInProgress, 1))
     return -1;
 #endif
