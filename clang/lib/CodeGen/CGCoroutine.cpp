@@ -372,6 +372,11 @@ static LValueOrRValue emitSuspendExpression(CodeGenFunction &CGF, CGCoroData &Co
   else
     Res.RV = CGF.EmitAnyExpr(S.getResumeExpr(), aggSlot, ignoreResult);
 
+  if (const auto *Await = dyn_cast<CoawaitExpr>(&S);
+      !Await || !Await->isImplicit())
+    CGF.incrementCallContinuationProfileCounter(
+        &S, CallContinuationKind::CoroutineSuspend);
+
   return Res;
 }
 
@@ -1007,6 +1012,9 @@ void CodeGenFunction::EmitCoroutineBody(const CoroutineBodyStmt &S) {
         EmitBlock(BodyBB);
       }
 
+      incrementCallContinuationProfileCounter(
+          &S, CallContinuationKind::CoroutineBody);
+
       auto Loc = S.getBeginLoc();
       CXXCatchStmt Catch(Loc, /*exDecl=*/nullptr,
                          CurCoro.Data->ExceptionHandler);
@@ -1021,6 +1029,8 @@ void CodeGenFunction::EmitCoroutineBody(const CoroutineBodyStmt &S) {
         EmitBlock(ContBB);
     }
     else {
+      incrementCallContinuationProfileCounter(
+          &S, CallContinuationKind::CoroutineBody);
       emitBodyAndFallthrough(*this, S, S.getBody());
     }
 

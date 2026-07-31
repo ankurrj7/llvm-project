@@ -13,5 +13,5 @@ int foo(void) {
 }
 
 // NOCC: @__profd_foo = private global {{.*}} { i64 {{[-0-9]+}}, i64 24, {{.*}}, i32 1,
-// CC: @__profd_foo = private global {{.*}} { i64 {{[-0-9]+}}, i64 100513, {{.*}}, i32 2,
-// CC-EXTRA: @__profd_foo = private global {{.*}} { i64 {{[-0-9]+}}, i64 6432929, {{.*}}, i32 3,
+// CC: @__profd_foo = private global {{.*}} { i64 {{[-0-9]+}}, i64 569269683942722391, {{.*}}, i32 2,
+// CC-EXTRA: @__profd_foo = private global {{.*}} { i64 {{[-0-9]+}}, i64 742188651011768515, {{.*}}, i32 3,

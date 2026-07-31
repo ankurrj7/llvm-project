@@ -19,6 +19,7 @@
 #include "clang/Basic/DiagnosticFrontend.h"
 #include "clang/CodeGen/CGFunctionInfo.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Intrinsics.h"
 
@@ -899,6 +900,12 @@ static void EmitAtomicOp(CodeGenFunction &CGF, AtomicExpr *Expr, Address Dest,
 }
 
 RValue CodeGenFunction::EmitAtomicExpr(AtomicExpr *E) {
+  llvm::scope_exit EmitContinuation([&] {
+    if (E->getOp() != AtomicExpr::AO__c11_atomic_init &&
+        E->getOp() != AtomicExpr::AO__opencl_atomic_init)
+      incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::AtomicOperation);
+  });
   ApplyAtomGroup Grp(getDebugInfo());
 
   QualType AtomicTy = E->getPtr()->getType()->getPointeeType();

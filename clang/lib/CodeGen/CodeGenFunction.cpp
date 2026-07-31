@@ -2091,6 +2091,8 @@ void CodeGenFunction::EmitBranchOnBoolExpr(
   }
 
   MaybeEmitDeferredVarDeclInit(ConditionalDecl);
+  incrementCallContinuationProfileCounter(ConditionalDecl,
+                                          CallContinuationKind::Declaration);
 
   // If not at the top of the logical operator nest, update MCDC temp with the
   // boolean result of the evaluated condition.
@@ -2472,158 +2474,44 @@ void CodeGenFunction::EmitVariablyModifiedType(QualType type) {
          "Must pass variably modified type to EmitVLASizes!");
 
   EnsureInsertPoint();
-
-  // We're going to walk down into the type and look for VLA
-  // expressions.
-  do {
-    assert(type->isVariablyModifiedType());
-
-    const Type *ty = type.getTypePtr();
-    switch (ty->getTypeClass()) {
-
-#define TYPE(Class, Base)
-#define ABSTRACT_TYPE(Class, Base)
-#define NON_CANONICAL_TYPE(Class, Base)
-#define DEPENDENT_TYPE(Class, Base) case Type::Class:
-#define NON_CANONICAL_UNLESS_DEPENDENT_TYPE(Class, Base)
-#include "clang/AST/TypeNodes.inc"
-      llvm_unreachable("unexpected dependent type!");
-
-    // These types are never variably-modified.
-    case Type::Builtin:
-    case Type::Complex:
-    case Type::Vector:
-    case Type::ExtVector:
-    case Type::ConstantMatrix:
-    case Type::Record:
-    case Type::Enum:
-    case Type::Using:
-    case Type::TemplateSpecialization:
-    case Type::ObjCTypeParam:
-    case Type::ObjCObject:
-    case Type::ObjCInterface:
-    case Type::ObjCObjectPointer:
-    case Type::BitInt:
-    case Type::HLSLInlineSpirv:
-    case Type::PredefinedSugar:
-      llvm_unreachable("type class is never variably-modified!");
-
-    case Type::Adjusted:
-      type = cast<AdjustedType>(ty)->getAdjustedType();
-      break;
-
-    case Type::Decayed:
-      type = cast<DecayedType>(ty)->getPointeeType();
-      break;
-
-    case Type::Pointer:
-      type = cast<PointerType>(ty)->getPointeeType();
-      break;
-
-    case Type::BlockPointer:
-      type = cast<BlockPointerType>(ty)->getPointeeType();
-      break;
-
-    case Type::LValueReference:
-    case Type::RValueReference:
-      type = cast<ReferenceType>(ty)->getPointeeType();
-      break;
-
-    case Type::MemberPointer:
-      type = cast<MemberPointerType>(ty)->getPointeeType();
-      break;
-
-    case Type::ArrayParameter:
-    case Type::ConstantArray:
-    case Type::IncompleteArray:
-      // Losing element qualification here is fine.
-      type = cast<ArrayType>(ty)->getElementType();
-      break;
-
-    case Type::VariableArray: {
-      // Losing element qualification here is fine.
-      const VariableArrayType *vat = cast<VariableArrayType>(ty);
-
-      // Unknown size indication requires no size computation.
-      // Otherwise, evaluate and record it.
-      if (const Expr *sizeExpr = vat->getSizeExpr()) {
-        // It's possible that we might have emitted this already,
-        // e.g. with a typedef and a pointer to it.
-        llvm::Value *&entry = VLASizeMap[sizeExpr];
-        if (!entry) {
-          llvm::Value *size = EmitScalarExpr(sizeExpr);
-
-          // C11 6.7.6.2p5:
-          //   If the size is an expression that is not an integer constant
-          //   expression [...] each time it is evaluated it shall have a value
-          //   greater than zero.
-          if (SanOpts.has(SanitizerKind::VLABound)) {
-            auto CheckOrdinal = SanitizerKind::SO_VLABound;
-            auto CheckHandler = SanitizerHandler::VLABoundNotPositive;
-            SanitizerDebugLocation SanScope(this, {CheckOrdinal}, CheckHandler);
-            llvm::Value *Zero = llvm::Constant::getNullValue(size->getType());
-            clang::QualType SEType = sizeExpr->getType();
-            llvm::Value *CheckCondition =
-                SEType->isSignedIntegerType()
-                    ? Builder.CreateICmpSGT(size, Zero)
-                    : Builder.CreateICmpUGT(size, Zero);
-            llvm::Constant *StaticArgs[] = {
-                EmitCheckSourceLocation(sizeExpr->getBeginLoc()),
-                EmitCheckTypeDescriptor(SEType)};
-            EmitCheck(std::make_pair(CheckCondition, CheckOrdinal),
-                      CheckHandler, StaticArgs, size);
-          }
-
-          // Always zexting here would be wrong if it weren't
-          // undefined behavior to have a negative bound.
-          // FIXME: What about when size's type is larger than size_t?
-          entry = Builder.CreateIntCast(size, SizeTy, /*signed*/ false);
+  visitVLATypeEvaluations(
+      type, getContext(), [&](const VLATypeEvaluation &Evaluation) {
+        if (Evaluation.Kind == VLATypeEvaluationKind::TypeOfExpression) {
+          EmitIgnoredExpr(Evaluation.Expression);
+          return;
         }
-      }
-      type = vat->getElementType();
-      break;
-    }
 
-    case Type::FunctionProto:
-    case Type::FunctionNoProto:
-      type = cast<FunctionType>(ty)->getReturnType();
-      break;
+        const Expr *SizeExpr = Evaluation.Expression;
+        llvm::Value *&Entry = VLASizeMap[SizeExpr];
+        if (Entry)
+          return;
 
-    case Type::Paren:
-    case Type::TypeOf:
-    case Type::UnaryTransform:
-    case Type::Attributed:
-    case Type::BTFTagAttributed:
-    case Type::HLSLAttributedResource:
-    case Type::SubstTemplateTypeParm:
-    case Type::MacroQualified:
-    case Type::CountAttributed:
-      // Keep walking after single level desugaring.
-      type = type.getSingleStepDesugaredType(getContext());
-      break;
+        llvm::Value *Size = EmitScalarExpr(SizeExpr);
 
-    case Type::Typedef:
-    case Type::Decltype:
-    case Type::Auto:
-    case Type::DeducedTemplateSpecialization:
-    case Type::PackIndexing:
-      // Stop walking: nothing to do.
-      return;
+        // C11 6.7.6.2p5:
+        //   If the size is an expression that is not an integer constant
+        //   expression [...] each time it is evaluated it shall have a value
+        //   greater than zero.
+        if (SanOpts.has(SanitizerKind::VLABound)) {
+          auto CheckOrdinal = SanitizerKind::SO_VLABound;
+          auto CheckHandler = SanitizerHandler::VLABoundNotPositive;
+          SanitizerDebugLocation SanScope(this, {CheckOrdinal}, CheckHandler);
+          llvm::Value *Zero = llvm::Constant::getNullValue(Size->getType());
+          QualType SEType = SizeExpr->getType();
+          llvm::Value *CheckCondition = SEType->isSignedIntegerType()
+                                            ? Builder.CreateICmpSGT(Size, Zero)
+                                            : Builder.CreateICmpUGT(Size, Zero);
+          llvm::Constant *StaticArgs[] = {
+              EmitCheckSourceLocation(SizeExpr->getBeginLoc()),
+              EmitCheckTypeDescriptor(SEType)};
+          EmitCheck(std::make_pair(CheckCondition, CheckOrdinal), CheckHandler,
+                    StaticArgs, Size);
+        }
 
-    case Type::TypeOfExpr:
-      // Stop walking: emit typeof expression.
-      EmitIgnoredExpr(cast<TypeOfExprType>(ty)->getUnderlyingExpr());
-      return;
-
-    case Type::Atomic:
-      type = cast<AtomicType>(ty)->getValueType();
-      break;
-
-    case Type::Pipe:
-      type = cast<PipeType>(ty)->getElementType();
-      break;
-    }
-  } while (type->isVariablyModifiedType());
+        // Always zexting here would be wrong if it weren't undefined behavior
+        // to have a negative bound. FIXME: What about a type wider than size_t?
+        Entry = Builder.CreateIntCast(Size, SizeTy, /*signed*/ false);
+      });
 }
 
 Address CodeGenFunction::EmitVAListRef(const Expr* E) {

@@ -563,8 +563,12 @@ public:
 
   // l-values.
   Value *VisitDeclRefExpr(DeclRefExpr *E) {
-    if (CodeGenFunction::ConstantEmission Constant = CGF.tryEmitAsConstant(E))
+    if (CodeGenFunction::ConstantEmission Constant = CGF.tryEmitAsConstant(E)) {
+      if (callContinuationTLSAccessNeedsCounter(E, CGF.CGM))
+        CGF.incrementCallContinuationProfileCounter(
+            E, CallContinuationKind::TLSAccess);
       return CGF.emitScalarConstant(Constant, E);
+    }
     return EmitLoadOfLValue(E);
   }
 
@@ -716,10 +720,18 @@ public:
   }
 
   Value *VisitCXXDefaultArgExpr(CXXDefaultArgExpr *DAE) {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          DAE, CallContinuationKind::DefaultArgument);
+    });
     CodeGenFunction::CXXDefaultArgExprScope Scope(CGF, DAE);
     return Visit(DAE->getExpr());
   }
   Value *VisitCXXDefaultInitExpr(CXXDefaultInitExpr *DIE) {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          DIE, CallContinuationKind::DefaultInitializer);
+    });
     CodeGenFunction::CXXDefaultInitExprScope Scope(CGF, DIE);
     return Visit(DIE->getExpr());
   }
@@ -903,6 +915,11 @@ public:
   // Binary operators and binary compound assignment operators.
 #define HANDLEBINOP(OP)                                                        \
   Value *VisitBin##OP(const BinaryOperator *E) {                               \
+    llvm::scope_exit EmitOverflowContinuation([&] {                            \
+      if (callContinuationOverflowOperationNeedsCounter(E, CGF.getLangOpts())) \
+        CGF.incrementCallContinuationProfileCounter(                           \
+            E, CallContinuationKind::OverflowOperation);                       \
+    });                                                                        \
     QualType promotionTy = getPromotionType(E->getType());                     \
     auto result = Emit##OP(EmitBinOps(E, promotionTy));                        \
     if (result && !promotionTy.isNull())                                       \
@@ -910,6 +927,11 @@ public:
     return result;                                                             \
   }                                                                            \
   Value *VisitBin##OP##Assign(const CompoundAssignOperator *E) {               \
+    llvm::scope_exit EmitOverflowContinuation([&] {                            \
+      if (callContinuationOverflowOperationNeedsCounter(E, CGF.getLangOpts())) \
+        CGF.incrementCallContinuationProfileCounter(                           \
+            E, CallContinuationKind::OverflowOperation);                       \
+    });                                                                        \
     ApplyAtomGroup Grp(CGF.getDebugInfo());                                    \
     return EmitCompoundAssign(E, &ScalarExprEmitter::Emit##OP);                \
   }
@@ -951,6 +973,10 @@ public:
   Value *VisitBinPtrMemI(const Expr *E) { return EmitLoadOfLValue(E); }
 
   Value *VisitCXXRewrittenBinaryOperator(CXXRewrittenBinaryOperator *E) {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::RewrittenOperator);
+    });
     return Visit(E->getSemanticForm());
   }
 
@@ -2058,12 +2084,18 @@ Value *ScalarExprEmitter::VisitConvertVectorExpr(ConvertVectorExpr *E) {
 Value *ScalarExprEmitter::VisitMemberExpr(MemberExpr *E) {
   if (CodeGenFunction::ConstantEmission Constant = CGF.tryEmitAsConstant(E)) {
     CGF.EmitIgnoredExpr(E->getBase());
+    if (callContinuationTLSAccessNeedsCounter(E, CGF.CGM))
+      CGF.incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::TLSAccess);
     return CGF.emitScalarConstant(Constant, E);
   } else {
     Expr::EvalResult Result;
     if (E->EvaluateAsInt(Result, CGF.getContext(), Expr::SE_AllowSideEffects)) {
       llvm::APSInt Value = Result.Val.getInt();
       CGF.EmitIgnoredExpr(E->getBase());
+      if (callContinuationTLSAccessNeedsCounter(E, CGF.CGM))
+        CGF.incrementCallContinuationProfileCounter(
+            E, CallContinuationKind::TLSAccess);
       return Builder.getInt(Value);
     }
   }
@@ -2708,7 +2740,13 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
         CGF, Visit(E), E->getType()->getPointeeType().getAddressSpace(),
         ConvertType(DestTy));
   }
-  case CK_AtomicToNonAtomic:
+  case CK_AtomicToNonAtomic: {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          CE, CallContinuationKind::AtomicOperation);
+    });
+    return Visit(E);
+  }
   case CK_NonAtomicToAtomic:
   case CK_UserDefinedConversion:
     return Visit(E);
@@ -3079,6 +3117,10 @@ Value *ScalarExprEmitter::VisitStmtExpr(const StmtExpr *E) {
 }
 
 Value *ScalarExprEmitter::VisitExprWithCleanups(ExprWithCleanups *E) {
+  llvm::scope_exit EmitContinuation([&] {
+    CGF.incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::FullExpression);
+  });
   CodeGenFunction::RunCleanupsScope Scope(CGF);
   Value *V = Visit(E->getSubExpr());
   // Defend against dominance problems caused by jumps out of expression
@@ -3170,6 +3212,16 @@ public:
 llvm::Value *
 ScalarExprEmitter::EmitScalarPrePostIncDec(const UnaryOperator *E, LValue LV,
                                            bool isInc, bool isPre) {
+  llvm::scope_exit EmitAtomicContinuation([&] {
+    if (E->getSubExpr()->getType()->isAtomicType())
+      CGF.incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::AtomicOperation);
+  });
+  llvm::scope_exit EmitOverflowContinuation([&] {
+    if (callContinuationOverflowOperationNeedsCounter(E, CGF.getLangOpts()))
+      CGF.incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::OverflowOperation);
+  });
   ApplyAtomGroup Grp(CGF.getDebugInfo());
   OMPLastprivateConditionalUpdateRAII OMPRegion(CGF, E);
   QualType type = E->getSubExpr()->getType();
@@ -3545,6 +3597,11 @@ Value *ScalarExprEmitter::VisitPlus(const UnaryOperator *E,
 
 Value *ScalarExprEmitter::VisitUnaryMinus(const UnaryOperator *E,
                                           QualType PromotionType) {
+  llvm::scope_exit EmitOverflowContinuation([&] {
+    if (callContinuationOverflowOperationNeedsCounter(E, CGF.getLangOpts()))
+      CGF.incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::OverflowOperation);
+  });
   QualType promotionTy = PromotionType.isNull()
                              ? getPromotionType(E->getSubExpr()->getType())
                              : PromotionType;
@@ -3708,6 +3765,10 @@ Value *ScalarExprEmitter::VisitOffsetOfExpr(OffsetOfExpr *E) {
 Value *
 ScalarExprEmitter::VisitUnaryExprOrTypeTraitExpr(
                               const UnaryExprOrTypeTraitExpr *E) {
+  llvm::scope_exit EmitContinuation([&] {
+    CGF.incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::VLAEvaluation);
+  });
   QualType TypeToSize = E->getTypeOfArgument();
   if (auto Kind = E->getKind();
       Kind == UETT_SizeOf || Kind == UETT_DataSizeOf || Kind == UETT_CountOf) {
@@ -4002,6 +4063,8 @@ LValue ScalarExprEmitter::EmitCompoundAssignLValue(
 
         llvm::AtomicRMWInst *OldVal =
             CGF.emitAtomicRMWInst(AtomicOp, LHSLV.getAddress(), Amt);
+        CGF.incrementCallContinuationProfileCounter(
+            E, CallContinuationKind::Assignment);
 
         // Since operation is atomic, the result type is guaranteed to be the
         // same as the input in LLVM terms.
@@ -4058,6 +4121,8 @@ LValue ScalarExprEmitter::EmitCompoundAssignLValue(
     atomicPHI->addIncoming(old, curBlock);
     Builder.CreateCondBr(success, contBB, atomicPHI->getParent());
     Builder.SetInsertPoint(contBB);
+    CGF.incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::Assignment);
     return LHSLV;
   }
 
@@ -4074,6 +4139,9 @@ LValue ScalarExprEmitter::EmitCompoundAssignLValue(
                                     LHSLV.getBitFieldInfo(), E->getExprLoc());
   } else
     CGF.EmitStoreThroughLValue(RValue::get(Result), LHSLV);
+
+  CGF.incrementCallContinuationProfileCounter(E,
+                                              CallContinuationKind::Assignment);
 
   if (CGF.getLangOpts().OpenMP)
     CGF.CGM.getOpenMPRuntime().checkAndEmitLastprivateConditional(CGF,
@@ -5260,6 +5328,10 @@ llvm::Value *CodeGenFunction::EmitWithOriginalRHSBitfieldAssignment(
 
 Value *ScalarExprEmitter::VisitBinAssign(const BinaryOperator *E) {
   ApplyAtomGroup Grp(CGF.getDebugInfo());
+  llvm::scope_exit EmitContinuation([&] {
+    CGF.incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::Assignment);
+  });
   bool Ignore = TestAndClearIgnoreResultAssign();
 
   Value *RHS;

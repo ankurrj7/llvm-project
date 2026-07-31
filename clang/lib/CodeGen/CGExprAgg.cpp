@@ -25,6 +25,7 @@
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/StmtVisitor.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -171,6 +172,10 @@ public:
   void VisitBinComma(const BinaryOperator *E);
   void VisitBinCmp(const BinaryOperator *E);
   void VisitCXXRewrittenBinaryOperator(CXXRewrittenBinaryOperator *E) {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::RewrittenOperator);
+    });
     Visit(E->getSemanticForm());
   }
 
@@ -191,10 +196,18 @@ public:
   void VisitImplicitValueInitExpr(ImplicitValueInitExpr *E);
   void VisitNoInitExpr(NoInitExpr *E) { } // Do nothing.
   void VisitCXXDefaultArgExpr(CXXDefaultArgExpr *DAE) {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          DAE, CallContinuationKind::DefaultArgument);
+    });
     CodeGenFunction::CXXDefaultArgExprScope Scope(CGF, DAE);
     Visit(DAE->getExpr());
   }
   void VisitCXXDefaultInitExpr(CXXDefaultInitExpr *DIE) {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          DIE, CallContinuationKind::DefaultInitializer);
+    });
     CodeGenFunction::CXXDefaultInitExprScope Scope(CGF, DIE);
     Visit(DIE->getExpr());
   }
@@ -782,16 +795,21 @@ AggExprEmitter::VisitCompoundLiteralExpr(CompoundLiteralExpr *E) {
 
 /// Attempt to look through various unimportant expressions to find a
 /// cast of the given kind.
-static Expr *findPeephole(Expr *op, CastKind kind, const ASTContext &ctx) {
+static CastExpr *findPeephole(Expr *op, CastKind kind, const ASTContext &ctx) {
   op = op->IgnoreParenNoopCasts(ctx);
   if (auto castE = dyn_cast<CastExpr>(op)) {
     if (castE->getCastKind() == kind)
-      return castE->getSubExpr();
+      return castE;
   }
   return nullptr;
 }
 
 void AggExprEmitter::VisitCastExpr(CastExpr *E) {
+  llvm::scope_exit EmitAtomicContinuation([&] {
+    if (E->getCastKind() == CK_AtomicToNonAtomic)
+      CGF.incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::AtomicOperation);
+  });
   if (const auto *ECE = dyn_cast<ExplicitCastExpr>(E))
     CGF.CGM.EmitExplicitCastExprType(ECE, &CGF);
   switch (E->getCastKind()) {
@@ -874,12 +892,20 @@ void AggExprEmitter::VisitCastExpr(CastExpr *E) {
       (isToAtomic ? CK_AtomicToNonAtomic : CK_NonAtomicToAtomic);
 
     // These two cases are reverses of each other; try to peephole them.
-    if (Expr *op =
+    if (CastExpr *Peephole =
             findPeephole(E->getSubExpr(), peepholeTarget, CGF.getContext())) {
+      Expr *op = Peephole->getSubExpr();
       assert(CGF.getContext().hasSameUnqualifiedType(op->getType(),
                                                      E->getType()) &&
-           "peephole significantly changed types?");
-      return Visit(op);
+             "peephole significantly changed types?");
+      Visit(op);
+      // The inverse cast is deliberately bypassed by this representation
+      // peephole. Preserve its normal-completion boundary when it performed
+      // the atomic load represented by CK_AtomicToNonAtomic.
+      if (Peephole->getCastKind() == CK_AtomicToNonAtomic)
+        CGF.incrementCallContinuationProfileCounter(
+            Peephole, CallContinuationKind::AtomicOperation);
+      return;
     }
 
     // If we're converting an r-value of non-atomic type to an r-value
@@ -1224,74 +1250,12 @@ void AggExprEmitter::VisitPointerToDataMemberBinaryOperator(
   EmitFinalDestCopy(E->getType(), LV);
 }
 
-/// Is the value of the given expression possibly a reference to or
-/// into a __block variable?
-static bool isBlockVarRef(const Expr *E) {
-  // Make sure we look through parens.
-  E = E->IgnoreParens();
-
-  // Check for a direct reference to a __block variable.
-  if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E)) {
-    const VarDecl *var = dyn_cast<VarDecl>(DRE->getDecl());
-    return (var && var->hasAttr<BlocksAttr>());
-  }
-
-  // More complicated stuff.
-
-  // Binary operators.
-  if (const BinaryOperator *op = dyn_cast<BinaryOperator>(E)) {
-    // For an assignment or pointer-to-member operation, just care
-    // about the LHS.
-    if (op->isAssignmentOp() || op->isPtrMemOp())
-      return isBlockVarRef(op->getLHS());
-
-    // For a comma, just care about the RHS.
-    if (op->getOpcode() == BO_Comma)
-      return isBlockVarRef(op->getRHS());
-
-    // FIXME: pointer arithmetic?
-    return false;
-
-  // Check both sides of a conditional operator.
-  } else if (const AbstractConditionalOperator *op
-               = dyn_cast<AbstractConditionalOperator>(E)) {
-    return isBlockVarRef(op->getTrueExpr())
-        || isBlockVarRef(op->getFalseExpr());
-
-  // OVEs are required to support BinaryConditionalOperators.
-  } else if (const OpaqueValueExpr *op
-               = dyn_cast<OpaqueValueExpr>(E)) {
-    if (const Expr *src = op->getSourceExpr())
-      return isBlockVarRef(src);
-
-  // Casts are necessary to get things like (*(int*)&var) = foo().
-  // We don't really care about the kind of cast here, except
-  // we don't want to look through l2r casts, because it's okay
-  // to get the *value* in a __block variable.
-  } else if (const CastExpr *cast = dyn_cast<CastExpr>(E)) {
-    if (cast->getCastKind() == CK_LValueToRValue)
-      return false;
-    return isBlockVarRef(cast->getSubExpr());
-
-  // Handle unary operators.  Again, just aggressively look through
-  // it, ignoring the operation.
-  } else if (const UnaryOperator *uop = dyn_cast<UnaryOperator>(E)) {
-    return isBlockVarRef(uop->getSubExpr());
-
-  // Look into the base of a field access.
-  } else if (const MemberExpr *mem = dyn_cast<MemberExpr>(E)) {
-    return isBlockVarRef(mem->getBase());
-
-  // Look into the base of a subscript.
-  } else if (const ArraySubscriptExpr *sub = dyn_cast<ArraySubscriptExpr>(E)) {
-    return isBlockVarRef(sub->getBase());
-  }
-
-  return false;
-}
-
 void AggExprEmitter::VisitBinAssign(const BinaryOperator *E) {
   ApplyAtomGroup Grp(CGF.getDebugInfo());
+  auto EmitContinuation = [&] {
+    CGF.incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::Assignment);
+  };
   // For an assignment to work, the value on the right has
   // to be compatible with the value on the left.
   assert(CGF.getContext().hasSameUnqualifiedType(E->getLHS()->getType(),
@@ -1302,8 +1266,7 @@ void AggExprEmitter::VisitBinAssign(const BinaryOperator *E) {
   // potentially cause a block copy, we need to evaluate the RHS first
   // so that the assignment goes the right place.
   // This is pretty semantically fragile.
-  if (isBlockVarRef(E->getLHS()) &&
-      E->getRHS()->HasSideEffects(CGF.getContext())) {
+  if (callContinuationAssignmentEvaluatesRHSFirst(E, CGF.getContext())) {
     // Ensure that we have a destination, and evaluate the RHS into that.
     EnsureDest(E->getRHS()->getType());
     Visit(E->getRHS());
@@ -1315,6 +1278,7 @@ void AggExprEmitter::VisitBinAssign(const BinaryOperator *E) {
     if (LHS.getType()->isAtomicType() ||
         CGF.LValueIsSuitableForInlineAtomic(LHS)) {
       CGF.EmitAtomicStore(Dest.asRValue(), LHS, /*isInit*/ false);
+      EmitContinuation();
       return;
     }
 
@@ -1324,6 +1288,7 @@ void AggExprEmitter::VisitBinAssign(const BinaryOperator *E) {
                                      AggValueSlot::IsAliased,
                                      AggValueSlot::MayOverlap),
              Dest);
+    EmitContinuation();
     return;
   }
 
@@ -1336,6 +1301,7 @@ void AggExprEmitter::VisitBinAssign(const BinaryOperator *E) {
     EnsureDest(E->getRHS()->getType());
     Visit(E->getRHS());
     CGF.EmitAtomicStore(Dest.asRValue(), LHS, /*isInit*/ false);
+    EmitContinuation();
     return;
   }
 
@@ -1349,6 +1315,11 @@ void AggExprEmitter::VisitBinAssign(const BinaryOperator *E) {
     LHSSlot.setVolatile(true);
 
   CGF.EmitAggExpr(E->getRHS(), LHSSlot);
+
+  // The assignment has completed once the RHS has been stored into the LHS.
+  // Emit its continuation before copying the assignment result into an outer
+  // destination; a chained outer assignment can itself fail to complete.
+  EmitContinuation();
 
   // Copy into the destination if the assignment isn't ignored.
   EmitFinalDestCopy(E->getType(), LHS);
@@ -1494,6 +1465,10 @@ AggExprEmitter::VisitLambdaExpr(LambdaExpr *E) {
 }
 
 void AggExprEmitter::VisitExprWithCleanups(ExprWithCleanups *E) {
+  llvm::scope_exit EmitContinuation([&] {
+    CGF.incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::FullExpression);
+  });
   CodeGenFunction::RunCleanupsScope cleanups(CGF);
   Visit(E->getSubExpr());
 }
@@ -1950,6 +1925,10 @@ void AggExprEmitter::DoZeroInitPadding(uint64_t &PaddingStart,
 
 void AggExprEmitter::VisitArrayInitLoopExpr(const ArrayInitLoopExpr *E,
                                             llvm::Value *outerBegin) {
+  llvm::scope_exit EmitContinuation([&] {
+    CGF.incrementCallContinuationProfileCounter(
+        E, CallContinuationKind::ArrayInitialization);
+  });
   // Emit the common subexpression.
   CodeGenFunction::OpaqueValueMapping binding(CGF, E->getCommonExpr());
 

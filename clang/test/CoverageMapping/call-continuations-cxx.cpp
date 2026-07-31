@@ -20,4 +20,4 @@ int constructor_call(void) {
 
 // MAP-LABEL: _ZN1CC2Ev:
 // MAP: File 0, [[INIT_LINE:[0-9]+]]:11 -> [[INIT_LINE]]:23 = #0
-// MAP-NEXT: File 0, [[INIT_LINE]]:25 -> {{[0-9]+}}:4 = #1
+// MAP-NEXT: File 0, [[INIT_LINE]]:25 -> {{[0-9]+}}:4 = #2
