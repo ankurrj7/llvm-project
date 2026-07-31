@@ -14,6 +14,7 @@
 #include "InstrProfilingInternal.h"
 
 static unsigned ProfileDumped = 0;
+static int ProfileDumpFailure = 0;
 
 COMPILER_RT_VISIBILITY unsigned lprofProfileDumped(void) {
   return ProfileDumped;
@@ -21,6 +22,16 @@ COMPILER_RT_VISIBILITY unsigned lprofProfileDumped(void) {
 
 COMPILER_RT_VISIBILITY void lprofSetProfileDumped(unsigned Value) {
   ProfileDumped = Value;
+  ProfileDumpFailure = 0;
+}
+
+COMPILER_RT_VISIBILITY int lprofProfileDumpFailed(void) {
+  return ProfileDumpFailure;
+}
+
+COMPILER_RT_VISIBILITY void lprofSetProfileDumpFailed(int Value) {
+  ProfileDumped = 0;
+  ProfileDumpFailure = Value ? Value : -1;
 }
 
 #endif

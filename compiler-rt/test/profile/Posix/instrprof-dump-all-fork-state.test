@@ -1,0 +1,185 @@
+// REQUIRES: linux
+// RUN: rm -rf %t && split-file %s %t && cd %t
+// RUN: %clang -fPIC -shared blocker.c -o blocker.so
+// RUN: %clang_profgen all-guard.c -ldl -pthread -Wl,--export-dynamic \
+// RUN:   -o all-guard
+// RUN: env LLVM_PROFILE_FILE=%t/all-%%p-%m.profraw %run %t/all-guard
+// RUN: ls %t/all-*.profraw | count 2
+// RUN: llvm-profdata merge -sparse %t/all-*.profraw -o %t/all.profdata
+// RUN: llvm-profdata show --function=child_all_guard --counts \
+// RUN:   %t/all.profdata | FileCheck %s --check-prefix=ALL
+//
+// RUN: %clang_profgen image-guard.c -pthread -o image-guard
+// RUN: env LLVM_PROFILE_FILE=%t/unused.profraw \
+// RUN:   %run %t/image-guard %t/image-%%p-%m.profraw
+// RUN: llvm-profdata show --function=child_image_guard --counts \
+// RUN:   %t/image-*.profraw | FileCheck %s --check-prefix=IMAGE
+//
+// ALL: child_all_guard:
+// ALL: Function count: 1
+// IMAGE: child_image_guard:
+// IMAGE: Function count: 1
+
+//--- blocker.c
+int block_dump_in_parent(void);
+__attribute__((visibility("default"))) int
+__llvm_profile_dump_current_image(void) {
+  return block_dump_in_parent();
+}
+
+//--- all-guard.c
+#include <dlfcn.h>
+#include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static pthread_cond_t Condition = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t Mutex = PTHREAD_MUTEX_INITIALIZER;
+static int Ready;
+static int Release;
+static pid_t ParentPID;
+
+int __llvm_profile_dump_all(void);
+
+__attribute__((noinline)) static void child_all_guard(void) {}
+
+int block_dump_in_parent(void) {
+  if (getpid() != ParentPID)
+    return 0;
+  pthread_mutex_lock(&Mutex);
+  Ready = 1;
+  pthread_cond_broadcast(&Condition);
+  while (!Release)
+    pthread_cond_wait(&Condition, &Mutex);
+  pthread_mutex_unlock(&Mutex);
+  return 0;
+}
+
+static void *dump_all(void *Unused) {
+  (void)Unused;
+  return (void *)(long)__llvm_profile_dump_all();
+}
+
+int main(void) {
+  ParentPID = getpid();
+  void *Handle = dlopen("./blocker.so", RTLD_NOW | RTLD_LOCAL);
+  if (!Handle)
+    return 1;
+
+  pthread_t Worker;
+  if (pthread_create(&Worker, NULL, dump_all, NULL))
+    return 2;
+  pthread_mutex_lock(&Mutex);
+  while (!Ready)
+    pthread_cond_wait(&Condition, &Mutex);
+  pthread_mutex_unlock(&Mutex);
+
+  pid_t Child = fork();
+  if (Child == -1)
+    return 3;
+  if (Child == 0) {
+    child_all_guard();
+    _exit(__llvm_profile_dump_all() != 0);
+  }
+
+  int Status;
+  if (waitpid(Child, &Status, 0) != Child || !WIFEXITED(Status) ||
+      WEXITSTATUS(Status) != 0)
+    return 4;
+  pthread_mutex_lock(&Mutex);
+  Release = 1;
+  pthread_cond_broadcast(&Condition);
+  pthread_mutex_unlock(&Mutex);
+
+  void *Result;
+  if (pthread_join(Worker, &Result) || Result)
+    return 5;
+  if (dlclose(Handle))
+    return 6;
+  _exit(0);
+}
+
+//--- image-guard.c
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static pthread_cond_t Condition = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t Mutex = PTHREAD_MUTEX_INITIALIZER;
+static int Ready;
+static int Release;
+static pid_t ParentPID;
+
+int __llvm_profile_dump_current_image(void);
+void __llvm_profile_set_filename(const char *);
+int __llvm_profile_set_file_object(FILE *, int);
+
+__attribute__((noinline)) static void child_image_guard(void) {}
+
+static ssize_t write_cookie(void *Cookie, const char *Data, size_t Size) {
+  (void)Cookie;
+  (void)Data;
+  if (getpid() != ParentPID)
+    return Size;
+  pthread_mutex_lock(&Mutex);
+  Ready = 1;
+  pthread_cond_broadcast(&Condition);
+  while (!Release)
+    pthread_cond_wait(&Condition, &Mutex);
+  pthread_mutex_unlock(&Mutex);
+  return Size;
+}
+
+static void *dump_image(void *Unused) {
+  (void)Unused;
+  return (void *)(long)__llvm_profile_dump_current_image();
+}
+
+int main(int argc, char **argv) {
+  if (argc != 2)
+    return 1;
+  ParentPID = getpid();
+  cookie_io_functions_t Functions = {0};
+  Functions.write = write_cookie;
+  FILE *Output = fopencookie(NULL, "wb", Functions);
+  if (!Output || setvbuf(Output, NULL, _IONBF, 0) ||
+      __llvm_profile_set_file_object(Output, 0))
+    return 2;
+
+  pthread_t Worker;
+  if (pthread_create(&Worker, NULL, dump_image, NULL))
+    return 3;
+  pthread_mutex_lock(&Mutex);
+  while (!Ready)
+    pthread_cond_wait(&Condition, &Mutex);
+  pthread_mutex_unlock(&Mutex);
+
+  pid_t Child = fork();
+  if (Child == -1)
+    return 4;
+  if (Child == 0) {
+    if (__llvm_profile_set_file_object(NULL, 0))
+      _exit(5);
+    __llvm_profile_set_filename(argv[1]);
+    child_image_guard();
+    _exit(__llvm_profile_dump_current_image() != 0);
+  }
+
+  int Status;
+  if (waitpid(Child, &Status, 0) != Child || !WIFEXITED(Status) ||
+      WEXITSTATUS(Status) != 0)
+    return 6;
+  pthread_mutex_lock(&Mutex);
+  Release = 1;
+  pthread_cond_broadcast(&Condition);
+  pthread_mutex_unlock(&Mutex);
+
+  void *Result;
+  if (pthread_join(Worker, &Result))
+    return 7;
+  fclose(Output);
+  _exit(0);
+}
