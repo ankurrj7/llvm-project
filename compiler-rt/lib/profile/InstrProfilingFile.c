@@ -887,7 +887,14 @@ static void closeSparseFileObject(FILE *OutputFile) {
 static int writeFile(const char *OutputName) {
   int RetVal;
   FILE *OutputFile;
-  int SparseProfile = shouldWriteSparseProfile();
+  /*
+   * Sparse output is an append-only container and therefore needs a seekable,
+   * lockable destination.  A FILE supplied through
+   * __llvm_profile_set_file_object() may be a pipe, cookie stream, or another
+   * non-seekable object.  Preserve the file-object API contract by using the
+   * traditional dense writer for those destinations.
+   */
+  int SparseProfile = shouldWriteSparseProfile() && !getProfileFile();
   uint64_t SparseSegmentOffset = 0;
 
   int MergeDone = 0;
