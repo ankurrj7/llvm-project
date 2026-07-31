@@ -16,6 +16,7 @@
 #include "CodeGenModule.h"
 #include "ConstantEmitter.h"
 #include "clang/AST/StmtVisitor.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/MDBuilder.h"
@@ -143,8 +144,12 @@ public:
 
   // l-values.
   ComplexPairTy VisitDeclRefExpr(DeclRefExpr *E) {
-    if (CodeGenFunction::ConstantEmission Constant = CGF.tryEmitAsConstant(E))
+    if (CodeGenFunction::ConstantEmission Constant = CGF.tryEmitAsConstant(E)) {
+      if (callContinuationTLSAccessNeedsCounter(E, CGF.CGM))
+        CGF.incrementCallContinuationProfileCounter(
+            E, CallContinuationKind::TLSAccess);
       return emitConstant(Constant, E);
+    }
     return EmitLoadOfLValue(E);
   }
   ComplexPairTy VisitObjCIvarRefExpr(ObjCIvarRefExpr *E) {
@@ -158,6 +163,9 @@ public:
     if (CodeGenFunction::ConstantEmission Constant =
             CGF.tryEmitAsConstant(ME)) {
       CGF.EmitIgnoredExpr(ME->getBase());
+      if (callContinuationTLSAccessNeedsCounter(ME, CGF.CGM))
+        CGF.incrementCallContinuationProfileCounter(
+            ME, CallContinuationKind::TLSAccess);
       return emitConstant(Constant, ME);
     }
     return EmitLoadOfLValue(ME);
@@ -177,6 +185,11 @@ public:
 
   ComplexPairTy EmitCast(CastKind CK, Expr *Op, QualType DestTy);
   ComplexPairTy VisitImplicitCastExpr(ImplicitCastExpr *E) {
+    llvm::scope_exit EmitAtomicContinuation([&] {
+      if (E->getCastKind() == CK_AtomicToNonAtomic)
+        CGF.incrementCallContinuationProfileCounter(
+            E, CallContinuationKind::AtomicOperation);
+    });
     // Unlike for scalars, we don't have to worry about function->ptr demotion
     // here.
     if (E->changesVolatileQualification())
@@ -184,6 +197,11 @@ public:
     return EmitCast(E->getCastKind(), E->getSubExpr(), E->getType());
   }
   ComplexPairTy VisitCastExpr(CastExpr *E) {
+    llvm::scope_exit EmitAtomicContinuation([&] {
+      if (E->getCastKind() == CK_AtomicToNonAtomic)
+        CGF.incrementCallContinuationProfileCounter(
+            E, CallContinuationKind::AtomicOperation);
+    });
     if (const auto *ECE = dyn_cast<ExplicitCastExpr>(E))
       CGF.CGM.EmitExplicitCastExprType(ECE, &CGF);
     if (E->changesVolatileQualification())
@@ -196,6 +214,11 @@ public:
   // Operators.
   ComplexPairTy VisitPrePostIncDec(const UnaryOperator *E, bool isInc,
                                    bool isPre) {
+    llvm::scope_exit EmitAtomicContinuation([&] {
+      if (E->getSubExpr()->getType()->isAtomicType())
+        CGF.incrementCallContinuationProfileCounter(
+            E, CallContinuationKind::AtomicOperation);
+    });
     LValue LV = CGF.EmitLValue(E->getSubExpr());
     return CGF.EmitComplexPrePostIncDec(E, LV, isInc, isPre);
   }
@@ -225,14 +248,26 @@ public:
     return Visit(E->getSubExpr());
   }
   ComplexPairTy VisitCXXDefaultArgExpr(CXXDefaultArgExpr *DAE) {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          DAE, CallContinuationKind::DefaultArgument);
+    });
     CodeGenFunction::CXXDefaultArgExprScope Scope(CGF, DAE);
     return Visit(DAE->getExpr());
   }
   ComplexPairTy VisitCXXDefaultInitExpr(CXXDefaultInitExpr *DIE) {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          DIE, CallContinuationKind::DefaultInitializer);
+    });
     CodeGenFunction::CXXDefaultInitExprScope Scope(CGF, DIE);
     return Visit(DIE->getExpr());
   }
   ComplexPairTy VisitExprWithCleanups(ExprWithCleanups *E) {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::FullExpression);
+    });
     CodeGenFunction::RunCleanupsScope Scope(CGF);
     ComplexPairTy Vals = Visit(E->getSubExpr());
     // Defend against dominance problems caused by jumps out of expression
@@ -254,6 +289,7 @@ public:
   }
 
   struct BinOpInfo {
+    const BinaryOperator *E;
     ComplexPairTy LHS;
     ComplexPairTy RHS;
     QualType Ty; // Computation Type.
@@ -356,6 +392,10 @@ public:
 #undef HANDLEBINOP
 
   ComplexPairTy VisitCXXRewrittenBinaryOperator(CXXRewrittenBinaryOperator *E) {
+    llvm::scope_exit EmitContinuation([&] {
+      CGF.incrementCallContinuationProfileCounter(
+          E, CallContinuationKind::RewrittenOperator);
+    });
     return Visit(E->getSemanticForm());
   }
 
@@ -820,6 +860,10 @@ static StringRef getComplexMultiplyLibCallName(llvm::Type *Ty) {
 // See C11 Annex G.5.1 for the semantics of multiplicative operators on complex
 // typed values.
 ComplexPairTy ComplexExprEmitter::EmitBinMul(const BinOpInfo &Op) {
+  llvm::scope_exit EmitContinuation([&] {
+    CGF.incrementCallContinuationProfileCounter(
+        Op.E, CallContinuationKind::ComplexOperation);
+  });
   using llvm::Value;
   Value *ResR, *ResI;
   llvm::MDBuilder MDHelper(CGF.getLLVMContext());
@@ -1029,6 +1073,10 @@ ComplexPairTy ComplexExprEmitter::EmitRangeReductionDiv(llvm::Value *LHSr,
 // See C11 Annex G.5.1 for the semantics of multiplicative operators on complex
 // typed values.
 ComplexPairTy ComplexExprEmitter::EmitBinDiv(const BinOpInfo &Op) {
+  llvm::scope_exit EmitContinuation([&] {
+    CGF.incrementCallContinuationProfileCounter(
+        Op.E, CallContinuationKind::ComplexOperation);
+  });
   llvm::Value *LHSr = Op.LHS.first, *LHSi = Op.LHS.second;
   llvm::Value *RHSr = Op.RHS.first, *RHSi = Op.RHS.second;
   llvm::Value *DSTr, *DSTi;
@@ -1202,6 +1250,7 @@ ComplexExprEmitter::EmitBinOps(const BinaryOperator *E,
   TestAndClearIgnoreReal();
   TestAndClearIgnoreImag();
   BinOpInfo Ops;
+  Ops.E = E;
 
   Ops.LHS = EmitPromotedComplexOperand(E->getLHS(), PromotionType);
   Ops.RHS = EmitPromotedComplexOperand(E->getRHS(), PromotionType);
@@ -1221,6 +1270,7 @@ LValue ComplexExprEmitter::EmitCompoundAssignLValue(
   QualType LHSTy = E->getLHS()->getType().getAtomicUnqualifiedType();
 
   BinOpInfo OpInfo;
+  OpInfo.E = E;
   OpInfo.FPFeatures = E->getFPFeaturesInEffect(CGF.getLangOpts());
   CodeGenFunction::CGFPOptionsRAII FPOptsRAII(CGF, OpInfo.FPFeatures);
 
@@ -1319,6 +1369,8 @@ LValue ComplexExprEmitter::EmitCompoundAssignLValue(
     Val = RValue::get(ResVal);
   }
 
+  CGF.incrementCallContinuationProfileCounter(E,
+                                              CallContinuationKind::Assignment);
   return LHS;
 }
 
@@ -1356,6 +1408,8 @@ LValue ComplexExprEmitter::EmitBinAssignLValue(const BinaryOperator *E,
 
   // Store the result value into the LHS lvalue.
   EmitStoreOfComplex(Val, LHS, /*isInit*/ false);
+  CGF.incrementCallContinuationProfileCounter(E,
+                                              CallContinuationKind::Assignment);
 
   return LHS;
 }
