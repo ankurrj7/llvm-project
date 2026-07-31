@@ -41,6 +41,8 @@ COMPILER_RT_VISIBILITY unsigned lprofProfileDumped(void) {
   return 1;
 }
 COMPILER_RT_VISIBILITY void lprofSetProfileDumped(unsigned Value) {}
+COMPILER_RT_VISIBILITY int lprofProfileDumpFailed(void) { return 0; }
+COMPILER_RT_VISIBILITY void lprofSetProfileDumpFailed(int Value) {}
 
 static const char ProfileSinkName[] = "llvm-profile";
 

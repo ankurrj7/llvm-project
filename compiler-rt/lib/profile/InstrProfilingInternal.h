@@ -190,6 +190,13 @@ uint64_t lprofGetLoadModuleSignature(void);
 unsigned lprofProfileDumped(void);
 void lprofSetProfileDumped(unsigned);
 
+/* Return the preserved result of a non-retryable dump failure, or zero. */
+int lprofProfileDumpFailed(void);
+void lprofSetProfileDumpFailed(int Value);
+
+/* Refresh cached process-specific filename substitutions after fork(). */
+void lprofUpdateProfileNameForCurrentProcess(void);
+
 COMPILER_RT_VISIBILITY extern void (*FreeHook)(void *);
 COMPILER_RT_VISIBILITY extern uint8_t *DynamicBufferIOBuffer;
 COMPILER_RT_VISIBILITY extern uint32_t VPBufferSize;
