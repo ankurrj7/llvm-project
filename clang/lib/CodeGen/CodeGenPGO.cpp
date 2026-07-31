@@ -36,13 +36,26 @@ static llvm::cl::opt<bool>
 using namespace clang;
 using namespace CodeGen;
 
+static bool requiresCanonicalCoverageMappingSPIName(
+    llvm::GlobalValue::LinkageTypes Linkage) {
+  // ODR definitions emitted in multiple translation units must retain the same
+  // profile name. The name determines both the profile-counter symbol and the
+  // coverage-mapping COMDAT identity, which must follow the function selected
+  // by the linker. Available-externally name variables use linkonce_odr
+  // linkage, so they require the same treatment.
+  return llvm::GlobalValue::isLinkOnceODRLinkage(Linkage) ||
+         llvm::GlobalValue::isWeakODRLinkage(Linkage) ||
+         llvm::GlobalValue::isAvailableExternallyLinkage(Linkage);
+}
+
 void CodeGenPGO::setFuncName(StringRef Name,
                              llvm::GlobalValue::LinkageTypes Linkage) {
   llvm::IndexedInstrProfReader *PGOReader = CGM.getPGOReader();
   FuncName = llvm::getPGOFuncName(
       Name, Linkage, CGM.getCodeGenOpts().MainFileName,
       PGOReader ? PGOReader->getVersion() : llvm::IndexedInstrProf::Version);
-  if (!CGM.getCodeGenOpts().CoverageMappingSPIKey.empty())
+  if (!CGM.getCodeGenOpts().CoverageMappingSPIKey.empty() &&
+      !requiresCanonicalCoverageMappingSPIName(Linkage))
     FuncName = llvm::getPGOFuncNameWithCoverageMappingSPIUnit(
         FuncName, CGM.getCodeGenOpts().CoverageMappingSPIKey);
 
