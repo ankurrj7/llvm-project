@@ -28,6 +28,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/Assumptions.h"
@@ -568,6 +569,10 @@ Address CodeGenFunction::EmitCompoundStmt(const CompoundStmt &S, bool GetLast,
                              "LLVM IR generation of compound statement ('{}')");
 
   // Keep track of the current cleanup stack depth, including debug scopes.
+  llvm::scope_exit EmitContinuation([&] {
+    incrementCallContinuationProfileCounter(
+        &S, CallContinuationKind::CompoundFallthrough);
+  });
   LexicalScope Scope(*this, S.getSourceRange());
 
   return EmitCompoundStmtWithoutScope(S, GetLast, AggSlot);
@@ -872,6 +877,9 @@ void CodeGenFunction::EmitIndirectGotoStmt(const IndirectGotoStmt &S) {
 }
 
 void CodeGenFunction::EmitIfStmt(const IfStmt &S) {
+  llvm::scope_exit EmitContinuation([&] {
+    incrementCallContinuationProfileCounter(&S, CallContinuationKind::IfExit);
+  });
   const Stmt *Else = S.getElse();
 
   // The else branch of a consteval if statement is always the only branch that
@@ -919,9 +927,13 @@ void CodeGenFunction::EmitIfStmt(const IfStmt &S) {
                               /*UseBoth=*/true);
       if (Executed) {
         MaybeEmitDeferredVarDeclInit(S.getConditionVariable());
+        incrementCallContinuationProfileCounter(
+            S.getConditionVariable(), CallContinuationKind::Declaration);
         RunCleanupsScope ExecutedScope(*this);
         EmitStmt(Executed);
-      }
+      } else
+        incrementCallContinuationProfileCounter(
+            S.getConditionVariable(), CallContinuationKind::Declaration);
       PGO->markStmtMaybeUsed(Skipped);
       return;
     }
@@ -965,6 +977,8 @@ void CodeGenFunction::EmitIfStmt(const IfStmt &S) {
   } else {
     llvm::Value *BoolCondVal = EvaluateExprAsBool(S.getCond());
     MaybeEmitDeferredVarDeclInit(S.getConditionVariable());
+    incrementCallContinuationProfileCounter(S.getConditionVariable(),
+                                            CallContinuationKind::Declaration);
     Builder.CreateCondBr(BoolCondVal, ThenBlock, ElseBlock);
   }
 
@@ -1075,6 +1089,8 @@ void CodeGenFunction::EmitWhileStmt(const WhileStmt &S,
   // the continue target.
   JumpDest LoopHeader = getJumpDestInCurrentScope("while.cond");
   EmitBlock(LoopHeader.getBlock());
+  incrementCallContinuationProfileCounter(&S,
+                                          CallContinuationKind::LoopBackedge);
 
   if (CGM.shouldEmitConvergenceTokens())
     ConvergenceTokenStack.push_back(
@@ -1105,6 +1121,8 @@ void CodeGenFunction::EmitWhileStmt(const WhileStmt &S,
   llvm::Value *BoolCondVal = EvaluateExprAsBool(S.getCond());
 
   MaybeEmitDeferredVarDeclInit(S.getConditionVariable());
+  incrementCallContinuationProfileCounter(S.getConditionVariable(),
+                                          CallContinuationKind::Declaration);
 
   // while(1) is common, avoid extra exit blocks.  Be sure
   // to correctly handle break/continue though.
@@ -1174,6 +1192,7 @@ void CodeGenFunction::EmitWhileStmt(const WhileStmt &S,
 
   // Emit the exit block.
   EmitBlock(LoopExit.getBlock(), true);
+  incrementCallContinuationProfileCounter(&S, CallContinuationKind::LoopExit);
 
   // The LoopHeader typically is just a branch if we skipped emitting
   // a branch, try to erase it.
@@ -1210,6 +1229,8 @@ void CodeGenFunction::EmitDoStmt(const DoStmt &S,
   }
 
   EmitBlock(LoopCond.getBlock());
+  incrementCallContinuationProfileCounter(&S,
+                                          CallContinuationKind::LoopBackedge);
 
   // C99 6.8.5.2: "The evaluation of the controlling expression takes place
   // after each execution of the loop body."
@@ -1261,6 +1282,7 @@ void CodeGenFunction::EmitDoStmt(const DoStmt &S,
 
   // Emit the exit block.
   EmitBlock(LoopExit.getBlock());
+  incrementCallContinuationProfileCounter(&S, CallContinuationKind::LoopExit);
 
   // The DoCond block typically is just a branch if we skipped
   // emitting a branch, try to erase it.
@@ -1289,6 +1311,8 @@ void CodeGenFunction::EmitForStmt(const ForStmt &S,
   JumpDest CondDest = getJumpDestInCurrentScope("for.cond");
   llvm::BasicBlock *CondBlock = CondDest.getBlock();
   EmitBlock(CondBlock);
+  incrementCallContinuationProfileCounter(&S,
+                                          CallContinuationKind::LoopBackedge);
 
   if (CGM.shouldEmitConvergenceTokens())
     ConvergenceTokenStack.push_back(emitConvergenceLoopToken(CondBlock));
@@ -1342,6 +1366,8 @@ void CodeGenFunction::EmitForStmt(const ForStmt &S,
     llvm::Value *BoolCondVal = EvaluateExprAsBool(S.getCond());
 
     MaybeEmitDeferredVarDeclInit(S.getConditionVariable());
+    incrementCallContinuationProfileCounter(S.getConditionVariable(),
+                                            CallContinuationKind::Declaration);
 
     llvm::MDNode *Weights =
         createProfileWeightsForLoop(S.getCond(), getProfileCount(S.getBody()));
@@ -1387,6 +1413,8 @@ void CodeGenFunction::EmitForStmt(const ForStmt &S,
   // If there is an increment, emit it next.
   if (S.getInc()) {
     EmitBlock(Continue.getBlock());
+    incrementCallContinuationProfileCounter(&S,
+                                            CallContinuationKind::LoopContinue);
     EmitStmt(S.getInc());
   }
 
@@ -1404,6 +1432,7 @@ void CodeGenFunction::EmitForStmt(const ForStmt &S,
 
   // Emit the fall-through block.
   EmitBlock(LoopExit.getBlock(), true);
+  incrementCallContinuationProfileCounter(&S, CallContinuationKind::LoopExit);
 
   if (CGM.shouldEmitConvergenceTokens())
     ConvergenceTokenStack.pop_back();
@@ -1434,6 +1463,8 @@ CodeGenFunction::EmitCXXForRangeStmt(const CXXForRangeStmt &S,
   // later.
   llvm::BasicBlock *CondBlock = createBasicBlock("for.cond");
   EmitBlock(CondBlock);
+  incrementCallContinuationProfileCounter(&S,
+                                          CallContinuationKind::LoopBackedge);
 
   if (CGM.shouldEmitConvergenceTokens())
     ConvergenceTokenStack.push_back(emitConvergenceLoopToken(CondBlock));
@@ -1488,6 +1519,7 @@ CodeGenFunction::EmitCXXForRangeStmt(const CXXForRangeStmt &S,
     // Create a separate cleanup scope for the loop variable and body.
     LexicalScope BodyScope(*this, S.getSourceRange());
     EmitStmt(S.getLoopVarStmt());
+    incrementCallContinuationProfileCounter(&S, CallContinuationKind::LoopBody);
     EmitStmt(S.getBody());
   }
   // The last block in the loop's body (which unconditionally branches to the
@@ -1509,6 +1541,7 @@ CodeGenFunction::EmitCXXForRangeStmt(const CXXForRangeStmt &S,
 
   // Emit the fall-through block.
   EmitBlock(LoopExit.getBlock(), true);
+  incrementCallContinuationProfileCounter(&S, CallContinuationKind::LoopExit);
 
   if (CGM.shouldEmitConvergenceTokens())
     ConvergenceTokenStack.pop_back();
@@ -1597,6 +1630,19 @@ static bool isSwiftAsyncCallee(const CallExpr *CE) {
   return calleeType->getCallConv() == CallingConv::CC_SwiftAsync;
 }
 
+const CallExpr *
+clang::CodeGen::getImplicitSwiftAsyncMustTailCall(const ReturnStmt &S,
+                                                  bool IsSwiftAsyncCaller) {
+  if (!IsSwiftAsyncCaller)
+    return nullptr;
+
+  const Expr *RV = S.getRetValue();
+  if (const auto *EWC = dyn_cast_or_null<ExprWithCleanups>(RV))
+    RV = EWC->getSubExpr();
+  const auto *CE = dyn_cast_or_null<CallExpr>(RV);
+  return CE && isSwiftAsyncCallee(CE) ? CE : nullptr;
+}
+
 /// EmitReturnStmt - Note that due to GCC extensions, this can have an operand
 /// if the function returns void, or may be missing one if the function returns
 /// non-void.  Fun stuff :).
@@ -1633,20 +1679,17 @@ void CodeGenFunction::EmitReturnStmt(const ReturnStmt &S) {
   SaveRetExprRAII SaveRetExpr(RV, *this);
 
   RunCleanupsScope cleanupScope(*this);
-  if (const auto *EWC = dyn_cast_or_null<ExprWithCleanups>(RV))
-    RV = EWC->getSubExpr();
+  const auto *ReturnEWC = dyn_cast_or_null<ExprWithCleanups>(RV);
+  if (ReturnEWC)
+    RV = ReturnEWC->getSubExpr();
 
   // If we're in a swiftasynccall function, and the return expression is a
   // call to a swiftasynccall function, mark the call as the musttail call.
   std::optional<llvm::SaveAndRestore<const CallExpr *>> SaveMustTail;
-  if (RV && CurFnInfo &&
-      CurFnInfo->getASTCallingConvention() == CallingConv::CC_SwiftAsync) {
-    if (auto CE = dyn_cast<CallExpr>(RV)) {
-      if (isSwiftAsyncCallee(CE)) {
-        SaveMustTail.emplace(MustTailCall, CE);
-      }
-    }
-  }
+  if (const auto *CE = getImplicitSwiftAsyncMustTailCall(
+          S, CurFnInfo && CurFnInfo->getASTCallingConvention() ==
+                              CallingConv::CC_SwiftAsync))
+    SaveMustTail.emplace(MustTailCall, CE);
 
   // FIXME: Clean this up by using an LValue for ReturnTemp,
   // EmitStoreThroughLValue, and EmitAnyExpr.
@@ -1712,6 +1755,9 @@ void CodeGenFunction::EmitReturnStmt(const ReturnStmt &S) {
     ++NumSimpleReturnExprs;
 
   cleanupScope.ForceCleanup();
+  if (ReturnEWC)
+    incrementCallContinuationProfileCounter(
+        ReturnEWC, CallContinuationKind::FullExpression);
   EmitBranchThroughCleanup(ReturnBlock);
 }
 
@@ -1721,8 +1767,11 @@ void CodeGenFunction::EmitDeclStmt(const DeclStmt &S) {
   if (HaveInsertPoint())
     EmitStopPoint(&S);
 
-  for (const auto *I : S.decls())
+  for (const auto *I : S.decls()) {
     EmitDecl(*I, /*EvaluateConditionDecl=*/true);
+    incrementCallContinuationProfileCounter(I,
+                                            CallContinuationKind::Declaration);
+  }
 }
 
 auto CodeGenFunction::GetDestForLoopControlStmt(const LoopControlStmt &S)
@@ -2383,8 +2432,11 @@ void CodeGenFunction::EmitSwitchStmt(const SwitchStmt &S) {
 
       // Emit the condition variable if needed inside the entire cleanup scope
       // used by this special case for constant folded switches.
-      if (S.getConditionVariable())
+      if (S.getConditionVariable()) {
         EmitDecl(*S.getConditionVariable(), /*EvaluateConditionDecl=*/true);
+        incrementCallContinuationProfileCounter(
+            S.getConditionVariable(), CallContinuationKind::Declaration);
+      }
 
       // At this point, we are no longer "within" a switch instance, so
       // we can temporarily enforce this to ensure that any embedded case
@@ -2395,6 +2447,8 @@ void CodeGenFunction::EmitSwitchStmt(const SwitchStmt &S) {
       // specified series of statements and we're good.
       for (const Stmt *CaseStmt : CaseStmts)
         EmitStmt(CaseStmt);
+      if (CGM.getCodeGenOpts().CoverageCallContinuations)
+        ExecutedScope.ForceCleanup();
       incrementProfileCounter(&S);
       PGO->markStmtMaybeUsed(S.getBody());
 
@@ -2422,6 +2476,8 @@ void CodeGenFunction::EmitSwitchStmt(const SwitchStmt &S) {
     EmitDecl(*S.getConditionVariable());
   llvm::Value *CondV = EmitScalarExpr(S.getCond());
   MaybeEmitDeferredVarDeclInit(S.getConditionVariable());
+  incrementCallContinuationProfileCounter(S.getConditionVariable(),
+                                          CallContinuationKind::Declaration);
 
   // Create basic block to hold stuff that comes after switch
   // statement. We also need to create a default block now so that

@@ -15,7 +15,7 @@ int constructor_call(void) {
 }
 
 // IR-DAG: @__profc__Z16constructor_callv = private global [2 x i64]
-// IR-DAG: @__profc__ZN1CC2Ev = linkonce_odr hidden global [2 x i64]
+// IR-DAG: @__profc__ZN1CC2Ev = linkonce_odr hidden global [3 x i64]
 
 // IR-LABEL: define{{.*}} i32 @_Z16constructor_callv(
 // IR: call void @_ZN1CC1Ev
@@ -23,4 +23,4 @@ int constructor_call(void) {
 
 // IR-LABEL: define{{.*}} void @_ZN1CC2Ev(
 // IR: call{{.*}} @_Z10init_valuev
-// IR-NEXT: load i64, ptr getelementptr inbounds ([2 x i64], ptr @__profc__ZN1CC2Ev, i32 0, i32 1)
+// IR-NEXT: load i64, ptr getelementptr inbounds ([3 x i64], ptr @__profc__ZN1CC2Ev, i32 0, i32 1)

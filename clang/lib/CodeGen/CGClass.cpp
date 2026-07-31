@@ -837,6 +837,8 @@ void CodeGenFunction::EmitConstructorBody(FunctionArgList &Args) {
   // Emit the constructor prologue, i.e. the base and member
   // initializers.
   EmitCtorPrologue(Ctor, CtorType, Args);
+  incrementCallContinuationProfileCounter(
+      Body, CallContinuationKind::ConstructorPrologue);
 
   // Emit the body of the statement.
   if (IsTryBody)

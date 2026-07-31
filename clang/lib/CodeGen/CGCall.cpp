@@ -6762,8 +6762,11 @@ RValue CodeGenFunction::EmitVAArg(VAArgExpr *VE, Address &VAListAddr,
                    : (VE->isZOSABI() ? EmitZOSVAListRef(VE->getSubExpr())
                                      : EmitVAListRef(VE->getSubExpr()));
   QualType Ty = VE->getType();
-  if (Ty->isVariablyModifiedType())
+  if (Ty->isVariablyModifiedType()) {
     EmitVariablyModifiedType(Ty);
+    incrementCallContinuationProfileCounter(
+        VE, CallContinuationKind::VLAEvaluation);
+  }
   if (VE->isMicrosoftABI())
     return CGM.getABIInfo().EmitMSVAArg(*this, VAListAddr, Ty, Slot);
   if (VE->isZOSABI())

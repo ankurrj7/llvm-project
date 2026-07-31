@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "CodeGenPGO.h"
+#include "CGCXXABI.h"
 #include "CGDebugInfo.h"
 #include "CodeGenFunction.h"
 #include "CoverageMappingGen.h"
@@ -19,6 +20,9 @@
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/StmtVisitor.h"
 #include "clang/Basic/DiagnosticFrontend.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/MDBuilder.h"
@@ -26,6 +30,7 @@
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/SaveAndRestore.h"
+#include <limits>
 #include <optional>
 
 namespace llvm {
@@ -39,6 +44,476 @@ static llvm::cl::opt<bool>
 
 using namespace clang;
 using namespace CodeGen;
+
+void clang::CodeGen::visitVLATypeEvaluations(
+    QualType QTy, ASTContext &Context,
+    llvm::function_ref<void(const VLATypeEvaluation &)> Visit) {
+  assert(QTy->isVariablyModifiedType() && "expected a variably-modified type");
+
+  do {
+    assert(QTy->isVariablyModifiedType());
+    const Type *Ty = QTy.getTypePtr();
+    switch (Ty->getTypeClass()) {
+#define TYPE(Class, Base)
+#define ABSTRACT_TYPE(Class, Base)
+#define NON_CANONICAL_TYPE(Class, Base)
+#define DEPENDENT_TYPE(Class, Base) case clang::Type::Class:
+#define NON_CANONICAL_UNLESS_DEPENDENT_TYPE(Class, Base)
+#include "clang/AST/TypeNodes.inc"
+      llvm_unreachable("unexpected dependent type");
+
+    case clang::Type::Builtin:
+    case clang::Type::Complex:
+    case clang::Type::Vector:
+    case clang::Type::ExtVector:
+    case clang::Type::ConstantMatrix:
+    case clang::Type::Record:
+    case clang::Type::Enum:
+    case clang::Type::Using:
+    case clang::Type::TemplateSpecialization:
+    case clang::Type::ObjCTypeParam:
+    case clang::Type::ObjCObject:
+    case clang::Type::ObjCInterface:
+    case clang::Type::ObjCObjectPointer:
+    case clang::Type::BitInt:
+    case clang::Type::HLSLInlineSpirv:
+    case clang::Type::PredefinedSugar:
+      llvm_unreachable("type class is never variably-modified");
+
+    case clang::Type::Adjusted:
+      QTy = cast<AdjustedType>(Ty)->getAdjustedType();
+      break;
+    case clang::Type::Decayed:
+      QTy = cast<DecayedType>(Ty)->getPointeeType();
+      break;
+    case clang::Type::Pointer:
+      QTy = cast<PointerType>(Ty)->getPointeeType();
+      break;
+    case clang::Type::BlockPointer:
+      QTy = cast<BlockPointerType>(Ty)->getPointeeType();
+      break;
+    case clang::Type::LValueReference:
+    case clang::Type::RValueReference:
+      QTy = cast<ReferenceType>(Ty)->getPointeeType();
+      break;
+    case clang::Type::MemberPointer:
+      QTy = cast<MemberPointerType>(Ty)->getPointeeType();
+      break;
+
+    case clang::Type::ArrayParameter:
+    case clang::Type::ConstantArray:
+    case clang::Type::IncompleteArray:
+      QTy = cast<ArrayType>(Ty)->getElementType();
+      break;
+    case clang::Type::VariableArray: {
+      const auto *VAT = cast<VariableArrayType>(Ty);
+      if (const Expr *Size = VAT->getSizeExpr())
+        Visit({VLATypeEvaluationKind::ArrayBound, Size});
+      QTy = VAT->getElementType();
+      break;
+    }
+
+    case clang::Type::FunctionProto:
+    case clang::Type::FunctionNoProto:
+      QTy = cast<FunctionType>(Ty)->getReturnType();
+      break;
+
+    case clang::Type::Paren:
+    case clang::Type::TypeOf:
+    case clang::Type::UnaryTransform:
+    case clang::Type::Attributed:
+    case clang::Type::BTFTagAttributed:
+    case clang::Type::OverflowBehavior:
+    case clang::Type::HLSLAttributedResource:
+    case clang::Type::SubstTemplateTypeParm:
+    case clang::Type::MacroQualified:
+    case clang::Type::CountAttributed:
+      QTy = QTy.getSingleStepDesugaredType(Context);
+      break;
+
+    case clang::Type::Typedef:
+    case clang::Type::Decltype:
+    case clang::Type::Auto:
+    case clang::Type::DeducedTemplateSpecialization:
+    case clang::Type::PackIndexing:
+      return;
+
+    case clang::Type::TypeOfExpr: {
+      const Expr *Underlying = cast<TypeOfExprType>(Ty)->getUnderlyingExpr();
+      Visit({VLATypeEvaluationKind::TypeOfExpression, Underlying});
+      return;
+    }
+
+    case clang::Type::Atomic:
+      QTy = cast<AtomicType>(Ty)->getValueType();
+      break;
+    case clang::Type::Pipe:
+      QTy = cast<PipeType>(Ty)->getElementType();
+      break;
+    }
+  } while (QTy->isVariablyModifiedType());
+}
+
+void clang::CodeGen::visitCallContinuationCallChildren(
+    const CallExpr *E, bool ReverseDefaultArgs,
+    llvm::function_ref<void(const Stmt *)> Visit) {
+  SmallVector<const Stmt *, 8> Children(E->children());
+  assert(Children.size() >= E->getNumArgs());
+  unsigned PrefixSize = Children.size() - E->getNumArgs();
+  for (const Stmt *Child : ArrayRef(Children).take_front(PrefixSize))
+    if (Child)
+      Visit(Child);
+
+  SmallVector<const Expr *, 8> Args(E->arguments());
+  const auto *OperatorCall = dyn_cast<CXXOperatorCallExpr>(E);
+  const auto *Method =
+      OperatorCall
+          ? dyn_cast_if_present<CXXMethodDecl>(OperatorCall->getCalleeDecl())
+          : nullptr;
+
+  if (OperatorCall && OperatorCall->isAssignmentOp() && Method &&
+      Method->isImplicitObjectMemberFunction()) {
+    for (const Expr *Arg : llvm::reverse(llvm::drop_begin(Args)))
+      Visit(Arg);
+    if (!Args.empty())
+      Visit(Args.front());
+    return;
+  }
+
+  // IR generation always forms an implicit member operator's object before
+  // its explicit arguments. Static operators have the same source-level
+  // object slot in CXXOperatorCallExpr and emit it first as well. Only the
+  // remaining explicit arguments use the ABI-default or forced operator order.
+  if (OperatorCall && Method &&
+      (Method->isImplicitObjectMemberFunction() || Method->isStatic()) &&
+      !Args.empty()) {
+    Visit(Args.front());
+    Args.erase(Args.begin());
+  }
+
+  bool ReverseArgs = ReverseDefaultArgs;
+  if (OperatorCall) {
+    if (OperatorCall->isAssignmentOp())
+      ReverseArgs = true;
+    else
+      switch (OperatorCall->getOperator()) {
+      case OO_LessLess:
+      case OO_GreaterGreater:
+      case OO_AmpAmp:
+      case OO_PipePipe:
+      case OO_Comma:
+      case OO_ArrowStar:
+        ReverseArgs = false;
+        break;
+      default:
+        break;
+      }
+  }
+
+  if (ReverseArgs)
+    for (const Expr *Arg : llvm::reverse(Args))
+      Visit(Arg);
+  else
+    for (const Expr *Arg : Args)
+      Visit(Arg);
+}
+
+void clang::CodeGen::visitCallContinuationAtomicExprChildren(
+    const AtomicExpr *E, llvm::function_ref<void(const Stmt *)> Visit) {
+  Visit(E->getPtr());
+
+  if (E->getOp() == AtomicExpr::AO__c11_atomic_init ||
+      E->getOp() == AtomicExpr::AO__opencl_atomic_init) {
+    Visit(E->getVal1());
+    return;
+  }
+
+  Visit(E->getOrder());
+  if (E->getScopeModel())
+    Visit(E->getScope());
+
+  if (!E->hasVal1Operand())
+    return;
+  Visit(E->getVal1());
+
+  if (E->getOp() == AtomicExpr::AO__atomic_exchange ||
+      E->getOp() == AtomicExpr::AO__scoped_atomic_exchange || E->isCmpXChg())
+    Visit(E->getVal2());
+
+  if (!E->isCmpXChg())
+    return;
+  Visit(E->getOrderFail());
+  if (E->getOp() == AtomicExpr::AO__atomic_compare_exchange ||
+      E->getOp() == AtomicExpr::AO__atomic_compare_exchange_n ||
+      E->getOp() == AtomicExpr::AO__scoped_atomic_compare_exchange ||
+      E->getOp() == AtomicExpr::AO__scoped_atomic_compare_exchange_n)
+    Visit(E->getWeak());
+}
+
+/// Whether \p E can denote storage within a __block variable. Keep this in the
+/// shared ordering helper so aggregate emission, counter allocation, and
+/// coverage mapping cannot disagree about the special RHS-first lowering.
+static bool isBlockVarRef(const Expr *E) {
+  E = E->IgnoreParens();
+
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+    return VD && VD->hasAttr<BlocksAttr>();
+  }
+
+  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->isAssignmentOp() || BO->isPtrMemOp())
+      return isBlockVarRef(BO->getLHS());
+    if (BO->getOpcode() == BO_Comma)
+      return isBlockVarRef(BO->getRHS());
+    return false;
+  }
+  if (const auto *ACO = dyn_cast<AbstractConditionalOperator>(E))
+    return isBlockVarRef(ACO->getTrueExpr()) ||
+           isBlockVarRef(ACO->getFalseExpr());
+  if (const auto *OVE = dyn_cast<OpaqueValueExpr>(E))
+    return OVE->getSourceExpr() && isBlockVarRef(OVE->getSourceExpr());
+  if (const auto *Cast = dyn_cast<CastExpr>(E)) {
+    if (Cast->getCastKind() == CK_LValueToRValue)
+      return false;
+    return isBlockVarRef(Cast->getSubExpr());
+  }
+  if (const auto *UO = dyn_cast<UnaryOperator>(E))
+    return isBlockVarRef(UO->getSubExpr());
+  if (const auto *ME = dyn_cast<MemberExpr>(E))
+    return isBlockVarRef(ME->getBase());
+  if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E))
+    return isBlockVarRef(ASE->getBase());
+  return false;
+}
+
+bool clang::CodeGen::callContinuationAssignmentEvaluatesRHSFirst(
+    const BinaryOperator *E, const ASTContext &Context) {
+  QualType LHSType = E->getLHS()->getType();
+  QualType LHSValueType = LHSType;
+  if (const auto *Atomic = LHSType->getAs<AtomicType>())
+    LHSValueType = Atomic->getValueType();
+  // Aggregate assignment is emitted directly into an already-computed
+  // destination, except for a side-effecting assignment through __block
+  // storage: that fragile lowering deliberately computes the RHS first.
+  if (LHSValueType->isAggregateType())
+    return isBlockVarRef(E->getLHS()) && E->getRHS()->HasSideEffects(Context);
+
+  // Pointer-authenticated assignment needs the destination address to qualify
+  // the value. Scalar, complex, ARC, and compound-assignment lowering evaluate
+  // the RHS first.
+  return !LHSType.getPointerAuth();
+}
+
+static bool callContinuationNeedsNonTrivialPrimitiveCopy(QualType Type) {
+  switch (Type.isNonTrivialToPrimitiveCopy()) {
+  case QualType::PCK_ARCStrong:
+  case QualType::PCK_ARCWeak:
+  case QualType::PCK_Struct:
+    return true;
+  case QualType::PCK_Trivial:
+  case QualType::PCK_VolatileTrivial:
+  case QualType::PCK_PtrAuth:
+    return false;
+  }
+  llvm_unreachable("unknown primitive copy kind");
+}
+
+bool clang::CodeGen::callContinuationAssignmentNeedsCounter(
+    const BinaryOperator *E) {
+  if (!E->isAssignmentOp())
+    return false;
+  if (E->getLHS()->getType()->isAtomicType())
+    return true;
+  return E->getOpcode() == BO_Assign &&
+         callContinuationNeedsNonTrivialPrimitiveCopy(E->getLHS()->getType());
+}
+
+bool clang::CodeGen::callContinuationComplexOperationNeedsCounter(
+    const BinaryOperator *E) {
+  if (E->isAssignmentOp() && callContinuationAssignmentNeedsCounter(E))
+    return false;
+
+  auto IsFloatingComplex = [](QualType Type) {
+    const auto *Complex = Type->getAs<ComplexType>();
+    return Complex && Complex->getElementType()->isFloatingType();
+  };
+
+  switch (E->getOpcode()) {
+  case BO_Mul:
+  case BO_MulAssign:
+    return IsFloatingComplex(E->getLHS()->getType()) &&
+           IsFloatingComplex(E->getRHS()->getType());
+  case BO_Div:
+  case BO_DivAssign:
+    return IsFloatingComplex(E->getRHS()->getType());
+  default:
+    return false;
+  }
+}
+
+bool clang::CodeGen::callContinuationOverflowOperationNeedsCounter(
+    const Expr *E, const LangOptions &Opts) {
+  QualType Type;
+  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+    if (UO->getSubExpr()->getType()->isAtomicType())
+      return false;
+    switch (UO->getOpcode()) {
+    case UO_Minus:
+    case UO_PostInc:
+    case UO_PostDec:
+    case UO_PreInc:
+    case UO_PreDec:
+      Type = UO->getType();
+      break;
+    default:
+      return false;
+    }
+  } else if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->isAssignmentOp() && BO->getLHS()->getType()->isAtomicType())
+      return false;
+    switch (BO->getOpcode()) {
+    case BO_Add:
+    case BO_Sub:
+    case BO_Mul:
+      Type = BO->getType();
+      break;
+    case BO_AddAssign:
+    case BO_SubAssign:
+    case BO_MulAssign:
+      Type = cast<CompoundAssignOperator>(BO)->getComputationResultType();
+      break;
+    default:
+      return false;
+    }
+  } else {
+    return false;
+  }
+
+  if (const auto *OBT = Type->getAs<OverflowBehaviorType>())
+    return OBT->getBehaviorKind() ==
+           OverflowBehaviorType::OverflowBehaviorKind::Trap;
+  return Type->isSignedIntegerOrEnumerationType() &&
+         Opts.getSignedOverflowBehavior() == LangOptions::SOB_Trapping;
+}
+
+bool clang::CodeGen::callContinuationBlockLiteralNeedsCounter(
+    const BlockExpr *E) {
+  for (const BlockDecl::Capture &Capture : E->getBlockDecl()->captures()) {
+    if (Capture.isByRef())
+      continue;
+    if (Capture.hasCopyExpr() || callContinuationNeedsNonTrivialPrimitiveCopy(
+                                     Capture.getVariable()->getType()))
+      return true;
+  }
+  return false;
+}
+
+bool clang::CodeGen::callContinuationBlockLiteralHasCleanup(
+    const BlockExpr *E) {
+  return llvm::any_of(
+      E->getBlockDecl()->captures(), [](const BlockDecl::Capture &Capture) {
+        return !Capture.isByRef() &&
+               Capture.getVariable()->getType().isDestructedType() !=
+                   QualType::DK_none;
+      });
+}
+
+bool clang::CodeGen::callContinuationTLSAccessNeedsCounter(const Expr *E,
+                                                           CodeGenModule &) {
+  const VarDecl *VD = nullptr;
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))
+    VD = dyn_cast<VarDecl>(DRE->getDecl());
+  else if (const auto *ME = dyn_cast<MemberExpr>(E))
+    VD = dyn_cast<VarDecl>(ME->getMemberDecl());
+
+  if (!VD || VD->hasAttr<WeakRefAttr>() || VD->isStaticLocal() ||
+      (!VD->hasLinkage() && !VD->isStaticDataMember()))
+    return false;
+  // Keep inline/COMDAT counter layouts source-stable across translation units.
+  // A defining TU can know that TLS is constant-initialized and access it
+  // directly while an extern-only TU calls a wrapper. Reserve and emit the
+  // continuation for global TLS on both paths; the direct-path increment is
+  // harmless and preserves one ODR profile identity.
+  return VD->getTLSKind() != VarDecl::TLS_None;
+}
+
+bool clang::CodeGen::callContinuationEvaluatesVLAExtent(
+    const UnaryExprOrTypeTraitExpr *E, const ASTContext &Context) {
+  UnaryExprOrTypeTrait Kind = E->getKind();
+  if (Kind != UETT_SizeOf && Kind != UETT_DataSizeOf && Kind != UETT_CountOf)
+    return false;
+
+  const VariableArrayType *VAT =
+      Context.getAsVariableArrayType(E->getTypeOfArgument());
+  if (!VAT)
+    return false;
+
+  // Match ScalarExprEmitter exactly: _Countof does not evaluate a constant
+  // outer extent merely because an inner array extent is variable.
+  if (Kind == UETT_CountOf && VAT->getElementType()->isArrayType())
+    return !VAT->getSizeExpr()->isIntegerConstantExpr(Context);
+  return true;
+}
+
+void clang::CodeGen::visitCallContinuationConstructChildren(
+    const CXXConstructExpr *E, bool ReverseDefaultArgs,
+    llvm::function_ref<void(const Stmt *)> Visit) {
+  bool ReverseArgs = ReverseDefaultArgs && !E->isListInitialization();
+  if (ReverseArgs)
+    for (const Expr *Arg : llvm::reverse(E->arguments()))
+      Visit(Arg);
+  else
+    for (const Expr *Arg : E->arguments())
+      Visit(Arg);
+}
+
+void clang::CodeGen::visitCallContinuationRewrittenOperatorChildren(
+    const CXXRewrittenBinaryOperator *E, bool ReverseDefaultArgs,
+    llvm::function_ref<void(const Stmt *)> Visit) {
+  const Expr *Inner = E->getDecomposedForm().InnerBinOp;
+  if (const auto *Call = dyn_cast<CallExpr>(Inner)) {
+    visitCallContinuationCallChildren(Call, ReverseDefaultArgs, Visit);
+    return;
+  }
+
+  // Built-in rewritten comparisons are unusual, but their semantic inner
+  // expression is still the exact expression CodeGen evaluates.
+  for (const Stmt *Child : Inner->children())
+    if (Child)
+      Visit(Child);
+}
+
+void clang::CodeGen::visitCallContinuationObjCMessageChildren(
+    const ObjCMessageExpr *E, bool ReverseDefaultArgs,
+    llvm::function_ref<void(const Stmt *)> Visit) {
+  if (E->getReceiverKind() == ObjCMessageExpr::Instance)
+    Visit(E->getInstanceReceiver());
+
+  if (ReverseDefaultArgs)
+    for (const Expr *Arg : llvm::reverse(E->arguments()))
+      Visit(Arg);
+  else
+    for (const Expr *Arg : E->arguments())
+      Visit(Arg);
+}
+
+void clang::CodeGen::visitCallContinuationPseudoObjectSemantics(
+    const PseudoObjectExpr *E, llvm::function_ref<void(const Expr *)> Visit) {
+  for (const Expr *Semantic : E->semantics()) {
+    const auto *OVE = dyn_cast<OpaqueValueExpr>(Semantic);
+    if (!OVE) {
+      Visit(Semantic);
+      continue;
+    }
+
+    // This is the point at which CodeGen binds a shared opaque value and
+    // evaluates its source. A unique opaque value has no binding; its source
+    // is evaluated only if and when a semantic expression actually uses it.
+    if (!OVE->isUnique())
+      Visit(OVE->getSourceExpr());
+  }
+}
 
 void CodeGenPGO::setFuncName(StringRef Name,
                              llvm::GlobalValue::LinkageTypes Linkage) {
@@ -142,7 +617,32 @@ public:
 
     CallContinuationCounters,
     CallContinuationCounter,
-
+    CallContinuationConstruct,
+    CallContinuationDefaultArgument,
+    CallContinuationDefaultInitializer,
+    CallContinuationArrayInitialization,
+    CallContinuationVLAEvaluation,
+    CallContinuationDeclaration,
+    CallContinuationFullExpression,
+    CallContinuationNewExpression,
+    CallContinuationNewInitializer,
+    CallContinuationDeleteExpression,
+    CallContinuationDynamicCast,
+    CallContinuationTypeidExpression,
+    CallContinuationRewrittenOperator,
+    CallContinuationObjCMessage,
+    CallContinuationPseudoObject,
+    CallContinuationConstructorPrologue,
+    CallContinuationCoroutineSuspend,
+    CallContinuationCoroutineBody,
+    CallContinuationCompoundFallthrough,
+    CallContinuationIfExit,
+    CallContinuationLoopBody,
+    CallContinuationLoopContinue,
+    CallContinuationLoopBackedge,
+    CallContinuationLoopExit,
+    CallContinuationLayout,
+    CallContinuationImplicitOperation,
     // Keep this last.  It's for the static assert that follows.
     LastHashType
   };
@@ -151,6 +651,7 @@ public:
   PGOHash(PGOHashVersion HashVersion)
       : Working(0), Count(0), HashVersion(HashVersion) {}
   void combine(HashType Type);
+  void combineStableValue(uint32_t Value);
   uint64_t finalize();
   PGOHashVersion getHashVersion() const { return HashVersion; }
 };
@@ -179,19 +680,36 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
   /// The function hash.
   PGOHash Hash;
   ASTContext &Context;
+  CodeGenModule &CGM;
   /// The map of statements to counters.
   llvm::DenseMap<const Stmt *, CounterPair> &CounterMap;
-  /// The map of calls to counters reached only when the call returns.
-  llvm::DenseMap<const Stmt *, unsigned> *CallContinuationCounterMap;
-  /// Call-like expressions that need continuation counters assigned after
-  /// normal counters.
-  SmallVector<const Stmt *, 8> CallContinuations;
+  /// Normal-completion counters for calls and implicit C++ operations.
+  CallContinuationCounterMap *CallContinuationCounters;
+  /// Exact, ordered run-time expressions evaluated by each VM-type site.
+  VLATypeEvaluationMap *VLATypeEvaluations;
+  /// Continuations are assigned after ordinary region counters.
+  SmallVector<CallContinuationKey, 8> CallContinuations;
+  /// Prevent shared or rewritten AST nodes from reserving a counter twice.
+  llvm::DenseSet<CallContinuationKey> CallContinuationSet;
+  /// Kinds owned by each AST node. The ordinary structural hash traversal
+  /// interleaves these markers with its stable branch/scope tokens.
+  llvm::DenseMap<CallContinuationOwner, uint64_t> CallContinuationKindsByOwner;
+  /// Stable preorder among only nodes that own continuation counters. This is
+  /// independent of source offsets and unrelated AST nodes.
+  llvm::DenseMap<CallContinuationOwner, uint32_t> CallContinuationNodeOrdinal;
+  uint32_t NextCallContinuationNodeOrdinal = 0;
   /// The state of MC/DC Coverage in this function.
   MCDC::State &MCDCState;
   /// Maximum number of supported MC/DC conditions in a boolean expression.
   unsigned MCDCMaxCond;
   /// Whether call-continuation coverage counters are enabled.
   bool CoverageCallContinuations;
+  /// Whether the emitted function uses the swiftasynccall convention.
+  bool IsSwiftAsyncFunction;
+  /// Whether this constructor variant emits virtual-base initializers.
+  bool EmitVirtualBaseInitializers;
+  /// Whether the target's default C++ argument order is right-to-left.
+  bool ReverseDefaultCallArgs;
   /// The call currently marked as musttail, if any.
   const CallExpr *MustTailCall = nullptr;
   /// The profile version.
@@ -199,23 +717,35 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
   /// Diagnostics Engine used to report warnings.
   DiagnosticsEngine &Diag;
 
-  MapRegionCounters(
-      PGOHashVersion HashVersion, uint64_t ProfileVersion,
-      llvm::DenseMap<const Stmt *, CounterPair> &CounterMap,
-      llvm::DenseMap<const Stmt *, unsigned> *CallContinuationCounterMap,
-      MCDC::State &MCDCState, unsigned MCDCMaxCond,
-      bool CoverageCallContinuations, ASTContext &Context,
-      DiagnosticsEngine &Diag)
-      : NextCounter(0), Hash(HashVersion), Context(Context),
+  MapRegionCounters(PGOHashVersion HashVersion, uint64_t ProfileVersion,
+                    llvm::DenseMap<const Stmt *, CounterPair> &CounterMap,
+                    CallContinuationCounterMap *CallContinuationCounters,
+                    VLATypeEvaluationMap *VLATypeEvaluations,
+                    MCDC::State &MCDCState, unsigned MCDCMaxCond,
+                    bool CoverageCallContinuations, bool IsSwiftAsyncFunction,
+                    bool EmitVirtualBaseInitializers,
+                    bool ReverseDefaultCallArgs, ASTContext &Context,
+                    DiagnosticsEngine &Diag, CodeGenModule &CGM)
+      : NextCounter(0), Hash(HashVersion), Context(Context), CGM(CGM),
         CounterMap(CounterMap),
-        CallContinuationCounterMap(CallContinuationCounterMap),
-        MCDCState(MCDCState), MCDCMaxCond(MCDCMaxCond),
+        CallContinuationCounters(CallContinuationCounters),
+        VLATypeEvaluations(VLATypeEvaluations), MCDCState(MCDCState),
+        MCDCMaxCond(MCDCMaxCond),
         CoverageCallContinuations(CoverageCallContinuations),
+        IsSwiftAsyncFunction(IsSwiftAsyncFunction),
+        EmitVirtualBaseInitializers(EmitVirtualBaseInitializers),
+        ReverseDefaultCallArgs(ReverseDefaultCallArgs),
         ProfileVersion(ProfileVersion), Diag(Diag) {}
 
-  // Blocks and lambdas are handled as separate functions, so we need not
-  // traverse them in the parent context.
-  bool TraverseBlockExpr(BlockExpr *BE) { return true; }
+  // Block bodies are separate functions. With continuation coverage enabled,
+  // the literal itself can own a capture-construction completion counter in
+  // the parent function, but its body and synthetic copy expressions remain
+  // opaque here.
+  bool TraverseBlockExpr(BlockExpr *BE) {
+    if (!CoverageCallContinuations)
+      return true;
+    return WalkUpFromBlockExpr(BE);
+  }
   bool TraverseLambdaExpr(LambdaExpr *LE) {
     // Traverse the captures, but not the body.
     for (auto C : zip(LE->captures(), LE->capture_inits()))
@@ -223,6 +753,26 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
     return true;
   }
   bool TraverseCapturedStmt(CapturedStmt *CS) { return true; }
+
+  bool TraverseInitListExpr(InitListExpr *S,
+                            DataRecursionQueue *Queue = nullptr) {
+    if (!CoverageCallContinuations)
+      return Base::TraverseInitListExpr(S, Queue);
+
+    // Collection and CodeGen evaluate the semantic form, which can contain
+    // implicit constructors and fillers absent from the written form. Visit
+    // that form exactly once so every emitted continuation receives a stable
+    // structural-hash ordinal.
+    InitListExpr *Semantic = S->isSemanticForm() ? S : S->getSemanticForm();
+    if (!Semantic)
+      Semantic = S;
+    if (!WalkUpFromInitListExpr(Semantic))
+      return false;
+    for (Stmt *Child : Semantic->children())
+      if (Child && !TraverseStmt(Child, Queue))
+        return false;
+    return true;
+  }
 
   static const CallExpr *getMustTailCall(const AttributedStmt *S) {
     for (const Attr *A : S->getAttrs()) {
@@ -247,6 +797,141 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
     return Base::TraverseAttributedStmt(S);
   }
 
+  bool TraverseCXXDefaultArgExpr(CXXDefaultArgExpr *E) {
+    return Base::TraverseCXXDefaultArgExpr(E);
+  }
+
+  bool TraverseCXXDefaultInitExpr(CXXDefaultInitExpr *E) {
+    if (!CoverageCallContinuations)
+      return Base::TraverseCXXDefaultInitExpr(E);
+    if (!Base::TraverseCXXDefaultInitExpr(E))
+      return false;
+    return TraverseStmt(E->getExpr());
+  }
+
+  ArrayRef<const Expr *>
+  getVLATypeEvaluationPlan(CallContinuationOwner Owner) const {
+    if (!VLATypeEvaluations)
+      return {};
+    auto I = VLATypeEvaluations->find(Owner);
+    if (I == VLATypeEvaluations->end())
+      return {};
+    return I->second;
+  }
+
+  bool traverseVLATypeEvaluationPlan(CallContinuationOwner Owner) {
+    for (const Expr *Expression : getVLATypeEvaluationPlan(Owner))
+      if (!TraverseStmt(const_cast<Expr *>(Expression)))
+        return false;
+    return true;
+  }
+
+  bool TraverseVariableArrayTypeLoc(VariableArrayTypeLoc TL,
+                                    bool TraverseQualifier) {
+    if (!CoverageCallContinuations)
+      return Base::TraverseVariableArrayTypeLoc(TL, TraverseQualifier);
+    // Runtime bounds are traversed from the recorded per-site evaluation plan.
+    // Keep walking the written element type, but do not independently
+    // rediscover or reorder its size expression here.
+    return TraverseTypeLoc(TL.getElementLoc(), TraverseQualifier);
+  }
+
+  bool TraverseTypeOfExprTypeLoc(TypeOfExprTypeLoc TL, bool TraverseQualifier) {
+    if (!CoverageCallContinuations)
+      return Base::TraverseTypeOfExprTypeLoc(TL, TraverseQualifier);
+    return true;
+  }
+
+  bool TraverseVarDecl(VarDecl *D) {
+    if (!CoverageCallContinuations)
+      return Base::TraverseVarDecl(D);
+    if (!WalkUpFromVarDecl(D))
+      return false;
+    if (TypeSourceInfo *TSI = D->getTypeSourceInfo())
+      if (!TraverseTypeLoc(TSI->getTypeLoc()))
+        return false;
+    if (!traverseVLATypeEvaluationPlan(D))
+      return false;
+    if (!isa<ParmVarDecl>(D) &&
+        (!D->isCXXForRangeDecl() || shouldVisitImplicitCode()))
+      return TraverseStmt(D->getInit());
+    return true;
+  }
+
+  bool TraverseParmVarDecl(ParmVarDecl *D) {
+    if (!CoverageCallContinuations)
+      return Base::TraverseParmVarDecl(D);
+    if (!WalkUpFromParmVarDecl(D))
+      return false;
+    if (TypeSourceInfo *TSI = D->getTypeSourceInfo())
+      if (!TraverseTypeLoc(TSI->getTypeLoc()))
+        return false;
+    return traverseVLATypeEvaluationPlan(D);
+  }
+
+  bool TraverseTypedefDecl(TypedefDecl *D) {
+    if (!CoverageCallContinuations)
+      return Base::TraverseTypedefDecl(D);
+    if (!WalkUpFromTypedefDecl(D) ||
+        !TraverseTypeLoc(D->getTypeSourceInfo()->getTypeLoc()))
+      return false;
+    return traverseVLATypeEvaluationPlan(D);
+  }
+
+  bool TraverseTypeAliasDecl(TypeAliasDecl *D) {
+    if (!CoverageCallContinuations)
+      return Base::TraverseTypeAliasDecl(D);
+    if (!WalkUpFromTypeAliasDecl(D) ||
+        !TraverseTypeLoc(D->getTypeSourceInfo()->getTypeLoc()))
+      return false;
+    return traverseVLATypeEvaluationPlan(D);
+  }
+
+#define TRAVERSE_EXPLICIT_VLA_CAST(Class)                                      \
+  bool Traverse##Class(Class *E) {                                             \
+    if (getVLATypeEvaluationPlan(E).empty())                                   \
+      return Base::Traverse##Class(E);                                         \
+    if (!WalkUpFrom##Class(E) || !traverseVLATypeEvaluationPlan(E))            \
+      return false;                                                            \
+    return TraverseStmt(E->getSubExpr());                                      \
+  }
+
+  TRAVERSE_EXPLICIT_VLA_CAST(CStyleCastExpr)
+  TRAVERSE_EXPLICIT_VLA_CAST(CXXFunctionalCastExpr)
+  TRAVERSE_EXPLICIT_VLA_CAST(CXXAddrspaceCastExpr)
+  TRAVERSE_EXPLICIT_VLA_CAST(CXXConstCastExpr)
+  TRAVERSE_EXPLICIT_VLA_CAST(CXXDynamicCastExpr)
+  TRAVERSE_EXPLICIT_VLA_CAST(CXXReinterpretCastExpr)
+  TRAVERSE_EXPLICIT_VLA_CAST(CXXStaticCastExpr)
+  TRAVERSE_EXPLICIT_VLA_CAST(BuiltinBitCastExpr)
+  TRAVERSE_EXPLICIT_VLA_CAST(ObjCBridgedCastExpr)
+
+#undef TRAVERSE_EXPLICIT_VLA_CAST
+
+  bool TraverseCompoundLiteralExpr(CompoundLiteralExpr *E) {
+    if (getVLATypeEvaluationPlan(E).empty())
+      return Base::TraverseCompoundLiteralExpr(E);
+    if (!WalkUpFromCompoundLiteralExpr(E) || !traverseVLATypeEvaluationPlan(E))
+      return false;
+    return TraverseStmt(E->getInitializer());
+  }
+
+  bool TraverseVAArgExpr(VAArgExpr *E) {
+    if (getVLATypeEvaluationPlan(E).empty())
+      return Base::TraverseVAArgExpr(E);
+    if (!WalkUpFromVAArgExpr(E) || !TraverseStmt(E->getSubExpr()))
+      return false;
+    return traverseVLATypeEvaluationPlan(E);
+  }
+
+  bool TraverseUnaryExprOrTypeTraitExpr(UnaryExprOrTypeTraitExpr *E) {
+    if (getVLATypeEvaluationPlan(E).empty())
+      return Base::TraverseUnaryExprOrTypeTraitExpr(E);
+    if (!WalkUpFromUnaryExprOrTypeTraitExpr(E))
+      return false;
+    return traverseVLATypeEvaluationPlan(E);
+  }
+
   bool VisitDecl(const Decl *D) {
     switch (D->getKind()) {
     default:
@@ -262,6 +947,7 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
       CounterMap[D->getBody()] = NextCounter++;
       break;
     }
+    hashCallContinuationMarkers(D);
     return true;
   }
 
@@ -409,20 +1095,92 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
     return true;
   }
 
-  void addCallContinuation(const CallExpr *S, const CallExpr *CurrentMustTail) {
-    if (CoverageCallContinuations && CallContinuationCounterMap &&
-        !isNoReturnCall(S) && S != CurrentMustTail) {
-      CallContinuations.push_back(S);
-      Hash.combine(PGOHash::CallContinuationCounter);
+  static PGOHash::HashType
+  getCallContinuationHashType(CallContinuationKind Kind) {
+    switch (Kind) {
+    case CallContinuationKind::Call:
+      return PGOHash::CallContinuationCounter;
+    case CallContinuationKind::Construct:
+      return PGOHash::CallContinuationConstruct;
+    case CallContinuationKind::DefaultArgument:
+      return PGOHash::CallContinuationDefaultArgument;
+    case CallContinuationKind::DefaultInitializer:
+      return PGOHash::CallContinuationDefaultInitializer;
+    case CallContinuationKind::ArrayInitialization:
+      return PGOHash::CallContinuationArrayInitialization;
+    case CallContinuationKind::VLAEvaluation:
+      return PGOHash::CallContinuationVLAEvaluation;
+    case CallContinuationKind::Declaration:
+      return PGOHash::CallContinuationDeclaration;
+    case CallContinuationKind::FullExpression:
+      return PGOHash::CallContinuationFullExpression;
+    case CallContinuationKind::NewExpression:
+      return PGOHash::CallContinuationNewExpression;
+    case CallContinuationKind::NewInitializer:
+      return PGOHash::CallContinuationNewInitializer;
+    case CallContinuationKind::DeleteExpression:
+      return PGOHash::CallContinuationDeleteExpression;
+    case CallContinuationKind::DynamicCast:
+      return PGOHash::CallContinuationDynamicCast;
+    case CallContinuationKind::TypeidExpression:
+      return PGOHash::CallContinuationTypeidExpression;
+    case CallContinuationKind::RewrittenOperator:
+      return PGOHash::CallContinuationRewrittenOperator;
+    case CallContinuationKind::ObjCMessage:
+      return PGOHash::CallContinuationObjCMessage;
+    case CallContinuationKind::PseudoObject:
+      return PGOHash::CallContinuationPseudoObject;
+    case CallContinuationKind::ConstructorPrologue:
+      return PGOHash::CallContinuationConstructorPrologue;
+    case CallContinuationKind::CoroutineSuspend:
+      return PGOHash::CallContinuationCoroutineSuspend;
+    case CallContinuationKind::CoroutineBody:
+      return PGOHash::CallContinuationCoroutineBody;
+    case CallContinuationKind::CompoundFallthrough:
+      return PGOHash::CallContinuationCompoundFallthrough;
+    case CallContinuationKind::IfExit:
+      return PGOHash::CallContinuationIfExit;
+    case CallContinuationKind::LoopBody:
+      return PGOHash::CallContinuationLoopBody;
+    case CallContinuationKind::LoopContinue:
+      return PGOHash::CallContinuationLoopContinue;
+    case CallContinuationKind::LoopBackedge:
+      return PGOHash::CallContinuationLoopBackedge;
+    case CallContinuationKind::LoopExit:
+      return PGOHash::CallContinuationLoopExit;
+    case CallContinuationKind::Assignment:
+    case CallContinuationKind::BlockLiteral:
+    case CallContinuationKind::AtomicOperation:
+    case CallContinuationKind::TLSAccess:
+    case CallContinuationKind::ComplexOperation:
+    case CallContinuationKind::OverflowOperation:
+      return PGOHash::CallContinuationImplicitOperation;
     }
+    llvm_unreachable("unknown call continuation kind");
+  }
+
+  void
+  addCallContinuation(CallContinuationOwner Owner,
+                      CallContinuationKind Kind = CallContinuationKind::Call) {
+    CallContinuationKey Key(Owner, Kind);
+    if (!CoverageCallContinuations || !CallContinuationCounters ||
+        !CallContinuationSet.insert(Key).second)
+      return;
+
+    CallContinuations.push_back(Key);
+    static_assert(llvm::to_underlying(CallContinuationKind::Last) < 64);
+    CallContinuationKindsByOwner[Owner] |= uint64_t(1)
+                                           << llvm::to_underlying(Kind);
+  }
+
+  void addCallContinuation(const CallExpr *S, const CallExpr *CurrentMustTail) {
+    if (!isNoReturnCall(S) && S != CurrentMustTail)
+      addCallContinuation(S, CallContinuationKind::Call);
   }
 
   void addCallContinuation(const CXXConstructExpr *S) {
-    if (CoverageCallContinuations && CallContinuationCounterMap &&
-        shouldEmitCXXConstructContinuation(S)) {
-      CallContinuations.push_back(S);
-      Hash.combine(PGOHash::CallContinuationCounter);
-    }
+    if (shouldEmitCXXConstructContinuation(S))
+      addCallContinuation(S, CallContinuationKind::Construct);
   }
 
   // Continuation counters are emitted from codegen, so collection has to match
@@ -431,11 +1189,202 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
   // unevaluated contexts that will never be emitted.
   struct CollectCallContinuations
       : public ConstEvaluatedExprVisitor<CollectCallContinuations> {
-    MapRegionCounters &Owner;
-    const CallExpr *MustTailCall = nullptr;
+    using Base = ConstEvaluatedExprVisitor<CollectCallContinuations>;
 
-    CollectCallContinuations(ASTContext &Context, MapRegionCounters &Owner)
-        : ConstEvaluatedExprVisitor(Context), Owner(Owner) {}
+    MapRegionCounters &Owner;
+    const Stmt *RootBody;
+    const CallExpr *MustTailCall = nullptr;
+    bool InPseudoObjectSemantics = false;
+    llvm::DenseSet<const Expr *> SeenVLASizeExpressions;
+    llvm::DenseSet<const VarDecl *> ConditionVariables;
+
+    CollectCallContinuations(ASTContext &Context, MapRegionCounters &Owner,
+                             const Stmt *RootBody)
+        : Base(Context), Owner(Owner), RootBody(RootBody) {}
+
+    bool shouldVisitDiscardedStmt() const { return false; }
+
+    void recordVLATypeEvaluation(CallContinuationOwner EvaluationOwner,
+                                 QualType Type) {
+      if (!Type->isVariablyModifiedType())
+        return;
+
+      VLATypeEvaluationPlan Plan;
+      visitVLATypeEvaluations(
+          Type, Owner.Context, [&](const VLATypeEvaluation &Evaluation) {
+            if (Evaluation.Kind == VLATypeEvaluationKind::ArrayBound &&
+                SeenVLASizeExpressions.contains(Evaluation.Expression))
+              return;
+
+            Plan.push_back(Evaluation.Expression);
+            Visit(Evaluation.Expression);
+            if (Evaluation.Kind == VLATypeEvaluationKind::ArrayBound)
+              SeenVLASizeExpressions.insert(Evaluation.Expression);
+          });
+
+      if (Plan.empty())
+        return;
+      bool Inserted = Owner.VLATypeEvaluations
+                          ->try_emplace(EvaluationOwner, std::move(Plan))
+                          .second;
+      assert(Inserted && "VM-type site collected more than once");
+      if (Inserted)
+        Owner.addCallContinuation(EvaluationOwner,
+                                  CallContinuationKind::VLAEvaluation);
+    }
+
+    void VisitExplicitCastExpr(const ExplicitCastExpr *S) {
+      recordVLATypeEvaluation(S, S->getType());
+      Visit(S->getSubExpr());
+    }
+
+    void VisitCompoundLiteralExpr(const CompoundLiteralExpr *S) {
+      if (!S->isFileScope())
+        recordVLATypeEvaluation(S, S->getType());
+      Visit(S->getInitializer());
+    }
+
+    void VisitVAArgExpr(const VAArgExpr *S) {
+      Visit(S->getSubExpr());
+      recordVLATypeEvaluation(S, S->getType());
+    }
+
+    void seedParameterVLAEvaluations(const Decl *D) {
+      const auto *FD = dyn_cast<FunctionDecl>(D);
+      if (!FD || FD->hasAttr<NakedAttr>())
+        return;
+
+      if (const auto *MD = dyn_cast<CXXMethodDecl>(FD);
+          MD && MD->getParent()->isLambda() &&
+          MD->getOverloadedOperator() == OO_Call)
+        for (const FieldDecl *Field : MD->getParent()->fields())
+          if (Field->hasCapturedVLAType())
+            SeenVLASizeExpressions.insert(
+                Field->getCapturedVLAType()->getSizeExpr());
+
+      for (const ParmVarDecl *PVD : FD->parameters()) {
+        QualType Type = PVD->getOriginalType();
+        if (!Type->isVariablyModifiedType())
+          continue;
+        visitVLATypeEvaluations(
+            Type, Owner.Context, [&](const VLATypeEvaluation &Evaluation) {
+              if (Evaluation.Kind == VLATypeEvaluationKind::ArrayBound)
+                SeenVLASizeExpressions.insert(Evaluation.Expression);
+            });
+      }
+    }
+
+    static bool stmtHasLifetimeExtendedCleanup(const Stmt *S) {
+      if (!S)
+        return false;
+      if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(S)) {
+        QualType TemporaryType = MTE->getSubExpr()->getType();
+        if (MTE->getStorageDuration() == SD_Automatic &&
+            (TemporaryType.isDestructedType() != QualType::DK_none ||
+             MTE->getType().getObjCLifetime() == Qualifiers::OCL_Strong ||
+             MTE->getType().getObjCLifetime() == Qualifiers::OCL_Weak))
+          return true;
+      }
+      if (isa<LambdaExpr>(S))
+        return false;
+      if (const auto *BE = dyn_cast<BlockExpr>(S))
+        return callContinuationBlockLiteralHasCleanup(BE);
+      return llvm::any_of(S->children(), stmtHasLifetimeExtendedCleanup);
+    }
+
+    static bool declNeedsCallCleanup(const Decl *D, ASTContext &Context) {
+      const auto *VD = dyn_cast<VarDecl>(D);
+      return VD && (VD->needsDestruction(Context) != QualType::DK_none ||
+                    VD->isEscapingByref() || VD->hasAttr<CleanupAttr>() ||
+                    stmtHasLifetimeExtendedCleanup(VD->getInit()));
+    }
+
+    static bool stmtHasCleanupInCurrentCompound(const Stmt *S,
+                                                ASTContext &Context) {
+      if (const auto *DS = dyn_cast_or_null<DeclStmt>(S))
+        return llvm::any_of(DS->decls(), [&](const Decl *D) {
+          return declNeedsCallCleanup(D, Context);
+        });
+
+      // Labels and attributes do not introduce a cleanup scope. A declaration
+      // directly beneath one is still destroyed at the enclosing compound's
+      // fallthrough. Stop at nested compounds/control statements, which own
+      // their own normal-completion boundary.
+      if (const auto *LS = dyn_cast_or_null<LabelStmt>(S))
+        return stmtHasCleanupInCurrentCompound(LS->getSubStmt(), Context);
+      if (const auto *AS = dyn_cast_or_null<AttributedStmt>(S))
+        return stmtHasCleanupInCurrentCompound(AS->getSubStmt(), Context);
+      if (const auto *SC = dyn_cast_or_null<SwitchCase>(S))
+        return stmtHasCleanupInCurrentCompound(SC->getSubStmt(), Context);
+      return false;
+    }
+
+    bool compoundNeedsCallCleanup(const CompoundStmt *S) const {
+      return llvm::any_of(S->body(), [&](const Stmt *Child) {
+        return stmtHasCleanupInCurrentCompound(Child, Owner.Context);
+      });
+    }
+
+    bool varDeclNeedsContinuation(const VarDecl *VD) const {
+      if (!VD || VD->isImplicit() || VD->hasExternalStorage())
+        return false;
+
+      // A condition declaration is not complete until contextual conversion
+      // and any deferred structured-binding initializers have completed.
+      if (ConditionVariables.contains(VD))
+        return true;
+
+      // A local static or thread_local declaration can perform hidden guard
+      // release or destructor registration after its written initializer.
+      if (VD->getStorageDuration() != SD_Automatic)
+        return VD->hasInit() && (!VD->hasConstantInitialization() ||
+                                 VD->needsDestruction(Owner.Context) ==
+                                     QualType::DK_cxx_destructor);
+
+      // Tuple-like structured bindings synthesize get<I> calls in holding
+      // variables that are not children of the written DeclStmt.
+      if (const auto *DD = dyn_cast<DecompositionDecl>(VD))
+        if (llvm::any_of(DD->flat_bindings(), [](const BindingDecl *Binding) {
+              return Binding->getHoldingVar() != nullptr;
+            }))
+          return true;
+
+      // Non-trivial C structs can require a compiler-generated default
+      // initializer even though the VarDecl has no AST initializer.
+      return !VD->hasInit() &&
+             VD->getType().isNonTrivialToPrimitiveDefaultInitialize() ==
+                 QualType::PDIK_Struct;
+    }
+
+    bool stmtContainsCallCleanup(const Stmt *S) const {
+      if (!S)
+        return false;
+      if (const auto *DS = dyn_cast<DeclStmt>(S))
+        for (const Decl *D : DS->decls())
+          if (declNeedsCallCleanup(D, Owner.Context))
+            return true;
+      if (const auto *EWC = dyn_cast<ExprWithCleanups>(S);
+          EWC && EWC->cleanupsHaveSideEffects())
+        return true;
+      if (isa<LambdaExpr>(S) || isa<BlockExpr>(S))
+        return false;
+      if (const auto *If = dyn_cast<IfStmt>(S); If && If->isConsteval()) {
+        const Stmt *Executed =
+            If->isNegatedConsteval() ? If->getThen() : If->getElse();
+        return stmtContainsCallCleanup(Executed);
+      }
+      if (const auto *If = dyn_cast<IfStmt>(S); If && If->isConstexpr()) {
+        if (stmtContainsCallCleanup(If->getInit()))
+          return true;
+        if (std::optional<const Stmt *> Executed =
+                If->getNondiscardedCase(this->Context))
+          return *Executed && stmtContainsCallCleanup(*Executed);
+        return false;
+      }
+      return llvm::any_of(S->children(), [&](const Stmt *Child) {
+        return stmtContainsCallCleanup(Child);
+      });
+    }
 
     void VisitAttributedStmt(const AttributedStmt *S) {
       const CallExpr *NewMustTailCall = getMustTailCall(S);
@@ -447,34 +1396,373 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
       Visit(S->getSubStmt());
     }
 
+    void VisitReturnStmt(const ReturnStmt *S) {
+      const CallExpr *NewMustTailCall =
+          getImplicitSwiftAsyncMustTailCall(*S, Owner.IsSwiftAsyncFunction);
+      if (!NewMustTailCall)
+        return VisitStmt(S);
+
+      llvm::SaveAndRestore<const CallExpr *> SaveMustTail(MustTailCall,
+                                                          NewMustTailCall);
+      VisitStmt(S);
+    }
+
     void VisitCallExpr(const CallExpr *S) {
       if (S->isUnevaluatedBuiltinCall(this->Context))
         return;
 
       Owner.addCallContinuation(S, MustTailCall);
-      VisitExpr(S);
+      visitCallContinuationCallChildren(
+          S, Owner.ReverseDefaultCallArgs,
+          [&](const Stmt *Child) { Visit(Child); });
+    }
+
+    void VisitCastExpr(const CastExpr *S) {
+      VisitStmt(S);
+      if (S->getCastKind() == CK_AtomicToNonAtomic)
+        Owner.addCallContinuation(S, CallContinuationKind::AtomicOperation);
+    }
+
+    void VisitUnaryOperator(const UnaryOperator *S) {
+      VisitStmt(S);
+      if (S->isIncrementDecrementOp() &&
+          S->getSubExpr()->getType()->isAtomicType())
+        Owner.addCallContinuation(S, CallContinuationKind::AtomicOperation);
+      if (callContinuationOverflowOperationNeedsCounter(
+              S, Owner.CGM.getLangOpts()))
+        Owner.addCallContinuation(S, CallContinuationKind::OverflowOperation);
+    }
+
+    void VisitAtomicExpr(const AtomicExpr *S) {
+      visitCallContinuationAtomicExprChildren(
+          S, [&](const Stmt *Child) { Visit(Child); });
+      if (S->getOp() != AtomicExpr::AO__c11_atomic_init &&
+          S->getOp() != AtomicExpr::AO__opencl_atomic_init)
+        Owner.addCallContinuation(S, CallContinuationKind::AtomicOperation);
+    }
+
+    void VisitDeclRefExpr(const DeclRefExpr *S) {
+      if (callContinuationTLSAccessNeedsCounter(S, Owner.CGM))
+        Owner.addCallContinuation(S, CallContinuationKind::TLSAccess);
+    }
+
+    void VisitMemberExpr(const MemberExpr *S) {
+      Visit(S->getBase());
+      if (callContinuationTLSAccessNeedsCounter(S, Owner.CGM))
+        Owner.addCallContinuation(S, CallContinuationKind::TLSAccess);
+    }
+
+    void VisitBinaryOperator(const BinaryOperator *S) {
+      if (!S->isAssignmentOp()) {
+        VisitStmt(S);
+        if (callContinuationComplexOperationNeedsCounter(S))
+          Owner.addCallContinuation(S, CallContinuationKind::ComplexOperation);
+        if (callContinuationOverflowOperationNeedsCounter(
+                S, Owner.CGM.getLangOpts()))
+          Owner.addCallContinuation(S, CallContinuationKind::OverflowOperation);
+        return;
+      }
+      // Match the evaluation order selected by the expression emitters.
+      if (callContinuationAssignmentEvaluatesRHSFirst(S, Owner.Context)) {
+        Visit(S->getRHS());
+        Visit(S->getLHS());
+      } else {
+        Visit(S->getLHS());
+        Visit(S->getRHS());
+      }
+      if (callContinuationAssignmentNeedsCounter(S))
+        Owner.addCallContinuation(S, CallContinuationKind::Assignment);
+      if (callContinuationOverflowOperationNeedsCounter(
+              S, Owner.CGM.getLangOpts()))
+        Owner.addCallContinuation(S, CallContinuationKind::OverflowOperation);
+    }
+
+    void VisitBlockExpr(const BlockExpr *S) {
+      if (callContinuationBlockLiteralNeedsCounter(S))
+        Owner.addCallContinuation(S, CallContinuationKind::BlockLiteral);
+    }
+
+    void VisitCompoundAssignOperator(const CompoundAssignOperator *S) {
+      Visit(S->getRHS());
+      Visit(S->getLHS());
+      if (callContinuationAssignmentNeedsCounter(S))
+        Owner.addCallContinuation(S, CallContinuationKind::Assignment);
+      if (callContinuationComplexOperationNeedsCounter(S))
+        Owner.addCallContinuation(S, CallContinuationKind::ComplexOperation);
+      if (callContinuationOverflowOperationNeedsCounter(
+              S, Owner.CGM.getLangOpts()))
+        Owner.addCallContinuation(S, CallContinuationKind::OverflowOperation);
     }
 
     void VisitCXXConstructExpr(const CXXConstructExpr *S) {
       Owner.addCallContinuation(S);
+      visitCallContinuationConstructChildren(
+          S, Owner.ReverseDefaultCallArgs,
+          [&](const Stmt *Child) { Visit(Child); });
+    }
+
+    void VisitCXXDefaultInitExpr(const CXXDefaultInitExpr *S) {
+      Visit(S->getExpr());
+      Owner.addCallContinuation(S, CallContinuationKind::DefaultInitializer);
+    }
+
+    void VisitCXXDefaultArgExpr(const CXXDefaultArgExpr *S) {
+      // The default argument's spelling belongs to the callee declaration,
+      // while this wrapper executes at the caller's use location. LLVM's
+      // caller mapping intentionally treats it as opaque; use one atomic
+      // completion edge rather than importing out-of-order source regions.
+      Owner.addCallContinuation(S, CallContinuationKind::DefaultArgument);
+    }
+
+    void VisitArrayInitLoopExpr(const ArrayInitLoopExpr *S) {
+      // The per-element expression is synthetic and executes in a generated
+      // loop. Keep it out of the source counter walk and expose one completion
+      // edge for the whole implicit array copy/move.
+      Visit(S->getCommonExpr()->getSourceExpr());
+      Owner.addCallContinuation(S, CallContinuationKind::ArrayInitialization);
+    }
+
+    void VisitUnaryExprOrTypeTraitExpr(const UnaryExprOrTypeTraitExpr *S) {
+      if (!callContinuationEvaluatesVLAExtent(S, Owner.Context))
+        return;
+      if (S->isArgumentType())
+        recordVLATypeEvaluation(S, S->getTypeOfArgument());
+      else {
+        Visit(S->getArgumentExpr());
+        Owner.addCallContinuation(S, CallContinuationKind::VLAEvaluation);
+      }
+    }
+
+    void VisitDeclStmt(const DeclStmt *S) {
+      for (const Decl *D : S->decls()) {
+        if (const auto *TND = dyn_cast<TypedefNameDecl>(D)) {
+          recordVLATypeEvaluation(TND, TND->getUnderlyingType());
+          continue;
+        }
+        const auto *VD = dyn_cast<VarDecl>(D);
+        if (!VD || VD->hasExternalStorage())
+          continue;
+        recordVLATypeEvaluation(VD, VD->getType());
+        if (VD->hasInit() && !VD->hasConstantInitialization())
+          Visit(VD->getInit());
+        if (varDeclNeedsContinuation(VD))
+          Owner.addCallContinuation(VD, CallContinuationKind::Declaration);
+      }
+    }
+
+    void VisitCaseStmt(const CaseStmt *S) { Visit(S->getSubStmt()); }
+
+    // ConstantExpr is a required compile-time context. Keep it opaque so
+    // constexpr calls beneath it do not acquire run-time continuations.
+    void VisitConstantExpr(const ConstantExpr *) {}
+
+    void VisitCXXRewrittenBinaryOperator(const CXXRewrittenBinaryOperator *S) {
+      // The semantic operator call is compiler-generated and is intentionally
+      // hidden by RecursiveASTVisitor. Visit only its evaluated operands and
+      // own one completion edge on the stable written wrapper.
+      visitCallContinuationRewrittenOperatorChildren(
+          S, Owner.ReverseDefaultCallArgs,
+          [&](const Stmt *Child) { Visit(Child); });
+      Owner.addCallContinuation(S, CallContinuationKind::RewrittenOperator);
+    }
+
+    void VisitObjCMessageExpr(const ObjCMessageExpr *S) {
+      visitCallContinuationObjCMessageChildren(
+          S, Owner.ReverseDefaultCallArgs,
+          [&](const Stmt *Child) { Visit(Child); });
+      const ObjCMethodDecl *Method = S->getMethodDecl();
+      if ((!Method || !Method->hasAttr<NoReturnAttr>()) &&
+          !(InPseudoObjectSemantics && S->isImplicit()))
+        Owner.addCallContinuation(S, CallContinuationKind::ObjCMessage);
+    }
+
+    void VisitExprWithCleanups(const ExprWithCleanups *S) {
+      Visit(S->getSubExpr());
+      if (S->cleanupsHaveSideEffects())
+        Owner.addCallContinuation(S, CallContinuationKind::FullExpression);
+    }
+
+    void VisitCXXNewExpr(const CXXNewExpr *S) {
+      if (std::optional<const Expr *> ArraySize = S->getArraySize())
+        Visit(*ArraySize);
+
+      SmallVector<const Expr *, 4> PlacementArgs(S->placement_arguments());
+      if (Owner.ReverseDefaultCallArgs)
+        for (const Expr *Arg : llvm::reverse(PlacementArgs))
+          Visit(Arg);
+      else
+        for (const Expr *Arg : PlacementArgs)
+          Visit(Arg);
+
+      if (const Expr *Init = S->getInitializer()) {
+        Owner.addCallContinuation(S, CallContinuationKind::NewInitializer);
+        Visit(Init);
+      }
+      Owner.addCallContinuation(S, CallContinuationKind::NewExpression);
+    }
+
+    void VisitCXXDeleteExpr(const CXXDeleteExpr *S) {
+      VisitExpr(S);
+      Owner.addCallContinuation(S, CallContinuationKind::DeleteExpression);
+    }
+
+    void VisitCXXDynamicCastExpr(const CXXDynamicCastExpr *S) {
+      Visit(S->getSubExpr());
+      // Statically resolved reference upcasts do not call EmitDynamicCast and
+      // therefore have no matching completion emission. Only a genuine
+      // run-time reference cast can throw and needs a success continuation.
+      if (S->getCastKind() == CK_Dynamic &&
+          S->getTypeAsWritten()->isReferenceType())
+        Owner.addCallContinuation(S, CallContinuationKind::DynamicCast);
+    }
+
+    void VisitCXXTypeidExpr(const CXXTypeidExpr *S) {
+      if (!S->isTypeOperand() && S->isPotentiallyEvaluated())
+        Visit(S->getExprOperand());
+      if (!S->isTypeOperand() && S->hasNullCheck())
+        Owner.addCallContinuation(S, CallContinuationKind::TypeidExpression);
+    }
+
+    void VisitPseudoObjectExpr(const PseudoObjectExpr *S) {
+      llvm::SaveAndRestore<bool> SavePseudoObjectState(InPseudoObjectSemantics,
+                                                       true);
+      visitCallContinuationPseudoObjectSemantics(
+          S, [&](const Expr *Semantic) { Visit(Semantic); });
+      Owner.addCallContinuation(S, CallContinuationKind::PseudoObject);
+    }
+
+    void VisitOpaqueValueExpr(const OpaqueValueExpr *S) {
+      if (S->isUnique())
+        Visit(S->getSourceExpr());
+    }
+
+    void VisitCoroutineSuspendExpr(const CoroutineSuspendExpr *S) {
+      // await_ready/await_suspend/await_resume are implementation details. A
+      // single counter after await_resume is the source continuation.
+      Visit(S->getOperand());
+      if (const auto *Await = dyn_cast<CoawaitExpr>(S);
+          !Await || !Await->isImplicit())
+        Owner.addCallContinuation(S, CallContinuationKind::CoroutineSuspend);
+    }
+
+    void VisitCoroutineBodyStmt(const CoroutineBodyStmt *S) {
+      // CoroutineBodyStmt::children() also exposes compiler-generated promise,
+      // allocation, suspend, parameter-move, and deallocation nodes. They do
+      // not belong to the written function mapping. Model the one observable
+      // boundary after initial_suspend, then visit only the written body.
+      Owner.addCallContinuation(S, CallContinuationKind::CoroutineBody);
+      Visit(S->getBody());
+    }
+
+    void VisitCoreturnStmt(const CoreturnStmt *S) {
+      // PromiseCall is synthetic and has no independent source region.
+      if (S->getOperand())
+        Visit(S->getOperand());
+    }
+
+    void VisitCompoundStmt(const CompoundStmt *S) {
       VisitStmt(S);
+      if (S != RootBody && compoundNeedsCallCleanup(S))
+        Owner.addCallContinuation(S, CallContinuationKind::CompoundFallthrough);
+    }
+
+    void VisitWhileStmt(const WhileStmt *S) {
+      if (const VarDecl *VD = S->getConditionVariable())
+        ConditionVariables.insert(VD);
+      VisitStmt(S);
+      if (stmtContainsCallCleanup(S)) {
+        Owner.addCallContinuation(S, CallContinuationKind::LoopBackedge);
+        Owner.addCallContinuation(S, CallContinuationKind::LoopExit);
+      }
+    }
+
+    void VisitDoStmt(const DoStmt *S) {
+      VisitStmt(S);
+      if (stmtContainsCallCleanup(S)) {
+        Owner.addCallContinuation(S, CallContinuationKind::LoopBackedge);
+        Owner.addCallContinuation(S, CallContinuationKind::LoopExit);
+      }
+    }
+
+    void VisitForStmt(const ForStmt *S) {
+      if (const VarDecl *VD = S->getConditionVariable())
+        ConditionVariables.insert(VD);
+      VisitStmt(S);
+      if (stmtContainsCallCleanup(S)) {
+        if (S->getInc())
+          Owner.addCallContinuation(S, CallContinuationKind::LoopContinue);
+        Owner.addCallContinuation(S, CallContinuationKind::LoopBackedge);
+        Owner.addCallContinuation(S, CallContinuationKind::LoopExit);
+      }
+    }
+
+    void VisitCXXForRangeStmt(const CXXForRangeStmt *S) {
+      // Visit the written pieces. The generated begin/end/comparison,
+      // dereference, and increment calls are covered by the whole lowering
+      // boundaries below rather than receiving unmapped call counters.
+      if (S->getInit())
+        Visit(S->getInit());
+      Visit(S->getRangeStmt());
+      Visit(S->getBody());
+      // Range-for lowering contains implicit begin/end/comparison/increment
+      // operations that the source mapping does not visit individually.
+      Owner.addCallContinuation(S, CallContinuationKind::LoopBody);
+      Owner.addCallContinuation(S, CallContinuationKind::LoopBackedge);
+      Owner.addCallContinuation(S, CallContinuationKind::LoopExit);
+    }
+
+    void VisitSwitchStmt(const SwitchStmt *S) {
+      if (const VarDecl *VD = S->getConditionVariable())
+        ConditionVariables.insert(VD);
+      VisitStmt(S);
+    }
+
+    void VisitIfStmt(const IfStmt *S) {
+      if (S->isConsteval()) {
+        const Stmt *Executed =
+            S->isNegatedConsteval() ? S->getThen() : S->getElse();
+        if (Executed)
+          Visit(Executed);
+      } else if (S->isConstexpr()) {
+        // The init-statement is evaluated even though one arm is discarded.
+        if (const Stmt *Init = S->getInit())
+          Visit(Init);
+        if (std::optional<const Stmt *> Executed =
+                S->getNondiscardedCase(this->Context))
+          if (*Executed)
+            Visit(*Executed);
+      } else {
+        if (const VarDecl *VD = S->getConditionVariable())
+          ConditionVariables.insert(VD);
+        Base::VisitIfStmt(S);
+      }
+      if (stmtContainsCallCleanup(S))
+        Owner.addCallContinuation(S, CallContinuationKind::IfExit);
     }
   };
 
   void collectCallContinuations(const Decl *D) {
-    if (!CoverageCallContinuations || !CallContinuationCounterMap)
+    if (!CoverageCallContinuations || !CallContinuationCounters)
       return;
 
-    CollectCallContinuations Collector(Context, *this);
+    CollectCallContinuations Collector(Context, *this, D->getBody());
+    Collector.seedParameterVLAEvaluations(D);
     if (const auto *Ctor = dyn_cast_or_null<CXXConstructorDecl>(D)) {
-      for (const CXXCtorInitializer *Initializer : Ctor->inits()) {
-        if (Initializer->isWritten())
+      for (const CXXCtorInitializer *Initializer : Ctor->inits())
+        if ((Initializer->isWritten() ||
+             Initializer->isInClassMemberInitializer()) &&
+            (!Initializer->isBaseInitializer() || EmitVirtualBaseInitializers ||
+             !Initializer->isBaseVirtual()))
           Collector.Visit(Initializer->getInit());
-      }
-      Collector.Visit(Ctor->getBody());
-    } else if (const auto *FD = dyn_cast_or_null<FunctionDecl>(D))
-      Collector.Visit(FD->getBody());
-    else if (const auto *MD = dyn_cast_or_null<ObjCMethodDecl>(D))
+      addCallContinuation(Ctor->getBody(),
+                          CallContinuationKind::ConstructorPrologue);
+      if (!Ctor->isDefaulted())
+        Collector.Visit(Ctor->getBody());
+    } else if (const auto *FD = dyn_cast_or_null<FunctionDecl>(D)) {
+      if (const auto *Method = dyn_cast<CXXMethodDecl>(FD);
+          !Method || !Method->isDefaulted())
+        Collector.Visit(FD->getBody());
+    } else if (const auto *MD = dyn_cast_or_null<ObjCMethodDecl>(D))
       Collector.Visit(MD->getBody());
     else if (const auto *BD = dyn_cast_or_null<BlockDecl>(D))
       Collector.Visit(BD->getBody());
@@ -483,11 +1771,54 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
   }
 
   void assignCallContinuationCounters() {
-    if (!CallContinuationCounterMap)
+    if (!CallContinuationCounters)
       return;
 
-    for (const Stmt *S : CallContinuations)
-      (*CallContinuationCounterMap)[S] = NextCounter++;
+    for (CallContinuationKey Key : CallContinuations)
+      (*CallContinuationCounters)[Key] = NextCounter++;
+  }
+
+  void hashCallContinuationLayout() {
+    if (CallContinuations.empty())
+      return;
+
+    // The structural traversal above records where each continuation-owning
+    // node occurs. Encode the actual counter allocation order as well: C++
+    // evaluation order can differ from AST preorder (assignment, ABI argument
+    // order, and parenthesized versus list construction).
+    Hash.combine(PGOHash::CallContinuationLayout);
+    Hash.combineStableValue(static_cast<uint32_t>(CallContinuations.size()));
+    for (const auto &[Owner, Kind] : CallContinuations) {
+      auto I = CallContinuationNodeOrdinal.find(Owner);
+      assert(I != CallContinuationNodeOrdinal.end() &&
+             "continuation node absent from structural hash traversal");
+      Hash.combineStableValue(I == CallContinuationNodeOrdinal.end()
+                                  ? std::numeric_limits<uint32_t>::max()
+                                  : I->second);
+      Hash.combineStableValue(llvm::to_underlying(Kind));
+    }
+  }
+
+  /// Hash the typed markers owned by \p Owner without traversing its children.
+  /// This is also used for synthetic bodies of explicitly defaulted
+  /// constructors: RecursiveASTVisitor intentionally skips those bodies, but
+  /// the constructor-prologue continuation still needs a stable owner.
+  void hashCallContinuationMarkers(CallContinuationOwner Owner) {
+    if (auto I = CallContinuationKindsByOwner.find(Owner);
+        I != CallContinuationKindsByOwner.end()) {
+      bool Inserted = CallContinuationNodeOrdinal
+                          .try_emplace(Owner, NextCallContinuationNodeOrdinal)
+                          .second;
+      if (!Inserted)
+        return;
+      ++NextCallContinuationNodeOrdinal;
+      uint64_t Kinds = I->second;
+      for (unsigned Kind = 0;
+           Kind <= llvm::to_underlying(CallContinuationKind::Last); ++Kind)
+        if (Kinds & (uint64_t(1) << Kind))
+          Hash.combine(getCallContinuationHashType(
+              static_cast<CallContinuationKind>(Kind)));
+    }
   }
 
   /// Include \p S in the function hash.
@@ -497,6 +1828,7 @@ struct MapRegionCounters : public RecursiveASTVisitor<MapRegionCounters> {
       Type = getHashType(Hash.getHashVersion(), S);
     if (Type != PGOHash::None)
       Hash.combine(Type);
+    hashCallContinuationMarkers(S);
     return true;
   }
 
@@ -1038,6 +2370,13 @@ void PGOHash::combine(HashType Type) {
   Working = Working << NumBitsPerType | Type;
 }
 
+void PGOHash::combineStableValue(uint32_t Value) {
+  // Zero is reserved by HashType. Encode seven fixed five-bit chunks so every
+  // uint32_t has a unique, source-independent token sequence.
+  for (unsigned Shift = 0; Shift < 35; Shift += 5)
+    combine(static_cast<HashType>(((Value >> Shift) & 0x1f) + 1));
+}
+
 uint64_t PGOHash::finalize() {
   // Use Working as the hash directly if we never used MD5.
   if (Count <= NumTypesPerWord)
@@ -1107,9 +2446,9 @@ void CodeGenPGO::assignRegionCounters(GlobalDecl GD, llvm::Function *Fn) {
 
   setFuncName(Fn);
 
-  mapRegionCounters(D);
+  mapRegionCounters(GD, Fn->getCallingConv() == llvm::CallingConv::SwiftTail);
   if (CGM.getCodeGenOpts().CoverageMapping)
-    emitCounterRegionMapping(D);
+    emitCounterRegionMapping(GD);
   if (PGOReader) {
     loadRegionCounts(PGOReader, SM.isInMainFile(D->getLocation()));
     computeRegionCounts(D);
@@ -1117,7 +2456,8 @@ void CodeGenPGO::assignRegionCounters(GlobalDecl GD, llvm::Function *Fn) {
   }
 }
 
-void CodeGenPGO::mapRegionCounters(const Decl *D) {
+void CodeGenPGO::mapRegionCounters(GlobalDecl GD, bool IsSwiftAsyncFunction) {
+  const Decl *D = GD.getDecl();
   // Use the latest hash version when inserting instrumentation, but use the
   // version in the indexed profile if we're reading PGO data.
   PGOHashVersion HashVersion = PGO_HASH_LATEST;
@@ -1142,18 +2482,29 @@ void CodeGenPGO::mapRegionCounters(const Decl *D) {
   bool CoverageCallContinuations =
       CGM.getCodeGenOpts().CoverageMapping &&
       CGM.getCodeGenOpts().CoverageCallContinuations;
+  bool EmitVirtualBaseInitializers = true;
+  if (isa<CXXConstructorDecl>(D) &&
+      CGM.getTarget().getCXXABI().hasConstructorVariants())
+    EmitVirtualBaseInitializers = GD.getCtorType() != Ctor_Base;
 
   RegionCounterMap.reset(new llvm::DenseMap<const Stmt *, CounterPair>);
   if (CoverageCallContinuations)
-    CallContinuationCounterMap.reset(
-        new llvm::DenseMap<const Stmt *, unsigned>);
+    CallContinuationCounters.reset(new CallContinuationCounterMap);
   else
-    CallContinuationCounterMap.reset();
+    CallContinuationCounters.reset();
+  if (CoverageCallContinuations)
+    VLATypeEvaluations.reset(new VLATypeEvaluationMap);
+  else
+    VLATypeEvaluations.reset();
   RegionMCDCState.reset(new MCDC::State);
-  MapRegionCounters Walker(HashVersion, ProfileVersion, *RegionCounterMap,
-                           CallContinuationCounterMap.get(), *RegionMCDCState,
-                           MCDCMaxConditions, CoverageCallContinuations,
-                           CGM.getContext(), CGM.getDiags());
+  MapRegionCounters Walker(
+      HashVersion, ProfileVersion, *RegionCounterMap,
+      CallContinuationCounters.get(), VLATypeEvaluations.get(),
+      *RegionMCDCState, MCDCMaxConditions, CoverageCallContinuations,
+      IsSwiftAsyncFunction, EmitVirtualBaseInitializers,
+      CGM.getTarget().getCXXABI().areArgsDestroyedLeftToRightInCallee(),
+      CGM.getContext(), CGM.getDiags(), CGM);
+  Walker.collectCallContinuations(D);
   if (const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(D))
     Walker.TraverseDecl(const_cast<FunctionDecl *>(FD));
   else if (const ObjCMethodDecl *MD = dyn_cast_or_null<ObjCMethodDecl>(D))
@@ -1162,7 +2513,22 @@ void CodeGenPGO::mapRegionCounters(const Decl *D) {
     Walker.TraverseDecl(const_cast<BlockDecl *>(BD));
   else if (const CapturedDecl *CD = dyn_cast_or_null<CapturedDecl>(D))
     Walker.TraverseDecl(const_cast<CapturedDecl *>(CD));
-  Walker.collectCallContinuations(D);
+  // RecursiveASTVisitor intentionally skips in-class member initializers when
+  // implicit-code traversal is disabled. Coverage emits those initializers,
+  // so include their ordinary counters and structural continuation hash too.
+  if (CoverageCallContinuations) {
+    if (const auto *Ctor = dyn_cast_or_null<CXXConstructorDecl>(D)) {
+      for (const CXXCtorInitializer *Initializer : Ctor->inits())
+        if (!Initializer->isWritten() &&
+            Initializer->isInClassMemberInitializer() &&
+            (!Initializer->isBaseInitializer() || EmitVirtualBaseInitializers ||
+             !Initializer->isBaseVirtual()))
+          Walker.TraverseStmt(Initializer->getInit());
+      if (Ctor->isDefaulted())
+        Walker.hashCallContinuationMarkers(Ctor->getBody());
+    }
+  }
+  Walker.hashCallContinuationLayout();
   Walker.assignCallContinuationCounters();
   assert(Walker.NextCounter > 0 && "no entry counter mapped for decl");
   NumRegionCounters = Walker.NextCounter;
@@ -1195,18 +2561,21 @@ bool CodeGenPGO::skipRegionMappingForDecl(const Decl *D) {
   return !llvm::coverage::SystemHeadersCoverage && SM.isInSystemHeader(Loc);
 }
 
-void CodeGenPGO::emitCounterRegionMapping(const Decl *D) {
+void CodeGenPGO::emitCounterRegionMapping(GlobalDecl GD) {
+  const Decl *D = GD.getDecl();
   if (skipRegionMappingForDecl(D))
     return;
 
   std::string CoverageMapping;
   llvm::raw_string_ostream OS(CoverageMapping);
   RegionMCDCState->BranchByStmt.clear();
-  CoverageMappingGen MappingGen(*CGM.getCoverageMapping(),
-                                CGM.getContext().getSourceManager(),
-                                CGM.getLangOpts(), RegionCounterMap.get(),
-                                CallContinuationCounterMap.get(),
-                                RegionMCDCState.get(), NumRegionCounters);
+  CoverageMappingGen MappingGen(
+      *CGM.getCoverageMapping(), CGM.getContext().getSourceManager(),
+      CGM.getLangOpts(), RegionCounterMap.get(), CallContinuationCounters.get(),
+      VLATypeEvaluations.get(), RegionMCDCState.get(), NumRegionCounters,
+      !isa<CXXConstructorDecl>(D) ||
+          !CGM.getTarget().getCXXABI().hasConstructorVariants() ||
+          GD.getCtorType() != Ctor_Base);
   MappingGen.emitCounterMapping(D, OS);
 
   if (CoverageMapping.empty())
@@ -1220,8 +2589,8 @@ void CodeGenPGO::emitCounterRegionMapping(const Decl *D) {
     if (V.Skipped.hasValue())
       MaxNumCounters = std::max(MaxNumCounters, V.Skipped + 1);
   }
-  if (CallContinuationCounterMap)
-    for (const auto &[_, V] : *CallContinuationCounterMap)
+  if (CallContinuationCounters)
+    for (const auto &[_, V] : *CallContinuationCounters)
       MaxNumCounters = std::max(MaxNumCounters, V + 1);
   NumRegionCounters = MaxNumCounters;
 
@@ -1322,13 +2691,16 @@ void CodeGenPGO::emitCounterSetOrIncrement(CGBuilderTy &Builder, const Stmt *S,
 }
 
 void CodeGenPGO::emitCallContinuationCounter(CGBuilderTy &Builder,
-                                             const Stmt *S) {
-  if (!CallContinuationCounterMap)
+                                             CallContinuationOwner Owner,
+                                             CallContinuationKind Kind) {
+  if (!CallContinuationCounters)
     return;
 
-  auto I = CallContinuationCounterMap->find(S);
-  if (I == CallContinuationCounterMap->end())
+  auto I = CallContinuationCounters->find({Owner, Kind});
+  if (I == CallContinuationCounters->end())
     return;
+
+  unsigned Counter = I->second;
 
   if (!Builder.GetInsertBlock())
     return;
@@ -1339,7 +2711,7 @@ void CodeGenPGO::emitCallContinuationCounter(CGBuilderTy &Builder,
 
   llvm::Value *Args[] = {
       NormalizedFuncNameVarPtr, Builder.getInt64(FunctionHash),
-      Builder.getInt32(NumRegionCounters), Builder.getInt32(I->second)};
+      Builder.getInt32(NumRegionCounters), Builder.getInt32(Counter)};
 
   if (llvm::EnableSingleByteCoverage)
     Builder.CreateCall(CGM.getIntrinsic(llvm::Intrinsic::instrprof_cover),
@@ -1678,12 +3050,31 @@ void CodeGenFunction::incrementProfileCounter(CounterForIncrement ExecSkip,
   PGO->setCurrentStmt(S);
 }
 
-void CodeGenFunction::incrementCallContinuationProfileCounter(const Stmt *S) {
+void CodeGenFunction::incrementCallContinuationProfileCounter(
+    const Stmt *S, CallContinuationKind Kind) {
+  CodeGenFunction *ProfileOwner = this;
+  while (ProfileOwner->IsOutlinedSEHHelper && ProfileOwner->ParentCGF)
+    ProfileOwner = ProfileOwner->ParentCGF;
+
   if (CGM.getCodeGenOpts().hasProfileClangInstr() &&
-      !CurFn->hasFnAttribute(llvm::Attribute::NoProfile) &&
-      !CurFn->hasFnAttribute(llvm::Attribute::SkipProfile)) {
+      !ProfileOwner->CurFn->hasFnAttribute(llvm::Attribute::NoProfile) &&
+      !ProfileOwner->CurFn->hasFnAttribute(llvm::Attribute::SkipProfile)) {
     auto AL = ApplyDebugLocation::CreateArtificial(*this);
-    PGO->emitCallContinuationCounter(Builder, S);
+    ProfileOwner->PGO->emitCallContinuationCounter(Builder, S, Kind);
+  }
+}
+
+void CodeGenFunction::incrementCallContinuationProfileCounter(
+    const Decl *D, CallContinuationKind Kind) {
+  CodeGenFunction *ProfileOwner = this;
+  while (ProfileOwner->IsOutlinedSEHHelper && ProfileOwner->ParentCGF)
+    ProfileOwner = ProfileOwner->ParentCGF;
+
+  if (CGM.getCodeGenOpts().hasProfileClangInstr() &&
+      !ProfileOwner->CurFn->hasFnAttribute(llvm::Attribute::NoProfile) &&
+      !ProfileOwner->CurFn->hasFnAttribute(llvm::Attribute::SkipProfile)) {
+    auto AL = ApplyDebugLocation::CreateArtificial(*this);
+    ProfileOwner->PGO->emitCallContinuationCounter(Builder, D, Kind);
   }
 }
 

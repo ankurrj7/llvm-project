@@ -13,6 +13,7 @@
 #ifndef LLVM_CLANG_LIB_CODEGEN_COVERAGEMAPPINGGEN_H
 #define LLVM_CLANG_LIB_CODEGEN_COVERAGEMAPPINGGEN_H
 
+#include "CoverageCallContinuations.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Lex/PPCallbacks.h"
@@ -165,26 +166,31 @@ class CoverageMappingGen {
   SourceManager &SM;
   const LangOptions &LangOpts;
   llvm::DenseMap<const Stmt *, CounterPair> *CounterMap;
-  llvm::DenseMap<const Stmt *, unsigned> *CallContinuationCounterMap;
+  CallContinuationCounterMap *CallContinuationCounters;
+  VLATypeEvaluationMap *VLATypeEvaluations;
   MCDC::State *MCDCState;
   unsigned NextCounter;
+  bool EmitVirtualBaseInitializers;
 
 public:
   CoverageMappingGen(CoverageMappingModuleGen &CVM, SourceManager &SM,
                      const LangOptions &LangOpts)
       : CVM(CVM), SM(SM), LangOpts(LangOpts), CounterMap(nullptr),
-        CallContinuationCounterMap(nullptr), MCDCState(nullptr),
-        NextCounter(0) {}
+        CallContinuationCounters(nullptr), VLATypeEvaluations(nullptr),
+        MCDCState(nullptr), NextCounter(0), EmitVirtualBaseInitializers(true) {}
 
-  CoverageMappingGen(
-      CoverageMappingModuleGen &CVM, SourceManager &SM,
-      const LangOptions &LangOpts,
-      llvm::DenseMap<const Stmt *, CounterPair> *CounterMap,
-      llvm::DenseMap<const Stmt *, unsigned> *CallContinuationCounterMap,
-      MCDC::State *MCDCState, unsigned NextCounter)
+  CoverageMappingGen(CoverageMappingModuleGen &CVM, SourceManager &SM,
+                     const LangOptions &LangOpts,
+                     llvm::DenseMap<const Stmt *, CounterPair> *CounterMap,
+                     CallContinuationCounterMap *CallContinuationCounters,
+                     VLATypeEvaluationMap *VLATypeEvaluations,
+                     MCDC::State *MCDCState, unsigned NextCounter,
+                     bool EmitVirtualBaseInitializers)
       : CVM(CVM), SM(SM), LangOpts(LangOpts), CounterMap(CounterMap),
-        CallContinuationCounterMap(CallContinuationCounterMap),
-        MCDCState(MCDCState), NextCounter(NextCounter) {}
+        CallContinuationCounters(CallContinuationCounters),
+        VLATypeEvaluations(VLATypeEvaluations), MCDCState(MCDCState),
+        NextCounter(NextCounter),
+        EmitVirtualBaseInitializers(EmitVirtualBaseInitializers) {}
 
   /// Emit the coverage mapping data which maps the regions of
   /// code to counters that will be used to find the execution
