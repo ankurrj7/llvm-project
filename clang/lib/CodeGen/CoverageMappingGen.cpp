@@ -2191,6 +2191,10 @@ struct CounterCoverageMappingBuilder
   void VisitBinaryOperator(const BinaryOperator *E) {
     if (!CallContinuationCounters)
       return VisitStmt(E);
+    // The assignment children may be visited in runtime evaluation order. Start
+    // the source region at the operator before that traversal can reach its
+    // RHS.
+    extendRegion(E);
     if (!E->isAssignmentOp()) {
       VisitStmt(E);
       if (std::optional<Counter> ContinuationCounter =
@@ -2226,6 +2230,9 @@ struct CounterCoverageMappingBuilder
   void VisitCompoundAssignOperator(const CompoundAssignOperator *E) {
     if (!CallContinuationCounters)
       return VisitStmt(E);
+    // Compound assignments likewise visit their RHS before their source-leading
+    // LHS when tracking call continuations.
+    extendRegion(E);
     Visit(E->getRHS());
     Visit(E->getLHS());
     adjustForOutOfOrderTraversal(getEnd(E));

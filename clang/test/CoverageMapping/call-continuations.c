@@ -2,6 +2,7 @@
 // RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fprofile-instrument=clang -fcoverage-mapping -dump-coverage-mapping -emit-llvm-only -o - %s | FileCheck %s --check-prefix=NOCC
 
 void f(void);
+int g(void);
 void *alloc(unsigned long);
 void release(void *);
 __attribute__((returns_twice)) int returns_twice(void);
@@ -59,6 +60,18 @@ int cleanup_macro_after_call(int ret) {
   return 0;
 }
 
+int assignment_after_call(int *p) {
+  f();
+  *p = g();
+  return *p;
+}
+
+int compound_assignment_after_call(int *p) {
+  f();
+  *p += g();
+  return *p;
+}
+
 // MAP-LABEL: after_call:
 // MAP: Gap,File 0, [[CALL_LINE:[0-9]+]]:7 -> [[RET_LINE:[0-9]+]]:3 = #1
 // MAP: File 0, [[RET_LINE]]:3 -> [[END_LINE:[0-9]+]]:2 = #1
@@ -69,5 +82,9 @@ int cleanup_macro_after_call(int ret) {
 // MAP-LABEL: cleanup_macro_after_call:
 // MAP: Expansion,File 0, [[FIRST_CLEANUP:[0-9]+]]:5 -> [[FIRST_CLEANUP]]:22 = #{{[0-9]+}}
 // MAP: Expansion,File 0, [[SECOND_CLEANUP:[0-9]+]]:5 -> [[SECOND_CLEANUP]]:22 = #{{[0-9]+}}
+// MAP-LABEL: assignment_after_call:
+// MAP: File 0, [[ASSIGN_LINE:[0-9]+]]:3 -> [[ASSIGN_LINE]]:11 = #{{[0-9]+}}
+// MAP-LABEL: compound_assignment_after_call:
+// MAP: File 0, [[COMPOUND_ASSIGN_LINE:[0-9]+]]:3 -> [[COMPOUND_ASSIGN_LINE]]:12 = #{{[0-9]+}}
 // NOCC-LABEL: setjmp_like:
 // NOCC: Branch,File 0, [[COND_LINE:[0-9]+]]:7 -> [[COND_LINE]]:27 = #1, (#0 - #1)
