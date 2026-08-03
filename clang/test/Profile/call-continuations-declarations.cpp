@@ -135,6 +135,7 @@ ArrayBox constant_array_expression() {
 // IR: call{{.*}} i32 @_Z3getILm0EEiO9TupleLike
 // IR: call{{.*}} i32 @_Z3getILm1EEiO9TupleLike
 // IR-NEXT: store i32
+// IR-NEXT: store ptr
 // IR-NEXT: load i64, ptr getelementptr inbounds ({{.*}}@__profc__Z19tuple_decompositionv
 // MAP-LABEL: _Z19tuple_decompositionv:
 // MAP: Gap,File 0, {{[0-9]+}}:39 -> {{[0-9]+}}:3 = #2
