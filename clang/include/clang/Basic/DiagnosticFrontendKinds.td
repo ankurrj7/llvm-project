@@ -14,8 +14,9 @@ def err_fe_error_opening : Error<"error opening '%0': %1">;
 def err_fe_error_reading : Error<"error reading '%0': %1">;
 def err_fe_error_reading_stdin : Error<"error reading stdin: %0">;
 def err_fe_error_backend : Error<"error in backend: %0">, DefaultFatal;
-def err_coverage_mapping_spi_key_required : Error<
-  "coverage mapping SPI output requires a stable compilation-unit key">;
+def err_coverage_mapping_spi_key_required
+    : Error<
+          "coverage mapping SPI output requires a stable compilation-unit key">;
 
 def err_fe_inline_asm : Error<"%0">, CatInlineAsm;
 def warn_fe_inline_asm : Warning<"%0">, CatInlineAsm, InGroup<BackendInlineAsm>;

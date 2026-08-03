@@ -1774,18 +1774,24 @@ def fcoverage_compilation_dir_EQ : Joined<["-"], "fcoverage-compilation-dir=">,
     Group<f_Group>, Visibility<[ClangOption, CC1Option, CC1AsOption, CLOption]>,
     HelpText<"The compilation directory to embed in the coverage mapping.">,
     MarshallingInfoString<CodeGenOpts<"CoverageCompilationDir">>;
-def fcoverage_mapping_spi : Flag<["-"], "fcoverage-mapping-spi">,
-    Group<f_Group>, Visibility<[ClangOption, CLOption]>,
-    HelpText<"Write coverage mapping records to the default SPI container">;
-def fcoverage_mapping_spi_EQ : Joined<["-"], "fcoverage-mapping-spi=">,
-    Group<f_Group>, Visibility<[ClangOption, CLOption, CC1Option]>,
-    MetaVarName<"<file>">,
-    HelpText<"Write coverage mapping records to <file>">,
-    MarshallingInfoString<CodeGenOpts<"CoverageMappingSPIPath">>;
-def fcoverage_mapping_spi_key_EQ : Joined<["-"], "fcoverage-mapping-spi-key=">,
-    Visibility<[CC1Option]>, MetaVarName<"<key>">,
-    HelpText<"Use <key> as the coverage mapping SPI record identity">,
-    MarshallingInfoString<CodeGenOpts<"CoverageMappingSPIKey">>;
+def fcoverage_mapping_spi
+    : Flag<["-"], "fcoverage-mapping-spi">,
+      Group<f_Group>,
+      Visibility<[ClangOption, CLOption]>,
+      HelpText<"Write coverage mapping records to the default SPI container">;
+def fcoverage_mapping_spi_EQ
+    : Joined<["-"], "fcoverage-mapping-spi=">,
+      Group<f_Group>,
+      Visibility<[ClangOption, CLOption, CC1Option]>,
+      MetaVarName<"<file>">,
+      HelpText<"Write coverage mapping records to <file>">,
+      MarshallingInfoString<CodeGenOpts<"CoverageMappingSPIPath">>;
+def fcoverage_mapping_spi_key_EQ
+    : Joined<["-"], "fcoverage-mapping-spi-key=">,
+      Visibility<[CC1Option]>,
+      MetaVarName<"<key>">,
+      HelpText<"Use <key> as the coverage mapping SPI record identity">,
+      MarshallingInfoString<CodeGenOpts<"CoverageMappingSPIKey">>;
 def ffile_compilation_dir_EQ : Joined<["-"], "ffile-compilation-dir=">, Group<f_Group>,
     Visibility<[ClangOption, CLOption, DXCOption]>,
     HelpText<"The compilation directory to embed in the debug info and coverage mapping.">;
