@@ -123,7 +123,6 @@ void clang::CodeGen::visitVLATypeEvaluations(
     case clang::Type::UnaryTransform:
     case clang::Type::Attributed:
     case clang::Type::BTFTagAttributed:
-    case clang::Type::OverflowBehavior:
     case clang::Type::HLSLAttributedResource:
     case clang::Type::SubstTemplateTypeParm:
     case clang::Type::MacroQualified:
@@ -390,9 +389,6 @@ bool clang::CodeGen::callContinuationOverflowOperationNeedsCounter(
     return false;
   }
 
-  if (const auto *OBT = Type->getAs<OverflowBehaviorType>())
-    return OBT->getBehaviorKind() ==
-           OverflowBehaviorType::OverflowBehaviorKind::Trap;
   return Type->isSignedIntegerOrEnumerationType() &&
          Opts.getSignedOverflowBehavior() == LangOptions::SOB_Trapping;
 }
