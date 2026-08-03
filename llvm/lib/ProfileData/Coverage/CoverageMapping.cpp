@@ -703,12 +703,10 @@ ArrayRef<unsigned> CoverageMapping::getImpreciseRecordIndicesForFilename(
 
 static unsigned getMaxCounterID(const CounterMappingContext &Ctx,
                                 const CoverageMappingRecord &Record,
-                                bool LoadBranchRecords,
-                                bool LoadMCDCRecords) {
+                                bool LoadBranchRecords, bool LoadMCDCRecords) {
   unsigned MaxCounterID = 0;
   for (const auto &Region : Record.MappingRegions) {
-    if (Region.Kind == CounterMappingRegion::BranchRegion &&
-        !LoadBranchRecords)
+    if (Region.Kind == CounterMappingRegion::BranchRegion && !LoadBranchRecords)
       continue;
     if (Region.Kind == CounterMappingRegion::MCDCBranchRegion &&
         !LoadBranchRecords && !LoadMCDCRecords)
@@ -1476,9 +1474,9 @@ class SegmentBuilder {
     // emit closing segments in sorted order.
     auto CompletedRegionsIt = ActiveRegions.begin() + FirstCompletedRegion;
     std::stable_sort(CompletedRegionsIt, ActiveRegions.end(),
-                      [](const CountedRegion *L, const CountedRegion *R) {
-                        return L->endLoc() < R->endLoc();
-                      });
+                     [](const CountedRegion *L, const CountedRegion *R) {
+                       return L->endLoc() < R->endLoc();
+                     });
 
     // Emit segments for all completed regions.
     for (unsigned I = FirstCompletedRegion + 1, E = ActiveRegions.size(); I < E;

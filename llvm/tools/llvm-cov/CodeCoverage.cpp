@@ -195,7 +195,7 @@ private:
   bool FormatSpecified = false;
   bool CheckBinaryIDs;
 };
-}
+} // namespace
 
 static std::string getErrorString(const Twine &Message, StringRef Whence,
                                   bool Warning) {
@@ -249,8 +249,8 @@ void CodeCoverageTool::collectPaths(const std::string &Path) {
 
   if (llvm::sys::fs::is_directory(Status)) {
     std::error_code EC;
-    for (llvm::sys::fs::recursive_directory_iterator F(Path, EC), E;
-         F != E; F.increment(EC)) {
+    for (llvm::sys::fs::recursive_directory_iterator F(Path, EC), E; F != E;
+         F.increment(EC)) {
 
       auto Status = F->status();
       if (!Status) {
@@ -383,9 +383,9 @@ CodeCoverageTool::createFunctionView(const FunctionRecord &Function,
   auto Branches = FunctionCoverage.getBranches();
   auto Expansions = FunctionCoverage.getExpansions();
   auto MCDCRecords = FunctionCoverage.getMCDCRecords();
-  auto View = SourceCoverageView::create(DC.demangle(Function.Name),
-                                         SourceBuffer.get(), ViewOpts,
-                                         std::move(FunctionCoverage));
+  auto View =
+      SourceCoverageView::create(DC.demangle(Function.Name), SourceBuffer.get(),
+                                 ViewOpts, std::move(FunctionCoverage));
   attachExpansionSubViews(*View, Expansions, Coverage);
   attachBranchSubViews(*View, Branches);
   attachMCDCSubViews(*View, MCDCRecords);
@@ -779,8 +779,7 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
 
   cl::opt<bool> RegionSummary(
       "show-region-summary", cl::Optional,
-      cl::desc("Show region statistics in summary table"),
-      cl::init(true));
+      cl::desc("Show region statistics in summary table"), cl::init(true));
 
   cl::opt<bool> BranchSummary(
       "show-branch-summary", cl::Optional,
@@ -1341,8 +1340,8 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
                               cl::cat(ExportCategory));
 
   cl::opt<bool> SkipBranches("skip-branches", cl::Optional,
-                              cl::desc("Don't export branch data (LCOV)"),
-                              cl::cat(ExportCategory));
+                             cl::desc("Don't export branch data (LCOV)"),
+                             cl::cat(ExportCategory));
 
   cl::opt<bool> UnifyInstantiations("unify-instantiations", cl::Optional,
                                     cl::desc("Unify function instantiations"),
@@ -1414,8 +1413,8 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
                          : CoveredFunctionsExportOptions::Mode::Execution;
     ExportOptions.IncludeBranches = IncludeBranches;
     ExportOptions.IncludeMCDC = IncludeMCDC;
-    CoverageExporterCoveredFunctions Exporter(outs(), Remappings,
-                                              FilenameFilters, ExportOptions);
+    CoverageExporterCoveredFunctions Exporter(
+        outs(), Remappings, IgnoreFilenameFilters, ExportOptions);
     CoverageMappingLoadOptions LoadOptions;
     LoadOptions.LoadExecutedFunctionsOnly = TextCoverage;
     LoadOptions.AllCountersZero = TextCoverageFull;
