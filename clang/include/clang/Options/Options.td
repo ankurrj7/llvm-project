@@ -1831,12 +1831,15 @@ defm coverage_mapping : BoolFOption<"coverage-mapping",
           "Generate coverage mapping to enable code coverage analysis">,
   NegFlag<SetFalse, [], [ClangOption], "Disable code coverage analysis">, BothFlags<
           [], [ClangOption, CLOption]>>;
-defm coverage_call_continuations : BoolFOption<"coverage-call-continuations",
-  CodeGenOpts<"CoverageCallContinuations">, DefaultFalse,
-  PosFlag<SetTrue, [], [ClangOption, CC1Option],
-          "Track coverage after calls with returned-from-call counters">,
-  NegFlag<SetFalse, [], [ClangOption],
-          "Disable returned-from-call coverage counters">,
+defm coverage_call_continuations
+    : BoolFOption<
+          "coverage-call-continuations",
+          CodeGenOpts<"CoverageCallContinuations">, DefaultFalse,
+          PosFlag<
+              SetTrue, [], [ClangOption, CC1Option],
+              "Track coverage after calls with returned-from-call counters">,
+          NegFlag<SetFalse, [], [ClangOption],
+                  "Disable returned-from-call coverage counters">,
           BothFlags<[], [ClangOption, CLOption]>>;
 defm mcdc_coverage : BoolFOption<"coverage-mcdc",
   CodeGenOpts<"MCDCCoverage">, DefaultFalse,

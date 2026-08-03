@@ -1373,8 +1373,7 @@ TEST(CoverageMappingTest, SparseStreamingDoesNotRetainDecodedFunctions) {
   EXPECT_TRUE((*CoverageOrErr)->getCoveredFunctions().empty());
 }
 
-TEST(CoverageMappingTest,
-     StreamingDisplayNameStripsSPIUnitAndLocalFilePrefix) {
+TEST(CoverageMappingTest, StreamingDisplayNameStripsSPIUnitAndLocalFilePrefix) {
   std::string RawName = getPGOFuncNameWithCoverageMappingSPIUnit(
       "kdzc.c:local_function", "/build/kdzc.o");
 
@@ -1386,10 +1385,10 @@ TEST(CoverageMappingTest,
   Function.FilenamesStorage.push_back("/src/kdzc.c");
   for (const std::string &Filename : Function.FilenamesStorage)
     Function.Filenames.push_back(Filename);
-  Function.Regions.push_back(CounterMappingRegion::makeRegion(
-      Counter::getCounter(0), 0, 1, 1, 1, 2));
-  Function.Regions.push_back(CounterMappingRegion::makeRegion(
-      Counter::getCounter(0), 1, 1, 1, 1, 2));
+  Function.Regions.push_back(
+      CounterMappingRegion::makeRegion(Counter::getCounter(0), 0, 1, 1, 1, 2));
+  Function.Regions.push_back(
+      CounterMappingRegion::makeRegion(Counter::getCounter(0), 1, 1, 1, 1, 2));
 
   std::vector<std::unique_ptr<CoverageMappingReader>> MappingReaders;
   MappingReaders.push_back(
