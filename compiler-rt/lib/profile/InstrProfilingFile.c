@@ -466,8 +466,8 @@ static int writeDenseProfileSegment(ProfDataWriter *Writer,
   return lprofWriteDataImpl(
       Writer, __llvm_profile_begin_data(), __llvm_profile_end_data(),
       __llvm_profile_begin_counters(), __llvm_profile_end_counters(),
-      __llvm_profile_begin_bitmap(), __llvm_profile_end_bitmap(), NULL, NULL,
-      VPDataReader, __llvm_profile_begin_names(), __llvm_profile_end_names(),
+      __llvm_profile_begin_bitmap(), __llvm_profile_end_bitmap(), VPDataReader,
+      __llvm_profile_begin_names(), __llvm_profile_end_names(),
       __llvm_profile_begin_vtables(), __llvm_profile_end_vtables(),
       __llvm_profile_begin_vtabnames(), __llvm_profile_end_vtabnames(), 0,
       Version);
@@ -555,9 +555,9 @@ static int writeSparseProfileSegment(ProfDataWriter *Writer,
     free(Selected);
     return lprofWriteDataImpl(Writer, &EmptyData, &EmptyData, &EmptySection,
                               &EmptySection, &EmptySection, &EmptySection, NULL,
-                              NULL, NULL, &EmptySection, &EmptySection,
-                              &EmptyVTable, &EmptyVTable, &EmptySection,
-                              &EmptySection, 0, SparseVersion);
+                              &EmptySection, &EmptySection, &EmptyVTable,
+                              &EmptyVTable, &EmptySection, &EmptySection, 0,
+                              SparseVersion);
   }
 
   if (NumSparseData > SIZE_MAX / sizeof(*SparseData) ||
@@ -640,8 +640,8 @@ static int writeSparseProfileSegment(ProfDataWriter *Writer,
       SparseCounters + NumSparseCounters * CounterSize,
       NumSparseBitmapBytes ? SparseBitmap : BitmapBegin,
       NumSparseBitmapBytes ? SparseBitmap + NumSparseBitmapBytes : BitmapBegin,
-      NULL, NULL, VPDataReader, NamesBegin, NamesEnd, VTableBegin, VTableEnd,
-      VNamesBegin, VNamesEnd, 0, SparseVersion);
+      VPDataReader, NamesBegin, NamesEnd, VTableBegin, VTableEnd, VNamesBegin,
+      VNamesEnd, 0, SparseVersion);
 
   free(SparseBitmap);
   free(SparseCounters);
