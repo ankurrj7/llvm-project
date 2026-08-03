@@ -56,7 +56,7 @@ int musttail_call(int x) {
 }
 
 // IR-DAG: @__profc_unevaluated_sizeof = private global [2 x i64]
-// SB-DAG: @__profc_unevaluated_sizeof = private global [3 x i8]
+// SB-DAG: @__profc_unevaluated_sizeof = private global [4 x i8]
 
 // IR-LABEL: define{{.*}} i32 @after_call(
 // IR: call void @f()
@@ -103,7 +103,7 @@ int musttail_call(int x) {
 
 // SB-LABEL: define{{.*}} i32 @setjmp_like(
 // SB: call{{.*}} @returns_twice
-// SB-NEXT: store i8 0, ptr getelementptr inbounds ([4 x i8], ptr @__profc_setjmp_like, i32 0, i32 2)
+// SB-NEXT: store i8 0, ptr getelementptr inbounds ([4 x i8], ptr @__profc_setjmp_like, i32 0, i32 3)
 
 // SB-LABEL: define{{.*}} i32 @musttail_call(
 // SB: musttail call i32 @tail_callee

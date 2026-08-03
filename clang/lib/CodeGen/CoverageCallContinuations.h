@@ -132,11 +132,10 @@ bool callContinuationAssignmentEvaluatesRHSFirst(const BinaryOperator *E,
 bool callContinuationAssignmentNeedsCounter(const BinaryOperator *E);
 bool callContinuationComplexOperationNeedsCounter(const BinaryOperator *E);
 bool callContinuationOverflowOperationNeedsCounter(const Expr *E,
-                                                    const LangOptions &Opts);
+                                                   const LangOptions &Opts);
 bool callContinuationBlockLiteralNeedsCounter(const BlockExpr *E);
 bool callContinuationBlockLiteralHasCleanup(const BlockExpr *E);
-bool callContinuationTLSAccessNeedsCounter(const Expr *E,
-                                           CodeGenModule &CGM);
+bool callContinuationTLSAccessNeedsCounter(const Expr *E, CodeGenModule &CGM);
 bool callContinuationEvaluatesVLAExtent(const UnaryExprOrTypeTraitExpr *E,
                                         const ASTContext &Context);
 
