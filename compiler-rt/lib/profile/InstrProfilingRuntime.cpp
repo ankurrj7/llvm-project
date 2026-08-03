@@ -67,7 +67,7 @@ __llvm_profile_dump_current_image(void) {
 
 static int RegisterRuntime() {
   __llvm_profile_initialize();
-#if defined(__linux__)
+#if defined(__linux__) && defined(COMPILER_RT_PROFILE_COVERAGE_RUNTIME)
   ProfileDumpCurrentImageProcess = (int)getpid();
 #endif
 #ifdef _AIX
