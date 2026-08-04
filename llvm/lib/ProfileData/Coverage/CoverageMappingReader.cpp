@@ -1104,6 +1104,8 @@ class SPICoverageReader final : public CoverageMappingReader {
       : Records(std::move(Records)), CompilationDir(CompilationDir) {}
 
 public:
+  bool isSPIContainer() const override { return true; }
+
   static Expected<std::unique_ptr<CoverageMappingReader>>
   create(StringRef Data, StringRef CompilationDir) {
     auto Contents = readCoverageMappingSPI(Data);
