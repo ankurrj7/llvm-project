@@ -1170,9 +1170,20 @@ Error CoverageMapping::loadFromReaders(
       !ProfileReader || ProfileReader.value().get().hasSingleByteCoverage();
   for (const auto &CoverageReader : CoverageReaders) {
     if (Options.LoadExecutedFunctionsOnly) {
+      const bool IsSPIContainer = CoverageReader->isSPIContainer();
       std::optional<InstrProfRecord> ProfileRecord;
       auto ShouldRead = [&](StringRef FunctionName,
                             uint64_t FunctionHash) -> Expected<bool> {
+        // A zero function hash is emitted for coverage-only inline placeholders
+        // which do not have an executable profile record. In SPI mode these can
+        // survive from translation units whose inline definition was not linked,
+        // while another definition of the same function provides the real
+        // non-zero profile hash. Do not ask the profile reader to match the
+        // placeholder hash; it can only produce a misleading mismatch before
+        // the decoded zero-placeholder record would be skipped.
+        if (IsSPIContainer && FunctionHash == 0)
+          return false;
+
         if (!Options.KeepFunctionRecords) {
           auto FunctionIt =
               Coverage.StreamedRecordProvenance.find(FunctionName);

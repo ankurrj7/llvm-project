@@ -110,6 +110,7 @@ public:
   virtual Error
   readNextRecord(CoverageMappingRecord &Record,
                  function_ref<Expected<bool>(StringRef, uint64_t)> ShouldRead);
+  virtual bool isSPIContainer() const { return false; }
   CoverageMappingIterator begin() { return CoverageMappingIterator(this); }
   CoverageMappingIterator end() { return CoverageMappingIterator(); }
 };
