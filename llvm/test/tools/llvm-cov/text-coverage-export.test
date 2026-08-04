@@ -154,6 +154,7 @@
 // FRAGMENTS-DAG:  1 1.29 1.36 1
 // FRAGMENTS-DAG:  1 1.39 1.46 1
 // FRAGMENTS-DAG:  1 1.49 1.50 0
+// FRAGMENTS-NOT:  {{^1[[:space:]]+1\.1[[:space:]]}}
 // FRAGMENTS:      end
 
 // FULL:      txtcvrg 3 baseline branches=0 mcdc=0

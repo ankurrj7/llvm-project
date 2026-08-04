@@ -202,6 +202,18 @@ std::string sourceRegionKey(const SourceRegion &Region) {
   return Key;
 }
 
+bool isSyntheticExpandedSourceCodeRegion(const SourceRegion &Region,
+                                         bool IsExpandedFile) {
+  // Expanded source files can contain bookkeeping code regions that start at
+  // the synthetic beginning of the expanded file rather than at a token in the
+  // physical source. Do not print those as source-owned txtcvrg rows; they
+  // produce misleading ranges such as "1.1 -> <macro end>" in headers. Keep
+  // this limited to non-root source aggregation, and keep expansion records and
+  // real macro body regions intact.
+  return IsExpandedFile && Region.Kind == ReportCodeRegionKind &&
+         Region.LineStart == 1 && Region.ColumnStart == 1;
+}
+
 } // namespace
 
 class CoverageExporterCoveredFunctions::Implementation {
@@ -567,6 +579,9 @@ public:
                                 Region.LineStart,     Region.ColumnStart,
                                 Region.LineEnd,       Region.ColumnEnd,
                                 Region.ExecutionCount};
+      if (isSyntheticExpandedSourceCodeRegion(
+              OutputRegion, ExpandedFileIDs.test(Region.FileID)))
+        continue;
       if (Error E = addSourceRegion(std::move(OutputRegion)))
         return E;
     }
