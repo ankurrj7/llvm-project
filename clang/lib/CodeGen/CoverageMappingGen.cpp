@@ -1310,6 +1310,8 @@ struct CounterCoverageMappingBuilder
     size_t Index = pushRegion(TopCount, StartLoc, EndLoc);
     if (VisitChildren)
       Visit(S);
+    if (VisitChildren && isa<CompoundStmt>(S))
+      completeTailCallContinuationRegion(EndLoc, /*AllowMissingEndLoc=*/true);
     Counter ExitCount = getRegion().getCounter();
     popRegions(Index);
 
@@ -1538,13 +1540,16 @@ struct CounterCoverageMappingBuilder
     startCallContinuationRegion(getEnd(S), ContinuationCount);
   }
 
-  void completeTailCallContinuationRegion() {
+  void completeTailCallContinuationRegion(SourceLocation CompoundEndLoc,
+                                          bool AllowMissingEndLoc = false) {
     if (!CallContinuationCounters || RegionStack.size() < 2)
       return;
     size_t ContinuationIndex = RegionStack.size() - 1;
     SourceMappingRegion &Continuation = RegionStack[ContinuationIndex];
     if (!CallContinuationRegionIndices.count(ContinuationIndex) ||
-        Continuation.hasStartLoc() || !Continuation.hasEndLoc())
+        Continuation.hasStartLoc())
+      return;
+    if (!Continuation.hasEndLoc() && !AllowMissingEndLoc)
       return;
 
     SourceMappingRegion &Previous = RegionStack[ContinuationIndex - 1];
@@ -1552,14 +1557,21 @@ struct CounterCoverageMappingBuilder
       return;
 
     SourceLocation StartLoc = Previous.getEndLoc();
-    SourceLocation EndLoc = Continuation.getEndLoc();
+    SourceLocation EndLoc =
+        Continuation.hasEndLoc() ? Continuation.getEndLoc() : CompoundEndLoc;
     if (!isRegionInSourceOrder(StartLoc, EndLoc))
       return;
 
     // When the last statement in a compound is a call, there is no following
-    // statement to start the continuation region. Complete it here so the
-    // trailing source range, including the closing brace, is still represented.
+    // statement to start the continuation region. The active fallthrough region
+    // may also have no end location, for example after an if statement. At a
+    // propagated compound boundary, use that compound's end as the natural tail
+    // boundary in that case so the trailing source range, including the closing
+    // brace, is still represented. Nested compounds visited as ordinary child
+    // statements may still be followed by an outer statement, so leave their
+    // no-end continuation regions for the outer gap handling.
     handleFileExit(StartLoc);
+    Continuation.setEndLoc(EndLoc);
     Continuation.setStartLoc(StartLoc);
   }
 
@@ -2088,7 +2100,7 @@ struct CounterCoverageMappingBuilder
 
   void VisitCompoundStmt(const CompoundStmt *S) {
     VisitStmt(S);
-    completeTailCallContinuationRegion();
+    completeTailCallContinuationRegion(getEnd(S));
     if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
             S, CallContinuationKind::CompoundFallthrough))
       startCallContinuationRegion(S, *ContinuationCounter);
