@@ -1532,6 +1532,31 @@ struct CounterCoverageMappingBuilder
     startCallContinuationRegion(getEnd(S), ContinuationCount);
   }
 
+  void completeTailCallContinuationRegion() {
+    if (!CallContinuationCounters || RegionStack.size() < 2)
+      return;
+    size_t ContinuationIndex = RegionStack.size() - 1;
+    SourceMappingRegion &Continuation = RegionStack[ContinuationIndex];
+    if (!CallContinuationRegionIndices.count(ContinuationIndex) ||
+        Continuation.hasStartLoc() || !Continuation.hasEndLoc())
+      return;
+
+    SourceMappingRegion &Previous = RegionStack[ContinuationIndex - 1];
+    if (!Previous.hasEndLoc())
+      return;
+
+    SourceLocation StartLoc = Previous.getEndLoc();
+    SourceLocation EndLoc = Continuation.getEndLoc();
+    if (!isRegionInSourceOrder(StartLoc, EndLoc))
+      return;
+
+    // When the last statement in a compound is a call, there is no following
+    // statement to start the continuation region. Complete it here so the
+    // trailing source range, including the closing brace, is still represented.
+    handleFileExit(StartLoc);
+    Continuation.setStartLoc(StartLoc);
+  }
+
   /// Find a valid gap range between \p AfterLoc and \p BeforeLoc.
   std::optional<SourceRange> findGapAreaBetween(SourceLocation AfterLoc,
                                                 SourceLocation BeforeLoc) {
@@ -2057,6 +2082,7 @@ struct CounterCoverageMappingBuilder
 
   void VisitCompoundStmt(const CompoundStmt *S) {
     VisitStmt(S);
+    completeTailCallContinuationRegion();
     if (std::optional<Counter> ContinuationCounter = getCallContinuationCounter(
             S, CallContinuationKind::CompoundFallthrough))
       startCallContinuationRegion(S, *ContinuationCounter);
