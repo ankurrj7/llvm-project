@@ -29,6 +29,10 @@ int after_call(void) {
   return 1;
 }
 
+void tail_call(void) {
+  f();
+}
+
 int setjmp_like(void) {
   if (returns_twice() == 0)
     return 1;
@@ -75,6 +79,9 @@ int compound_assignment_after_call(int *p) {
 // MAP-LABEL: after_call:
 // MAP: Gap,File 0, [[CALL_LINE:[0-9]+]]:7 -> [[RET_LINE:[0-9]+]]:3 = #1
 // MAP: File 0, [[RET_LINE]]:3 -> [[END_LINE:[0-9]+]]:2 = #1
+// MAP-LABEL: tail_call:
+// MAP: File 0, [[TAIL_DECL_LINE:[0-9]+]]:22 -> [[TAIL_CALL_LINE:[0-9]+]]:6 = #0
+// MAP: File 0, [[TAIL_CALL_LINE]]:6 -> [[TAIL_END_LINE:[0-9]+]]:2 = #1
 // MAP-LABEL: setjmp_like:
 // MAP: Branch,File 0, [[COND_LINE:[0-9]+]]:7 -> [[COND_LINE]]:27 = #1, (#2 - #1)
 // MAP-LABEL: after_guard_and_call:
@@ -83,8 +90,10 @@ int compound_assignment_after_call(int *p) {
 // MAP: Expansion,File 0, [[FIRST_CLEANUP:[0-9]+]]:5 -> [[FIRST_CLEANUP]]:22 = #{{[0-9]+}}
 // MAP: Expansion,File 0, [[SECOND_CLEANUP:[0-9]+]]:5 -> [[SECOND_CLEANUP]]:22 = #{{[0-9]+}}
 // MAP-LABEL: assignment_after_call:
-// MAP: File 0, [[ASSIGN_LINE:[0-9]+]]:3 -> [[ASSIGN_LINE]]:11 = #{{[0-9]+}}
+// MAP: File 0, [[ASSIGN_LINE:[0-9]+]]:3 -> [[ASSIGN_END_LINE:[0-9]+]]:2 = #{{[0-9]+}}
+// MAP: File 0, [[ASSIGN_LINE]]:8 -> [[ASSIGN_LINE]]:11 = #{{[0-9]+}}
 // MAP-LABEL: compound_assignment_after_call:
-// MAP: File 0, [[COMPOUND_ASSIGN_LINE:[0-9]+]]:3 -> [[COMPOUND_ASSIGN_LINE]]:12 = #{{[0-9]+}}
+// MAP: File 0, [[COMPOUND_ASSIGN_LINE:[0-9]+]]:3 -> [[COMPOUND_ASSIGN_END_LINE:[0-9]+]]:2 = #{{[0-9]+}}
+// MAP: File 0, [[COMPOUND_ASSIGN_LINE]]:9 -> [[COMPOUND_ASSIGN_LINE]]:12 = #{{[0-9]+}}
 // NOCC-LABEL: setjmp_like:
 // NOCC: Branch,File 0, [[COND_LINE:[0-9]+]]:7 -> [[COND_LINE]]:27 = #1, (#0 - #1)
