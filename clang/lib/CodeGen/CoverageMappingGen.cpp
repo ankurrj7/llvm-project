@@ -2213,13 +2213,19 @@ struct CounterCoverageMappingBuilder
         startCallContinuationRegion(E, *ContinuationCounter);
       return;
     }
+    Counter ParentCount = getRegion().getCounter();
+    Counter ExitCount;
     if (callContinuationAssignmentEvaluatesRHSFirst(
             E, CVM.getCodeGenModule().getContext())) {
-      Visit(E->getRHS());
-      Visit(E->getLHS());
+      ExitCount = propagateCounts(ParentCount, E->getRHS());
+      ExitCount = propagateCounts(ExitCount, E->getLHS());
     } else {
-      Visit(E->getLHS());
-      Visit(E->getRHS());
+      ExitCount = propagateCounts(ParentCount, E->getLHS());
+      ExitCount = propagateCounts(ExitCount, E->getRHS());
+    }
+    if (!IsCounterEqual(ExitCount, ParentCount)) {
+      getRegion().setCounter(ExitCount);
+      GapRegionCounter = ExitCount;
     }
     adjustForOutOfOrderTraversal(getEnd(E));
     if (std::optional<Counter> ContinuationCounter =
@@ -2239,8 +2245,13 @@ struct CounterCoverageMappingBuilder
     // Compound assignments likewise visit their RHS before their source-leading
     // LHS when tracking call continuations.
     extendRegion(E);
-    Visit(E->getRHS());
-    Visit(E->getLHS());
+    Counter ParentCount = getRegion().getCounter();
+    Counter ExitCount = propagateCounts(ParentCount, E->getRHS());
+    ExitCount = propagateCounts(ExitCount, E->getLHS());
+    if (!IsCounterEqual(ExitCount, ParentCount)) {
+      getRegion().setCounter(ExitCount);
+      GapRegionCounter = ExitCount;
+    }
     adjustForOutOfOrderTraversal(getEnd(E));
     if (std::optional<Counter> ContinuationCounter =
             getCallContinuationCounter(E, CallContinuationKind::Assignment))
