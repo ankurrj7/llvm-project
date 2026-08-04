@@ -16,6 +16,19 @@ int block_after_call(int argc) {
   return 0;
 }
 
+void final_call_after_if(int argc) {
+  if (argc)
+    f();
+  f();
+}
+
+void final_call_after_prior_continuations(int argc) {
+  f();
+  if (argc)
+    f();
+  f();
+}
+
 int while_call_condition(void) {
   while (returns_twice())
     f();
@@ -46,6 +59,12 @@ int musttail_call(int x) {
 // MAP-LABEL: block_after_call:
 // MAP: Gap,File 0, [[BLOCK_CLOSE:[0-9]+]]:4 -> [[BLOCK_NEXT:[0-9]+]]:3 = #2
 // MAP-NEXT: File 0, [[BLOCK_NEXT]]:3 -> [[BLOCK_NEXT]]:18 = #2
+
+// MAP-LABEL: final_call_after_if:
+// MAP: File 0, [[FINAL_CALL:[0-9]+]]:6 -> [[FINAL_END:[0-9]+]]:2 = #{{[0-9]+}}
+
+// MAP-LABEL: final_call_after_prior_continuations:
+// MAP: File 0, [[PRIOR_FINAL_CALL:[0-9]+]]:6 -> [[PRIOR_FINAL_END:[0-9]+]]:2 = #{{[0-9]+}}
 
 // MAP-LABEL: while_call_condition:
 // MAP: File 0, [[WHILE_COND:[0-9]+]]:10 -> [[WHILE_COND]]:25 = (#0 + #3)
