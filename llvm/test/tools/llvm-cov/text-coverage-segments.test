@@ -1,0 +1,119 @@
+// RUN: llvm-profdata merge %S/Inputs/combine_expansions.proftext \
+// RUN:   -o %t.expansions.profdata
+// RUN: llvm-profdata merge %S/Inputs/covered-functions-fragments.proftext \
+// RUN:   -o %t.fragments.profdata
+// RUN: llvm-profdata merge %S/Inputs/branch-c-general.proftext \
+// RUN:   -o %t.branches.profdata
+// RUN: llvm-profdata merge %S/Inputs/mcdc-general.proftext \
+// RUN:   -o %t.mcdc.profdata
+// RUN: yaml2obj %S/Inputs/covered-functions-fragments.yaml -o %t.fragments.o
+
+// Naming the default view explicitly must not change the existing format.
+// RUN: llvm-cov export --txtcvrgfull \
+// RUN:   %S/Inputs/multiple-files.covmapping > %t.regions.default
+// RUN: llvm-cov export --txtcvrgfull --txtcvrg-view=regions \
+// RUN:   %S/Inputs/multiple-files.covmapping > %t.regions.explicit
+// RUN: diff %t.regions.default %t.regions.explicit
+
+// A C++ mapping with nested regions verifies count-independent topology and a
+// missed inner interval in an otherwise covered function.
+// RUN: llvm-cov export --txtcvrgfull --txtcvrg-view=segments \
+// RUN:   --path-equivalence=/tmp,/mapped \
+// RUN:   %S/Inputs/highlightedRanges.covmapping > %t.highlighted.full
+// RUN: llvm-cov export --txtcvrg --txtcvrg-view=segments \
+// RUN:   --instr-profile=%S/Inputs/highlightedRanges.profdata \
+// RUN:   --path-equivalence=/tmp,/mapped \
+// RUN:   %S/Inputs/highlightedRanges.covmapping > %t.highlighted.exec
+// RUN: %python %S/Inputs/check_txtcvrg_segments.py \
+// RUN:   %t.highlighted.full %t.highlighted.exec
+// RUN: FileCheck %s --check-prefix=NESTED < %t.highlighted.exec
+
+// Same-file C++ macro expansions remain function-owned and have the same
+// structural records in baseline and execution modes.
+// RUN: llvm-cov export --txtcvrgfull --txtcvrg-view=segments \
+// RUN:   %S/Inputs/combine_expansions.covmapping > %t.expansions.full
+// RUN: llvm-cov export --txtcvrg --txtcvrg-view=segments \
+// RUN:   --instr-profile=%t.expansions.profdata \
+// RUN:   %S/Inputs/combine_expansions.covmapping > %t.expansions.exec
+// RUN: %python %S/Inputs/check_txtcvrg_segments.py \
+// RUN:   %t.expansions.full %t.expansions.exec
+// RUN: FileCheck %s --check-prefix=SAME-FILE-MACRO < %t.expansions.exec
+
+// A macro body in a header verifies cross-file ownership, a zero-count macro
+// interval, and explicit invocation-to-expanded-file metadata.
+// RUN: llvm-cov export --txtcvrgfull --txtcvrg-view=segments \
+// RUN:   %t.fragments.o > %t.fragments.full
+// RUN: llvm-cov export --txtcvrg --txtcvrg-view=segments \
+// RUN:   --instr-profile=%t.fragments.profdata \
+// RUN:   %t.fragments.o > %t.fragments.exec
+// RUN: %python %S/Inputs/check_txtcvrg_segments.py \
+// RUN:   %t.fragments.full %t.fragments.exec
+// RUN: FileCheck %s --check-prefix=HEADER-MACRO < %t.fragments.exec
+
+// Template instantiations exercise non-C function identities and ensure that
+// execution filtering does not alter common-function topology.
+// RUN: llvm-cov export --txtcvrgfull --txtcvrg-view=segments \
+// RUN:   --path-equivalence=/tmp,%S \
+// RUN:   %S/Inputs/templateInstantiations.covmapping > %t.templates.full
+// RUN: llvm-cov export --txtcvrg --txtcvrg-view=segments \
+// RUN:   --instr-profile=%S/Inputs/templateInstantiations.profdata \
+// RUN:   --path-equivalence=/tmp,%S \
+// RUN:   %S/Inputs/templateInstantiations.covmapping > %t.templates.exec
+// RUN: %python %S/Inputs/check_txtcvrg_segments.py \
+// RUN:   %t.templates.full %t.templates.exec
+// RUN: FileCheck %s --check-prefix=TEMPLATE < %t.templates.exec
+
+// Optional branch and MC/DC records coexist with normalized segment records.
+// RUN: llvm-cov export --txtcvrg --txtcvrg-view=segments --include-branches \
+// RUN:   --instr-profile=%t.branches.profdata \
+// RUN:   %S/Inputs/branch-c-general.o32l | FileCheck %s \
+// RUN:   --check-prefix=SEGMENT-BRANCH
+// RUN: llvm-cov export --txtcvrg --txtcvrg-view=segments --include-mcdc \
+// RUN:   --instr-profile=%t.mcdc.profdata \
+// RUN:   %S/Inputs/mcdc-general.o | FileCheck %s \
+// RUN:   --check-prefix=SEGMENT-MCDC
+
+// The option is deliberately confined to txtcvrg export.
+// RUN: not llvm-cov export --txtcvrgfull --txtcvrg-view=unknown \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-VIEW
+// RUN: not llvm-cov export --empty-profile --txtcvrg-view=segments \
+// RUN:   %S/Inputs/multiple-files.covmapping 2>&1 | FileCheck %s \
+// RUN:   --check-prefix=BAD-VIEW-USE
+
+// NESTED:      txtcvrg 4 execution view=segments branches=0 mcdc=0
+// NESTED:      function "_Z4funcv" 2 1 50.00
+// NESTED-NEXT: 1 3.13 5.3 1
+// NESTED-NEXT: 1 5.3 6.2 0
+
+// SAME-FILE-MACRO:      function "main" 1 1 100.00
+// SAME-FILE-MACRO-NEXT: 1 22.12 26.2 1
+// SAME-FILE-MACRO-NEXT: 2 23.3 23.15 1
+// SAME-FILE-MACRO:      file "/tmp/ec/combine_expansions.cpp"
+// SAME-FILE-MACRO-NEXT: 1 7.3 7.6 2
+// SAME-FILE-MACRO-NEXT: 1 12.3 15.4 2
+// SAME-FILE-MACRO-NEXT: 2 14.5 14.14 2
+
+// HEADER-MACRO:      function "covered" 1 1 100.00
+// HEADER-MACRO-NEXT: 1 3.20 3.50 1
+// HEADER-MACRO-NEXT: 2 3.29 3.44 1
+// HEADER-MACRO:      file "/tmp/covered-functions-fragment/covered-functions-fragment.h"
+// HEADER-MACRO-NEXT: 1 1.28 1.39 1
+// HEADER-MACRO:      1 1.49 1.50 0
+
+// TEMPLATE-DAG: function "_Z4funcIbEiT_" 4 2 50.00
+// TEMPLATE-DAG: function "_Z4funcIiEiT_" 4 2 50.00
+
+// SEGMENT-BRANCH: txtcvrg 4 execution view=segments branches=1 mcdc=0
+// SEGMENT-BRANCH: function
+// SEGMENT-BRANCH: 1
+// SEGMENT-BRANCH: branch
+
+// SEGMENT-MCDC: txtcvrg 4 execution view=segments branches=0 mcdc=1
+// SEGMENT-MCDC: function
+// SEGMENT-MCDC: 1
+// SEGMENT-MCDC: mcdc-branch
+// SEGMENT-MCDC: mcdc-decision
+
+// BAD-VIEW: error: --txtcvrg-view must be 'regions' or 'segments'
+// BAD-VIEW-USE: error: --txtcvrg-view requires --txtcvrg or --txtcvrgfull

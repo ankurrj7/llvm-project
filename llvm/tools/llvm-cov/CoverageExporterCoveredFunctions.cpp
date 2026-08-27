@@ -9,8 +9,10 @@
 #include "CoverageExporterCoveredFunctions.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Errc.h"
@@ -27,6 +29,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -46,6 +49,274 @@ constexpr unsigned MaxSourcePartitionDepth = 8;
 // Non-countable skipped and gap regions are intentionally omitted.
 constexpr uint32_t ReportCodeRegionKind = 1;
 constexpr uint32_t ReportExpansionRegionKind = 2;
+
+struct StructuralRegion {
+  CounterMappingRegion::RegionKind Kind;
+  LineColPair Start;
+  LineColPair End;
+  Counter StaticCounter;
+  uint64_t ExecutionCount;
+  unsigned MappingOrdinal;
+  bool HasMultipleCounters = false;
+};
+
+struct StructuralSegment {
+  LineColPair Start;
+  LineColPair End;
+  Counter StaticCounter;
+  uint64_t ExecutionCount;
+  bool HasMultipleCounters;
+};
+
+unsigned structuralKindPrecedence(CounterMappingRegion::RegionKind Kind) {
+  switch (Kind) {
+  case CounterMappingRegion::CodeRegion:
+    return 0;
+  case CounterMappingRegion::SkippedRegion:
+    return 1;
+  case CounterMappingRegion::GapRegion:
+    return 2;
+  case CounterMappingRegion::ExpansionRegion:
+  case CounterMappingRegion::BranchRegion:
+  case CounterMappingRegion::MCDCDecisionRegion:
+  case CounterMappingRegion::MCDCBranchRegion:
+    llvm_unreachable("non-structural coverage region");
+  }
+  llvm_unreachable("unknown coverage region kind");
+}
+
+bool structuralRegionLess(const StructuralRegion &LHS,
+                          const StructuralRegion &RHS) {
+  if (LHS.Start != RHS.Start)
+    return LHS.Start < RHS.Start;
+  if (LHS.End != RHS.End)
+    return RHS.End < LHS.End;
+  if (LHS.Kind != RHS.Kind)
+    return structuralKindPrecedence(LHS.Kind) <
+           structuralKindPrecedence(RHS.Kind);
+  return LHS.MappingOrdinal < RHS.MappingOrdinal;
+}
+
+bool sameStructuralCoordinates(const StructuralRegion &LHS,
+                               const StructuralRegion &RHS) {
+  return LHS.Start == RHS.Start && LHS.End == RHS.End;
+}
+
+bool haveSameStaticCounter(const StructuralRegion &LHS,
+                           const StructuralRegion &RHS) {
+  return !LHS.HasMultipleCounters && !RHS.HasMultipleCounters &&
+         LHS.Kind == CounterMappingRegion::CodeRegion &&
+         RHS.Kind == CounterMappingRegion::CodeRegion &&
+         LHS.StaticCounter == RHS.StaticCounter;
+}
+
+std::optional<std::vector<StructuralSegment>>
+buildNestedStructuralSegments(ArrayRef<StructuralRegion> Regions) {
+  SmallVector<LineColPair, 8> EndStack;
+  for (const StructuralRegion &Region : Regions) {
+    while (!EndStack.empty() && EndStack.back() <= Region.Start)
+      EndStack.pop_back();
+    if (!EndStack.empty() && EndStack.back() < Region.End)
+      return std::nullopt;
+    EndStack.push_back(Region.End);
+  }
+
+  SmallVector<unsigned, 8> Active;
+  size_t StartIndex = 0;
+  std::optional<LineColPair> PreviousLoc;
+  std::optional<unsigned> LastOwner;
+  std::vector<StructuralSegment> Segments;
+  while (StartIndex != Regions.size() || !Active.empty()) {
+    std::optional<LineColPair> EventLoc;
+    if (StartIndex != Regions.size())
+      EventLoc = Regions[StartIndex].Start;
+    if (!Active.empty())
+      EventLoc = EventLoc ? std::min(*EventLoc, Regions[Active.back()].End)
+                          : Regions[Active.back()].End;
+
+    if (PreviousLoc && *PreviousLoc < *EventLoc && !Active.empty()) {
+      unsigned OwnerIndex = Active.back();
+      const StructuralRegion &Owner = Regions[OwnerIndex];
+      if (Owner.Kind == CounterMappingRegion::CodeRegion) {
+        if (LastOwner && haveSameStaticCounter(Regions[*LastOwner], Owner) &&
+            !Segments.empty() && Segments.back().End == *PreviousLoc)
+          Segments.back().End = *EventLoc;
+        else
+          Segments.push_back({*PreviousLoc, *EventLoc, Owner.StaticCounter,
+                              Owner.ExecutionCount, Owner.HasMultipleCounters});
+        LastOwner = OwnerIndex;
+      } else {
+        LastOwner.reset();
+      }
+    }
+
+    while (!Active.empty() && Regions[Active.back()].End == *EventLoc)
+      Active.pop_back();
+    while (StartIndex != Regions.size() &&
+           Regions[StartIndex].Start == *EventLoc)
+      Active.push_back(StartIndex++);
+    PreviousLoc = *EventLoc;
+  }
+  return Segments;
+}
+
+std::vector<StructuralSegment>
+buildStructuralSegments(std::vector<StructuralRegion> Regions) {
+  // A macro-generated function can have no source-width executable segment in
+  // its root file. Its code regions are still backed by counters and are the
+  // only way txtcvrg can report whether the function executed. Keep one
+  // fallback point per code region when normalization produces no ordinary
+  // executable segment. Using the original start location preserves stable
+  // identity without reintroducing overlapping ranges.
+  if (!llvm::is_sorted(Regions, structuralRegionLess))
+    llvm::sort(Regions, structuralRegionLess);
+  std::vector<StructuralSegment> FallbackCounterPoints;
+  for (const StructuralRegion &Region : Regions) {
+    if (Region.Kind == CounterMappingRegion::CodeRegion)
+      FallbackCounterPoints.push_back(
+          {Region.Start, Region.Start, Region.StaticCounter,
+           Region.ExecutionCount, Region.HasMultipleCounters});
+  }
+
+  llvm::erase_if(Regions, [](const StructuralRegion &Region) {
+    return !(Region.Start < Region.End);
+  });
+
+  std::vector<StructuralRegion> Combined;
+  Combined.reserve(Regions.size());
+  for (StructuralRegion &Region : Regions) {
+    if (!Combined.empty() &&
+        sameStructuralCoordinates(Combined.back(), Region)) {
+      // A gap or skipped region masks an executable region at the same exact
+      // coordinates. Among duplicates of the selected kind, aggregate counts
+      // to match LLVM's source-rendering semantics.
+      if (Combined.back().Kind == Region.Kind) {
+        Combined.back().ExecutionCount = SaturatingAdd(
+            Combined.back().ExecutionCount, Region.ExecutionCount);
+        if (Combined.back().StaticCounter != Region.StaticCounter)
+          Combined.back().HasMultipleCounters = true;
+      } else if (structuralKindPrecedence(Combined.back().Kind) <
+                 structuralKindPrecedence(Region.Kind)) {
+        Combined.back() = Region;
+      }
+      continue;
+    }
+    Combined.push_back(Region);
+  }
+
+  if (auto Segments = buildNestedStructuralSegments(Combined)) {
+    if (Segments->empty())
+      return FallbackCounterPoints;
+    return std::move(*Segments);
+  }
+
+  // Coverage mappings are normally properly nested. Keep a general ordered
+  // active-set fallback so unusual crossing ranges still normalize safely.
+  std::vector<unsigned> Ends;
+  Ends.reserve(Combined.size());
+  for (unsigned I = 0; I != Combined.size(); ++I) {
+    Ends.push_back(I);
+  }
+  llvm::sort(Ends, [&](unsigned LHS, unsigned RHS) {
+    if (Combined[LHS].End != Combined[RHS].End)
+      return Combined[LHS].End < Combined[RHS].End;
+    return structuralRegionLess(Combined[LHS], Combined[RHS]);
+  });
+
+  struct ActiveRegionLess {
+    const std::vector<StructuralRegion> *Regions;
+
+    bool operator()(unsigned LHS, unsigned RHS) const {
+      const StructuralRegion &L = (*Regions)[LHS];
+      const StructuralRegion &R = (*Regions)[RHS];
+      if (L.Start != R.Start)
+        return R.Start < L.Start;
+      if (L.End != R.End)
+        return L.End < R.End;
+      if (L.Kind != R.Kind)
+        return structuralKindPrecedence(L.Kind) <
+               structuralKindPrecedence(R.Kind);
+      return L.MappingOrdinal < R.MappingOrdinal;
+    }
+  };
+
+  std::set<unsigned, ActiveRegionLess> Active(ActiveRegionLess{&Combined});
+  size_t StartIndex = 0;
+  size_t EndIndex = 0;
+  std::vector<StructuralSegment> Segments;
+  std::optional<unsigned> LastOwner;
+  while (StartIndex != Combined.size() || EndIndex != Ends.size()) {
+    LineColPair Loc;
+    if (StartIndex == Combined.size())
+      Loc = Combined[Ends[EndIndex]].End;
+    else if (EndIndex == Ends.size())
+      Loc = Combined[StartIndex].Start;
+    else
+      Loc = std::min(Combined[StartIndex].Start, Combined[Ends[EndIndex]].End);
+    while (EndIndex != Ends.size() && Combined[Ends[EndIndex]].End <= Loc) {
+      Active.erase(Ends[EndIndex]);
+      ++EndIndex;
+    }
+    while (StartIndex != Combined.size() && Combined[StartIndex].Start == Loc) {
+      Active.insert(StartIndex);
+      ++StartIndex;
+    }
+
+    std::optional<LineColPair> NextLoc;
+    if (StartIndex != Combined.size())
+      NextLoc = Combined[StartIndex].Start;
+    if (EndIndex != Ends.size())
+      NextLoc = NextLoc ? std::min(*NextLoc, Combined[Ends[EndIndex]].End)
+                        : Combined[Ends[EndIndex]].End;
+    if (!NextLoc)
+      break;
+    if (Active.empty()) {
+      LastOwner.reset();
+      continue;
+    }
+    unsigned OwnerIndex = *Active.begin();
+    const StructuralRegion &Owner = Combined[OwnerIndex];
+    if (Owner.Kind != CounterMappingRegion::CodeRegion) {
+      LastOwner.reset();
+      continue;
+    }
+    if (LastOwner && haveSameStaticCounter(Combined[*LastOwner], Owner) &&
+        !Segments.empty() && Segments.back().End == Loc)
+      Segments.back().End = *NextLoc;
+    else
+      Segments.push_back({Loc, *NextLoc, Owner.StaticCounter,
+                          Owner.ExecutionCount, Owner.HasMultipleCounters});
+    LastOwner = OwnerIndex;
+  }
+  if (Segments.empty())
+    return FallbackCounterPoints;
+  return Segments;
+}
+
+void retainOneSegmentPerCounter(std::vector<StructuralSegment> &Segments) {
+  std::set<Counter> SeenCounters;
+  std::optional<LineColPair> PreviousEnd;
+  llvm::erase_if(Segments, [&](const StructuralSegment &Segment) {
+    // Fallback counter points represent distinct raw code records. Keep them
+    // all so function totals and hit state are not changed by deduplication.
+    if (Segment.Start == Segment.End)
+      return false;
+
+    // Counter expressions may legitimately recur in a later source range.
+    // Only deduplicate within one uninterrupted normalization run, where a
+    // broad region is split and then resumes around a nested region (A-B-A).
+    if (!PreviousEnd || *PreviousEnd != Segment.Start)
+      SeenCounters.clear();
+    PreviousEnd = Segment.End;
+
+    // A constant-zero counter does not identify a unique executable block:
+    // unrelated unreachable regions all use it. Exact-overlap aggregation can
+    // also represent several counters, so keep those structural ranges.
+    if (Segment.StaticCounter.isZero() || Segment.HasMultipleCounters)
+      return false;
+    return !SeenCounters.insert(Segment.StaticCounter).second;
+  });
+}
 
 std::optional<uint32_t>
 getReportRegionKind(CounterMappingRegion::RegionKind Kind) {
@@ -77,6 +348,66 @@ struct SourceRegion {
   uint32_t ColumnEnd;
   uint64_t ExecutionCount;
 };
+
+std::vector<SourceRegion>
+buildAggregatedSourceSegments(ArrayRef<SourceRegion> Regions) {
+  struct Event {
+    LineColPair Loc;
+    unsigned RegionIndex;
+    bool IsStart;
+  };
+
+  std::vector<Event> Events;
+  Events.reserve(2 * Regions.size());
+  for (unsigned I = 0; I != Regions.size(); ++I) {
+    const SourceRegion &Region = Regions[I];
+    LineColPair Start{Region.LineStart, Region.ColumnStart};
+    LineColPair End{Region.LineEnd, Region.ColumnEnd};
+    if (!(Start < End))
+      continue;
+    Events.push_back({Start, I, true});
+    Events.push_back({End, I, false});
+  }
+  llvm::sort(Events, [](const Event &LHS, const Event &RHS) {
+    return std::tie(LHS.Loc, LHS.IsStart, LHS.RegionIndex) <
+           std::tie(RHS.Loc, RHS.IsStart, RHS.RegionIndex);
+  });
+
+  uint64_t CountLow = 0;
+  uint64_t CountHigh = 0;
+  size_t ActiveRegions = 0;
+  std::vector<SourceRegion> Segments;
+  for (size_t I = 0; I != Events.size();) {
+    LineColPair Loc = Events[I].Loc;
+    size_t NextEvent = I;
+    while (NextEvent != Events.size() && Events[NextEvent].Loc == Loc) {
+      const Event &Current = Events[NextEvent++];
+      uint64_t Count = Regions[Current.RegionIndex].ExecutionCount;
+      uint64_t OldLow = CountLow;
+      if (Current.IsStart) {
+        CountLow += Count;
+        CountHigh += CountLow < OldLow;
+        ++ActiveRegions;
+      } else {
+        CountLow -= Count;
+        CountHigh -= OldLow < Count;
+        --ActiveRegions;
+      }
+    }
+    if (NextEvent == Events.size() || ActiveRegions == 0) {
+      I = NextEvent;
+      continue;
+    }
+    LineColPair End = Events[NextEvent].Loc;
+    uint64_t ExecutionCount =
+        CountHigh ? std::numeric_limits<uint64_t>::max() : CountLow;
+    Segments.push_back({Regions.front().FilenameID, ReportCodeRegionKind,
+                        Loc.first, Loc.second, End.first, End.second,
+                        ExecutionCount});
+    I = NextEvent;
+  }
+  return Segments;
+}
 
 struct SourceFileRegions {
   std::unordered_map<std::string, SourceRegion> Regions;
@@ -220,6 +551,24 @@ class CoverageExporterCoveredFunctions::Implementation {
   struct PathRemapping {
     std::string From;
     std::string To;
+  };
+
+  struct FunctionFileRegions {
+    unsigned FileID;
+    std::string Filename;
+    bool IsRoot = false;
+    std::vector<StructuralRegion> Regions;
+    std::vector<StructuralSegment> Segments;
+  };
+
+  struct FunctionExpansion {
+    unsigned FileID;
+    std::string Filename;
+    LineColPair Start;
+    LineColPair End;
+    std::string ExpandedFilename;
+    uint64_t ExecutionCount;
+    unsigned MappingOrdinal;
   };
 
   raw_ostream &OS;
@@ -383,14 +732,44 @@ class CoverageExporterCoveredFunctions::Implementation {
   }
 
   void renderSourceFiles(DenseMap<uint32_t, SourceFileRegions> &Files) {
-    for (auto &File : Files) {
-      assert(File.first < SourceFilenames.size() &&
-             "invalid source filename ID");
+    SmallVector<uint32_t, 8> FileIDs;
+    FileIDs.reserve(Files.size());
+    for (const auto &File : Files)
+      FileIDs.push_back(File.first);
+    if (Options.ExportView == CoveredFunctionsExportOptions::View::Segments)
+      llvm::sort(FileIDs, [&](uint32_t LHS, uint32_t RHS) {
+        return SourceFilenames[LHS] < SourceFilenames[RHS];
+      });
+
+    for (uint32_t FileID : FileIDs) {
+      assert(FileID < SourceFilenames.size() && "invalid source filename ID");
       OS << "\nfile\t\"";
-      printEscapedString(SourceFilenames[File.first], OS);
+      printEscapedString(SourceFilenames[FileID], OS);
       OS << "\"\n";
-      for (const auto &Entry : File.second.Regions) {
-        const SourceRegion &Region = Entry.second;
+      SmallVector<SourceRegion, 8> Regions;
+      if (Options.ExportView == CoveredFunctionsExportOptions::View::Segments) {
+        SmallVector<SourceRegion, 8> CodeRegions;
+        for (const auto &Entry : Files.find(FileID)->second.Regions) {
+          const SourceRegion &Region = Entry.second;
+          if (Region.Kind != ReportCodeRegionKind) {
+            Regions.push_back(Region);
+            continue;
+          }
+          CodeRegions.push_back(Region);
+        }
+        llvm::append_range(Regions, buildAggregatedSourceSegments(CodeRegions));
+        llvm::sort(Regions,
+                   [](const SourceRegion &LHS, const SourceRegion &RHS) {
+                     return std::tie(LHS.LineStart, LHS.ColumnStart,
+                                     LHS.LineEnd, LHS.ColumnEnd, LHS.Kind) <
+                            std::tie(RHS.LineStart, RHS.ColumnStart,
+                                     RHS.LineEnd, RHS.ColumnEnd, RHS.Kind);
+                   });
+      } else {
+        for (const auto &Entry : Files.find(FileID)->second.Regions)
+          Regions.push_back(Entry.second);
+      }
+      for (const SourceRegion &Region : Regions) {
         OS << Region.Kind << '\t' << Region.LineStart << '.'
            << Region.ColumnStart << '\t' << Region.LineEnd << '.'
            << Region.ColumnEnd << '\t' << Region.ExecutionCount << '\n';
@@ -479,6 +858,164 @@ class CoverageExporterCoveredFunctions::Implementation {
     return Error::success();
   }
 
+  Expected<bool> renderSegmentFunction(StringRef RawFunctionName,
+                                       FunctionRecord &Function,
+                                       unsigned RootFileID,
+                                       const SmallBitVector &ExpandedFileIDs) {
+    std::vector<FunctionFileRegions> Files;
+    DenseMap<unsigned, unsigned> FileIndices;
+    auto GetFile = [&](unsigned FileID,
+                       StringRef Filename) -> FunctionFileRegions & {
+      auto [I, Inserted] = FileIndices.try_emplace(FileID, Files.size());
+      if (Inserted)
+        Files.push_back({FileID, Filename.str(), FileID == RootFileID, {}, {}});
+      return Files[I->second];
+    };
+
+    StringRef RootFilename = remapPathCached(Function.Filenames[RootFileID]);
+    GetFile(RootFileID, RootFilename);
+    std::vector<FunctionExpansion> Expansions;
+    for (unsigned Ordinal = 0; Ordinal != Function.CountedRegions.size();
+         ++Ordinal) {
+      const CountedRegion &Region = Function.CountedRegions[Ordinal];
+      StringRef Filename = Function.Filenames[Region.FileID];
+      if (FilenameFilters.matchesFilename(Filename))
+        continue;
+      StringRef RemappedFilename = remapPathCached(Filename);
+
+      if (Region.Kind == CounterMappingRegion::ExpansionRegion) {
+        StringRef ExpandedFilename = Function.Filenames[Region.ExpandedFileID];
+        if (FilenameFilters.matchesFilename(ExpandedFilename) ||
+            !(Region.startLoc() < Region.endLoc()))
+          continue;
+        Expansions.push_back({Region.FileID, RemappedFilename.str(),
+                              Region.startLoc(), Region.endLoc(),
+                              remapPathCached(ExpandedFilename).str(),
+                              Region.ExecutionCount, Ordinal});
+        continue;
+      }
+      if (Region.Kind != CounterMappingRegion::CodeRegion &&
+          Region.Kind != CounterMappingRegion::GapRegion &&
+          Region.Kind != CounterMappingRegion::SkippedRegion)
+        continue;
+      if (ExpandedFileIDs.test(Region.FileID) &&
+          Region.Kind == CounterMappingRegion::CodeRegion &&
+          Region.LineStart == 1 && Region.ColumnStart == 1)
+        continue;
+      GetFile(Region.FileID, RemappedFilename)
+          .Regions.push_back({Region.Kind, Region.startLoc(), Region.endLoc(),
+                              Region.Count, Region.ExecutionCount, Ordinal});
+    }
+
+    llvm::sort(Files, [](const FunctionFileRegions &LHS,
+                         const FunctionFileRegions &RHS) {
+      if (LHS.IsRoot != RHS.IsRoot)
+        return LHS.IsRoot;
+      return std::tie(LHS.Filename, LHS.FileID) <
+             std::tie(RHS.Filename, RHS.FileID);
+    });
+
+    FunctionFileRegions *RootFile = nullptr;
+    for (FunctionFileRegions &File : Files) {
+      File.Segments = buildStructuralSegments(std::move(File.Regions));
+      retainOneSegmentPerCounter(File.Segments);
+      if (File.IsRoot)
+        RootFile = &File;
+    }
+    assert(RootFile && "missing root coverage file");
+    uint64_t TotalSegments = RootFile->Segments.size();
+    uint64_t HitSegments =
+        llvm::count_if(RootFile->Segments, [](const auto &Segment) {
+          return Segment.ExecutionCount != 0;
+        });
+    if (TotalSegments == 0 ||
+        (Options.ExportMode == CoveredFunctionsExportOptions::Mode::Execution &&
+         HitSegments == 0))
+      return false;
+
+    llvm::sort(Expansions,
+               [](const FunctionExpansion &LHS, const FunctionExpansion &RHS) {
+                 return std::tie(LHS.Filename, LHS.FileID, LHS.Start, LHS.End,
+                                 LHS.ExpandedFilename, LHS.MappingOrdinal) <
+                        std::tie(RHS.Filename, RHS.FileID, RHS.Start, RHS.End,
+                                 RHS.ExpandedFilename, RHS.MappingOrdinal);
+               });
+    std::vector<FunctionExpansion> CombinedExpansions;
+    CombinedExpansions.reserve(Expansions.size());
+    for (FunctionExpansion &Expansion : Expansions) {
+      if (!CombinedExpansions.empty()) {
+        FunctionExpansion &Last = CombinedExpansions.back();
+        if (std::tie(Last.Filename, Last.FileID, Last.Start, Last.End,
+                     Last.ExpandedFilename) ==
+            std::tie(Expansion.Filename, Expansion.FileID, Expansion.Start,
+                     Expansion.End, Expansion.ExpandedFilename)) {
+          Last.ExecutionCount =
+              SaturatingAdd(Last.ExecutionCount, Expansion.ExecutionCount);
+          continue;
+        }
+      }
+      CombinedExpansions.push_back(std::move(Expansion));
+    }
+
+    std::string DisplayName =
+        Function.Name.empty() ? RawFunctionName.str() : Function.Name;
+    if (DisplayName.empty())
+      DisplayName = "<global-init@" + RootFilename.str() + ">";
+    renderFunction(RootFilename, DisplayName, TotalSegments, HitSegments);
+    SmallVector<SourceRegion, 8> RootOutputRegions;
+    for (const StructuralSegment &Segment : RootFile->Segments)
+      RootOutputRegions.push_back({0, ReportCodeRegionKind, Segment.Start.first,
+                                   Segment.Start.second, Segment.End.first,
+                                   Segment.End.second, Segment.ExecutionCount});
+
+    for (const FunctionExpansion &Expansion : CombinedExpansions) {
+      if (Expansion.FileID != RootFileID)
+        continue;
+      RootOutputRegions.push_back(
+          {0, ReportExpansionRegionKind, Expansion.Start.first,
+           Expansion.Start.second, Expansion.End.first, Expansion.End.second,
+           Expansion.ExecutionCount});
+    }
+    llvm::sort(RootOutputRegions,
+               [](const SourceRegion &LHS, const SourceRegion &RHS) {
+                 return std::tie(LHS.LineStart, LHS.ColumnStart, LHS.LineEnd,
+                                 LHS.ColumnEnd, LHS.Kind) <
+                        std::tie(RHS.LineStart, RHS.ColumnStart, RHS.LineEnd,
+                                 RHS.ColumnEnd, RHS.Kind);
+               });
+    for (const SourceRegion &Region : RootOutputRegions)
+      OS << Region.Kind << '\t' << Region.LineStart << '.' << Region.ColumnStart
+         << '\t' << Region.LineEnd << '.' << Region.ColumnEnd << '\t'
+         << Region.ExecutionCount << '\n';
+
+    for (const FunctionFileRegions &File : Files) {
+      if (File.IsRoot)
+        continue;
+      Expected<uint32_t> FilenameID = getSourceFilenameID(File.Filename);
+      if (!FilenameID)
+        return FilenameID.takeError();
+      for (const StructuralSegment &Segment : File.Segments)
+        if (Error E = addSourceRegion(
+                {*FilenameID, ReportCodeRegionKind, Segment.Start.first,
+                 Segment.Start.second, Segment.End.first, Segment.End.second,
+                 Segment.ExecutionCount}))
+          return std::move(E);
+    }
+    for (const FunctionExpansion &Expansion : CombinedExpansions) {
+      if (Expansion.FileID == RootFileID)
+        continue;
+      Expected<uint32_t> FilenameID = getSourceFilenameID(Expansion.Filename);
+      if (!FilenameID)
+        return FilenameID.takeError();
+      if (Error E = addSourceRegion(
+              {*FilenameID, ReportExpansionRegionKind, Expansion.Start.first,
+               Expansion.Start.second, Expansion.End.first,
+               Expansion.End.second, Expansion.ExecutionCount}))
+        return std::move(E);
+    }
+    return true;
+  }
+
 public:
   Implementation(raw_ostream &OS,
                  ArrayRef<std::pair<std::string, std::string>> Remappings,
@@ -489,10 +1026,17 @@ public:
     for (const auto &[From, To] : Remappings)
       PathRemappings.push_back(
           {normalizedPath(From, true), normalizedPath(To, true)});
-    OS << "txtcvrg\t3\t"
+    OS << "txtcvrg\t"
+       << (Options.ExportView == CoveredFunctionsExportOptions::View::Segments
+               ? 4
+               : 3)
+       << '\t'
        << (Options.ExportMode == CoveredFunctionsExportOptions::Mode::Baseline
                ? "baseline"
                : "execution")
+       << (Options.ExportView == CoveredFunctionsExportOptions::View::Segments
+               ? "\tview=segments"
+               : "")
        << "\tbranches=" << unsigned(Options.IncludeBranches)
        << "\tmcdc=" << unsigned(Options.IncludeMCDC) << '\n';
   }
@@ -531,59 +1075,70 @@ public:
     if (FilenameFilters.matchesFilename(Function.Filenames[*RootFileID]))
       return Error::success();
 
-    uint64_t TotalCodeRegions = 0;
-    uint64_t HitCodeRegions = 0;
-    bool HasReportableRootRegion = false;
-    for (const CountedRegion &Region : Function.CountedRegions) {
-      if (Region.FileID == *RootFileID) {
-        HasReportableRootRegion |= bool(getReportRegionKind(Region.Kind));
-        if (Region.Kind == CounterMappingRegion::CodeRegion) {
-          ++TotalCodeRegions;
-          HitCodeRegions += Region.ExecutionCount != 0;
+    if (Options.ExportView == CoveredFunctionsExportOptions::View::Segments) {
+      Expected<bool> Rendered = renderSegmentFunction(
+          RawFunctionName, Function, *RootFileID, ExpandedFileIDs);
+      if (!Rendered)
+        return Rendered.takeError();
+      if (!*Rendered)
+        return Error::success();
+    } else {
+      uint64_t TotalCodeRegions = 0;
+      uint64_t HitCodeRegions = 0;
+      bool HasReportableRootRegion = false;
+      for (const CountedRegion &Region : Function.CountedRegions) {
+        if (Region.FileID == *RootFileID) {
+          HasReportableRootRegion |= bool(getReportRegionKind(Region.Kind));
+          if (Region.Kind == CounterMappingRegion::CodeRegion) {
+            ++TotalCodeRegions;
+            HitCodeRegions += Region.ExecutionCount != 0;
+          }
         }
       }
-    }
-    if (Options.ExportMode == CoveredFunctionsExportOptions::Mode::Execution &&
-        HitCodeRegions == 0)
-      return Error::success();
-    if (!HasReportableRootRegion)
-      return Error::success();
+      if (Options.ExportMode ==
+              CoveredFunctionsExportOptions::Mode::Execution &&
+          HitCodeRegions == 0)
+        return Error::success();
+      if (!HasReportableRootRegion)
+        return Error::success();
 
-    StringRef RootFilename = remapPathCached(Function.Filenames[*RootFileID]);
-    std::string DisplayName =
-        Function.Name.empty() ? RawFunctionName.str() : Function.Name;
-    if (DisplayName.empty())
-      DisplayName = "<global-init@" + RootFilename.str() + ">";
-    renderFunction(RootFilename, DisplayName, TotalCodeRegions, HitCodeRegions);
-    for (const CountedRegion &Region : Function.CountedRegions) {
-      std::optional<uint32_t> ReportKind = getReportRegionKind(Region.Kind);
-      if (!ReportKind)
-        continue;
-      if (Region.FileID >= Function.Filenames.size())
-        return make_error<CoverageMapError>(coveragemap_error::malformed,
-                                            "invalid coverage FileID");
-      StringRef Filename = Function.Filenames[Region.FileID];
-      if (FilenameFilters.matchesFilename(Filename))
-        continue;
-      if (Region.FileID == *RootFileID) {
-        OS << *ReportKind << '\t' << Region.LineStart << '.'
-           << Region.ColumnStart << '\t' << Region.LineEnd << '.'
-           << Region.ColumnEnd << '\t' << Region.ExecutionCount << '\n';
-        continue;
+      StringRef RootFilename = remapPathCached(Function.Filenames[*RootFileID]);
+      std::string DisplayName =
+          Function.Name.empty() ? RawFunctionName.str() : Function.Name;
+      if (DisplayName.empty())
+        DisplayName = "<global-init@" + RootFilename.str() + ">";
+      renderFunction(RootFilename, DisplayName, TotalCodeRegions,
+                     HitCodeRegions);
+      for (const CountedRegion &Region : Function.CountedRegions) {
+        std::optional<uint32_t> ReportKind = getReportRegionKind(Region.Kind);
+        if (!ReportKind)
+          continue;
+        if (Region.FileID >= Function.Filenames.size())
+          return make_error<CoverageMapError>(coveragemap_error::malformed,
+                                              "invalid coverage FileID");
+        StringRef Filename = Function.Filenames[Region.FileID];
+        if (FilenameFilters.matchesFilename(Filename))
+          continue;
+        if (Region.FileID == *RootFileID) {
+          OS << *ReportKind << '\t' << Region.LineStart << '.'
+             << Region.ColumnStart << '\t' << Region.LineEnd << '.'
+             << Region.ColumnEnd << '\t' << Region.ExecutionCount << '\n';
+          continue;
+        }
+        StringRef RemappedFilename = remapPathCached(Filename);
+        Expected<uint32_t> FilenameID = getSourceFilenameID(RemappedFilename);
+        if (!FilenameID)
+          return FilenameID.takeError();
+        SourceRegion OutputRegion{*FilenameID,          *ReportKind,
+                                  Region.LineStart,     Region.ColumnStart,
+                                  Region.LineEnd,       Region.ColumnEnd,
+                                  Region.ExecutionCount};
+        if (isSyntheticExpandedSourceCodeRegion(
+                OutputRegion, ExpandedFileIDs.test(Region.FileID)))
+          continue;
+        if (Error E = addSourceRegion(std::move(OutputRegion)))
+          return E;
       }
-      StringRef RemappedFilename = remapPathCached(Filename);
-      Expected<uint32_t> FilenameID = getSourceFilenameID(RemappedFilename);
-      if (!FilenameID)
-        return FilenameID.takeError();
-      SourceRegion OutputRegion{*FilenameID,          *ReportKind,
-                                Region.LineStart,     Region.ColumnStart,
-                                Region.LineEnd,       Region.ColumnEnd,
-                                Region.ExecutionCount};
-      if (isSyntheticExpandedSourceCodeRegion(
-              OutputRegion, ExpandedFileIDs.test(Region.FileID)))
-        continue;
-      if (Error E = addSourceRegion(std::move(OutputRegion)))
-        return E;
     }
 
     for (const CountedRegion &Region : Function.CountedBranchRegions) {

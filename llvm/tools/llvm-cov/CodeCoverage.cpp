@@ -192,6 +192,7 @@ private:
 
   bool TextCoverage = false;
   bool TextCoverageFull = false;
+  bool TextCoverageSegments = false;
   bool FormatSpecified = false;
   bool CheckBinaryIDs;
 };
@@ -692,6 +693,10 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
       "txtcvrgfull", cl::Optional,
       cl::desc("Export an all-zero function and source-region baseline"));
 
+  cl::opt<std::string> TxtCvrgView(
+      "txtcvrg-view", cl::Optional, cl::init("regions"),
+      cl::desc("Select txtcvrg records: regions (default) or segments"));
+
   cl::list<std::string> Arches(
       "arch", cl::desc("architectures of the coverage mapping binaries"));
 
@@ -816,6 +821,7 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
     cl::ParseCommandLineOptions(argc, argv, "LLVM code coverage tool\n");
     TextCoverage = TxtCvrg;
     TextCoverageFull = TxtCvrgFull;
+    TextCoverageSegments = TxtCvrgView == "segments";
     FormatSpecified = Format.getNumOccurrences() != 0;
     ViewOpts.Debug = DebugDump;
     // Initialize `Format` and `Colors` before any call to `error()` or
@@ -854,6 +860,14 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
     if ((TxtCvrg || TxtCvrgFull) && Cmd != Export) {
       error("--txtcvrg and --txtcvrgfull can only be used with 'llvm-cov "
             "export'");
+      return 1;
+    }
+    if (TxtCvrgView.getNumOccurrences() != 0 && !(TxtCvrg || TxtCvrgFull)) {
+      error("--txtcvrg-view requires --txtcvrg or --txtcvrgfull");
+      return 1;
+    }
+    if (TxtCvrgView != "regions" && TxtCvrgView != "segments") {
+      error("--txtcvrg-view must be 'regions' or 'segments'");
       return 1;
     }
     if (TxtCvrg) {
@@ -1411,6 +1425,9 @@ int CodeCoverageTool::doExport(int argc, const char **argv,
     ExportOptions.ExportMode =
         TextCoverageFull ? CoveredFunctionsExportOptions::Mode::Baseline
                          : CoveredFunctionsExportOptions::Mode::Execution;
+    ExportOptions.ExportView =
+        TextCoverageSegments ? CoveredFunctionsExportOptions::View::Segments
+                             : CoveredFunctionsExportOptions::View::Regions;
     ExportOptions.IncludeBranches = IncludeBranches;
     ExportOptions.IncludeMCDC = IncludeMCDC;
     CoverageExporterCoveredFunctions Exporter(

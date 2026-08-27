@@ -510,7 +510,7 @@ two modes:
 * ``-txtcvrgfull`` emits a complete baseline containing every mapped function
   and region with zero counts. It does not accept a profile.
 * ``-txtcvrg`` with ``-instr-profile=<PROFILE>`` emits only functions with
-  executed root code regions and their source-owned expansion regions.
+  executed code and their source-owned expansion regions.
 
 Functions are streamed directly. Source-owned macro regions first pass through
 a bounded streaming aggregate and are then reduced using bounded recursive hash
@@ -582,6 +582,56 @@ preserves exact source ranges, but it is not itself a rendered line coverage
 report. Consumers that need rendered line status should use
 :program:`llvm-cov show`, the JSON export, or the lcov export.
 
+``-txtcvrg-view=segments`` selects format 4, an opt-in normalized view for
+consumers that require non-overlapping executable intervals. It retains the
+readable format 3 ``file``, ``function``, and numeric region records.
+
+The complete machine-readable contract and consumer guidance are documented
+in :doc:`llvm-cov-txtcvrg-format`.
+
+.. code-block:: text
+
+  txtcvrg\t4\t<baseline|execution>\tview=segments\
+  \tbranches=<0|1>\tmcdc=<0|1>
+  file\t"<root-file>"
+  function\t"<display-name>"\t<segments>\t<hit-segments>\t<percent>
+  1\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<count>
+  2\t<start-line>.<start-column>\
+  \t<end-line>.<end-column>\t<count>
+
+Kind ``1`` is an executable segment and kind ``2`` is an expansion site.
+Function totals contain root-file executable segments only. As in format 3,
+macro bodies are emitted under separate ``file`` records for their physical
+source, including a repeated filename when a macro is defined in the root
+source file. They cannot therefore be mistaken for ranges in the preceding
+function. Executable macro-body ranges collected in one source-file block are
+also normalized so they do not overlap.
+
+Within each function, executable segments are ordered and do not overlap.
+Nested code regions use the innermost executable region's count; skipped and
+gap regions mask executable coverage. Adjacent intervals with the same static
+counter are combined. If a nested region interrupts a counter and that counter
+resumes within the same uninterrupted normalization run, only its first
+interval is retained, so the A-B-A geometry contributes two blocks rather than
+three. Deduplication stops at a source gap because a counter expression may be
+reused by a later, independent source block. Constant-zero regions remain
+separate because the zero counter is shared by otherwise unrelated unreachable
+ranges.
+
+A macro-generated function can have counters but no source-width executable
+interval after normalization. In that case, kind ``1`` point records with equal
+start and end locations retain the function identity and its hit state. Point
+records are counter markers rather than source intervals and therefore do not
+overlap surrounding source text.
+
+No merging decision depends on evaluated counts. In particular, baseline
+intervals are not combined merely because all baseline counts are zero. For
+identical mapping inputs and ordering, a function present in both baseline and
+execution reports therefore has the same numeric region records; only counts
+and summary hits differ. Execution mode omits functions with no hit segment but
+retains zero-count segments inside functions that were selected.
+
 The exported data can optionally be filtered to only export the coverage
 for the files listed in *SOURCE*....
 
@@ -615,6 +665,11 @@ OPTIONS
  Export the complete all-zero scalable text baseline without loading or
  evaluating a profile. This option does not accept ``-instr-profile`` or
  ``-empty-profile``.
+
+.. option:: -txtcvrg-view=<VIEW>
+
+ Select ``regions`` (the default format 3 records) or ``segments`` (normalized
+ format 4 records). This option requires ``-txtcvrg`` or ``-txtcvrgfull``.
 
 .. option:: -include-branches
 
