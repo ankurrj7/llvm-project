@@ -23,7 +23,6 @@ class raw_ostream;
 
 struct CoveredFunctionsExportOptions {
   enum class Mode { Execution, Baseline } ExportMode = Mode::Execution;
-  enum class View { Regions, Segments } ExportView = View::Regions;
   bool IncludeBranches = false;
   bool IncludeMCDC = false;
 };
@@ -35,11 +34,6 @@ struct CoveredFunctionsExportOptions {
 /// where identical coordinates are combined with saturating addition. Large
 /// partitions are recursively repartitioned to bound memory. Optional branch
 /// and MC/DC records retain an explicit source filename and expansion identity.
-///
-/// The opt-in segment view retains the same readable record layout but emits
-/// count-independent, non-overlapping root-file block ranges. Repeated slices
-/// of one nonzero static counter within an uninterrupted nested run count as
-/// one block. Macro bodies retain the source-owned file-block layout above.
 class CoverageExporterCoveredFunctions final
     : public coverage::CoverageMappingFunctionRecordConsumer {
   class Implementation;
