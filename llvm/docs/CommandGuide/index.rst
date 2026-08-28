@@ -21,6 +21,7 @@ Basic Commands
    llvm-cgdata
    llvm-config
    llvm-cov
+   llvm-cov-txtcvrg-format
    llvm-cxxmap
    llvm-debuginfo-analyzer
    llvm-diff
