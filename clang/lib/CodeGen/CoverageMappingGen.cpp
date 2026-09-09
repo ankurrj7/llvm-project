@@ -2136,10 +2136,54 @@ struct CounterCoverageMappingBuilder
     terminateRegion(S);
   }
 
+  template <typename RangeT>
+  static bool hasDefaultAndWrittenArgs(const RangeT &Args) {
+    bool HasDefaultArg = false;
+    bool HasWrittenArg = false;
+    for (const Expr *Arg : Args) {
+      HasDefaultArg |= isa<CXXDefaultArgExpr>(Arg);
+      HasWrittenArg |= !isa<CXXDefaultArgExpr>(Arg);
+    }
+    return HasDefaultArg && HasWrittenArg;
+  }
+
+  /// Map written operands independently when a call also has omitted default
+  /// arguments. A default argument has no caller-side source range, so carry
+  /// its completion counter as flow state instead of starting a region for it.
+  void visitCallContinuationChildrenWithDefaultArg(
+      llvm::function_ref<void(llvm::function_ref<void(const Stmt *)>)>
+          VisitChildren) {
+    Counter ParentCount = getRegion().getCounter();
+    Counter ExitCount = ParentCount;
+    VisitChildren([&](const Stmt *Child) {
+      if (const auto *DefaultArg = dyn_cast<CXXDefaultArgExpr>(Child)) {
+        if (std::optional<Counter> ContinuationCounter =
+                getCallContinuationCounter(
+                    DefaultArg, CallContinuationKind::DefaultArgument))
+          ExitCount = *ContinuationCounter;
+        return;
+      }
+      ExitCount = propagateCounts(ExitCount, Child);
+    });
+    if (!IsCounterEqual(ExitCount, ParentCount)) {
+      getRegion().setCounter(ExitCount);
+      GapRegionCounter = ExitCount;
+    }
+  }
+
   void VisitCallExpr(const CallExpr *E) {
     if (CallContinuationCounters) {
-      visitCallContinuationCallChildren(
-          E, ReverseDefaultCallArgs, [&](const Stmt *Child) { Visit(Child); });
+      if (hasDefaultAndWrittenArgs(E->arguments())) {
+        visitCallContinuationChildrenWithDefaultArg(
+            [&](llvm::function_ref<void(const Stmt *)> VisitChild) {
+              visitCallContinuationCallChildren(E, ReverseDefaultCallArgs,
+                                                VisitChild);
+            });
+      } else {
+        visitCallContinuationCallChildren(
+            E, ReverseDefaultCallArgs,
+            [&](const Stmt *Child) { Visit(Child); });
+      }
       adjustForOutOfOrderTraversal(getEnd(E));
     } else {
       VisitStmt(E);
@@ -2274,8 +2318,17 @@ struct CounterCoverageMappingBuilder
 
   void VisitCXXConstructExpr(const CXXConstructExpr *E) {
     if (CallContinuationCounters) {
-      visitCallContinuationConstructChildren(
-          E, ReverseDefaultCallArgs, [&](const Stmt *Child) { Visit(Child); });
+      if (hasDefaultAndWrittenArgs(E->arguments())) {
+        visitCallContinuationChildrenWithDefaultArg(
+            [&](llvm::function_ref<void(const Stmt *)> VisitChild) {
+              visitCallContinuationConstructChildren(E, ReverseDefaultCallArgs,
+                                                     VisitChild);
+            });
+      } else {
+        visitCallContinuationConstructChildren(
+            E, ReverseDefaultCallArgs,
+            [&](const Stmt *Child) { Visit(Child); });
+      }
       adjustForOutOfOrderTraversal(getEnd(E));
     } else {
       VisitStmt(E);
