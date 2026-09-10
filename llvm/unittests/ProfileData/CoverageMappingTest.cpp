@@ -8,15 +8,18 @@
 
 #include "llvm/ProfileData/Coverage/CoverageMapping.h"
 #include "llvm/ProfileData/Coverage/CoverageMappingReader.h"
+#include "llvm/ProfileData/Coverage/CoverageMappingSPI.h"
 #include "llvm/ProfileData/Coverage/CoverageMappingWriter.h"
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/ProfileData/InstrProfWriter.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Testing/Support/Error.h"
 #include "llvm/Testing/Support/SupportHelpers.h"
 #include "gtest/gtest.h"
 
+#include <cstddef>
 #include <limits>
 #include <map>
 #include <ostream>
@@ -136,6 +139,64 @@ struct FilteringCoverageMappingReaderMock : CoverageMappingReaderMock {
     return make_error<CoverageMapError>(coveragemap_error::eof);
   }
 };
+
+struct RecoverableSPICoverageMappingReaderMock : CoverageMappingReader {
+  ArrayRef<OutputFunctionCoverageData> Functions;
+  coveragemap_error InjectedError;
+  bool IsSPI;
+  unsigned State = 0;
+
+  RecoverableSPICoverageMappingReaderMock(
+      ArrayRef<OutputFunctionCoverageData> Functions,
+      coveragemap_error InjectedError = coveragemap_error::malformed,
+      bool IsSPI = true)
+      : Functions(Functions), InjectedError(InjectedError), IsSPI(IsSPI) {}
+
+  bool isSPIContainer() const override { return IsSPI; }
+
+  Error readNextRecord(
+      CoverageMappingRecord &Record,
+      function_ref<Expected<bool>(StringRef, uint64_t)> ShouldRead) override {
+    for (;;) {
+      if (State == 1) {
+        ++State;
+        return make_error<CoverageMapError>(
+            InjectedError,
+            "SPI record 'bad.o', function 'broken': invalid region");
+      }
+      if (State >= 3)
+        return make_error<CoverageMapError>(coveragemap_error::eof);
+
+      const OutputFunctionCoverageData &Function =
+          Functions[State == 0 ? 0 : 1];
+      ++State;
+      Expected<bool> Read = ShouldRead(Function.Name, Function.Hash);
+      if (!Read)
+        return Read.takeError();
+      if (!*Read)
+        continue;
+      Function.fillCoverageMappingRecord(Record);
+      return Error::success();
+    }
+  }
+
+  Error readNextRecord(CoverageMappingRecord &Record) override {
+    return readNextRecord(
+        Record, [](StringRef, uint64_t) -> Expected<bool> { return true; });
+  }
+};
+
+static void
+addSimpleCoverageFunction(std::vector<OutputFunctionCoverageData> &Functions,
+                          StringRef Name) {
+  OutputFunctionCoverageData &Function = Functions.emplace_back();
+  Function.Name = Name;
+  Function.Hash = 1;
+  Function.FilenamesStorage.push_back("source.c");
+  Function.Filenames.push_back(Function.FilenamesStorage.front());
+  Function.Regions.push_back(
+      CounterMappingRegion::makeRegion(Counter::getCounter(0), 0, 1, 1, 1, 2));
+}
 
 struct RecordingFunctionConsumer : CoverageMappingFunctionRecordConsumer {
   std::vector<std::string> RawNames;
@@ -1371,6 +1432,140 @@ TEST(CoverageMappingTest, SparseStreamingDoesNotRetainDecodedFunctions) {
   EXPECT_EQ(MappingReaderPtr->DecodedRecords, 1u);
   EXPECT_EQ(Consumer.Count, 1u);
   EXPECT_TRUE((*CoverageOrErr)->getCoveredFunctions().empty());
+}
+
+TEST(CoverageMappingRecoveryTest, MalformedSPIRecordIsIgnoredForBaselineLoad) {
+  std::vector<OutputFunctionCoverageData> Functions;
+  Functions.reserve(2);
+  addSimpleCoverageFunction(Functions, "before");
+  addSimpleCoverageFunction(Functions, "after");
+
+  std::vector<std::unique_ptr<CoverageMappingReader>> MappingReaders;
+  MappingReaders.push_back(
+      std::make_unique<RecoverableSPICoverageMappingReaderMock>(Functions));
+  std::optional<std::reference_wrapper<IndexedInstrProfReader>> Profile;
+  CoverageMappingLoadOptions Options;
+  Options.AllCountersZero = true;
+
+  testing::internal::CaptureStderr();
+  auto CoverageOrErr = CoverageMapping::load(MappingReaders, Profile, Options);
+  std::string Warning = testing::internal::GetCapturedStderr();
+  ASSERT_THAT_EXPECTED(CoverageOrErr, Succeeded());
+  EXPECT_THAT(Warning,
+              ::testing::HasSubstr(
+                  "warning: ignoring malformed coverage mapping SPI record: "
+                  "malformed coverage data: SPI record 'bad.o', function "
+                  "'broken': invalid region"));
+  auto FunctionsRange = (*CoverageOrErr)->getCoveredFunctions();
+  EXPECT_EQ(std::distance(FunctionsRange.begin(), FunctionsRange.end()), 2);
+}
+
+TEST(CoverageMappingRecoveryTest, MalformedSPIPayloadsAreIgnored) {
+  std::string MalformedMapping(sizeof(CovMapHeader) + 1, '\0');
+  support::endian::write32le(
+      MalformedMapping.data() + offsetof(CovMapHeader, NRecords), 0);
+  support::endian::write32le(
+      MalformedMapping.data() + offsetof(CovMapHeader, FilenamesSize), 1);
+  support::endian::write32le(
+      MalformedMapping.data() + offsetof(CovMapHeader, CoverageSize), 0);
+  support::endian::write32le(MalformedMapping.data() +
+                                 offsetof(CovMapHeader, Version),
+                             CovMapVersion::CurrentVersion);
+
+  CoverageMappingSPIPayload BadPayload{"", MalformedMapping,        "", 0,
+                                       8,  llvm::endianness::little};
+  auto EncodedPayload = createCoverageMappingSPIPayload(BadPayload);
+  ASSERT_THAT_EXPECTED(EncodedPayload, Succeeded());
+
+  std::string SPI = createCoverageMappingSPIHeader();
+  for (StringRef Key : {"bad-a.o", "bad-b.o"}) {
+    auto EncodedRecord = createCoverageMappingSPIRecord(
+        CoverageMappingSPIRecord{Key, "", *EncodedPayload});
+    ASSERT_THAT_EXPECTED(EncodedRecord, Succeeded());
+    SPI += *EncodedRecord;
+  }
+
+  SmallVector<std::unique_ptr<MemoryBuffer>> ObjectFileBuffers;
+  auto MappingReaders = createCoverageMappingReaders(
+      MemoryBufferRef(SPI, "reproducer.spi"), "", ObjectFileBuffers);
+  ASSERT_THAT_EXPECTED(MappingReaders, Succeeded());
+  std::optional<std::reference_wrapper<IndexedInstrProfReader>> Profile;
+  CoverageMappingLoadOptions Options;
+  Options.AllCountersZero = true;
+
+  testing::internal::CaptureStderr();
+  auto CoverageOrErr = CoverageMapping::load(*MappingReaders, Profile, Options);
+  std::string Warning = testing::internal::GetCapturedStderr();
+  ASSERT_THAT_EXPECTED(CoverageOrErr, Succeeded());
+  EXPECT_THAT(Warning, ::testing::HasSubstr("SPI record 'bad-a.o'"));
+  EXPECT_THAT(Warning, ::testing::HasSubstr("SPI record 'bad-b.o'"));
+  EXPECT_TRUE((*CoverageOrErr)->getCoveredFunctions().empty());
+}
+
+TEST(CoverageMappingRecoveryTest, MalformedSPIRecordIsIgnoredForStreamingLoad) {
+  std::vector<OutputFunctionCoverageData> Functions;
+  Functions.reserve(2);
+  InstrProfWriter Writer;
+  for (StringRef Name : {"before", "after"}) {
+    addSimpleCoverageFunction(Functions, Name);
+    Writer.addRecord({Name, 1, {1}}, Err);
+  }
+
+  auto ProfileOrErr = IndexedInstrProfReader::create(Writer.writeBuffer());
+  ASSERT_THAT_EXPECTED(ProfileOrErr, Succeeded());
+  std::unique_ptr<IndexedInstrProfReader> Profile = std::move(*ProfileOrErr);
+  auto ProfileRef = std::make_optional(
+      std::reference_wrapper<IndexedInstrProfReader>(*Profile));
+  std::vector<std::unique_ptr<CoverageMappingReader>> MappingReaders;
+  MappingReaders.push_back(
+      std::make_unique<RecoverableSPICoverageMappingReaderMock>(Functions));
+
+  RecordingFunctionConsumer Consumer;
+  CoverageMappingLoadOptions Options;
+  Options.LoadExecutedFunctionsOnly = true;
+  Options.KeepFunctionRecords = false;
+  Options.FunctionRecordConsumer = &Consumer;
+  testing::internal::CaptureStderr();
+  auto CoverageOrErr =
+      CoverageMapping::load(MappingReaders, ProfileRef, Options);
+  std::string Warning = testing::internal::GetCapturedStderr();
+  ASSERT_THAT_EXPECTED(CoverageOrErr, Succeeded());
+  EXPECT_THAT(Warning,
+              ::testing::HasSubstr(
+                  "warning: ignoring malformed coverage mapping SPI record"));
+  EXPECT_EQ(Consumer.Functions.size(), 2u);
+}
+
+TEST(CoverageMappingRecoveryTest, MalformedOrdinaryObjectRecordRemainsFatal) {
+  std::vector<OutputFunctionCoverageData> Functions;
+  Functions.reserve(2);
+  addSimpleCoverageFunction(Functions, "before");
+  addSimpleCoverageFunction(Functions, "after");
+  std::vector<std::unique_ptr<CoverageMappingReader>> MappingReaders;
+  MappingReaders.push_back(
+      std::make_unique<RecoverableSPICoverageMappingReaderMock>(
+          Functions, coveragemap_error::malformed, false));
+  std::optional<std::reference_wrapper<IndexedInstrProfReader>> Profile;
+  CoverageMappingLoadOptions Options;
+  Options.AllCountersZero = true;
+  EXPECT_THAT_EXPECTED(CoverageMapping::load(MappingReaders, Profile, Options),
+                       Failed());
+}
+
+TEST(CoverageMappingRecoveryTest, UnsupportedSPIRecordVersionRemainsFatal) {
+  std::vector<OutputFunctionCoverageData> Functions;
+  Functions.reserve(2);
+  addSimpleCoverageFunction(Functions, "before");
+  addSimpleCoverageFunction(Functions, "after");
+  std::vector<std::unique_ptr<CoverageMappingReader>> MappingReaders;
+  MappingReaders.push_back(
+      std::make_unique<RecoverableSPICoverageMappingReaderMock>(
+          Functions, coveragemap_error::unsupported_version));
+  std::optional<std::reference_wrapper<IndexedInstrProfReader>> Profile;
+  CoverageMappingLoadOptions Options;
+  Options.AllCountersZero = true;
+  EXPECT_THAT_EXPECTED(CoverageMapping::load(MappingReaders, Profile, Options),
+                       Failed());
 }
 
 TEST(CoverageMappingTest, StreamingDisplayNameStripsSPIUnitAndLocalFilePrefix) {
