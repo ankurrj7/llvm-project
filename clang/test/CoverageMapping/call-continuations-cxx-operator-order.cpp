@@ -26,6 +26,32 @@ void overloaded_assignment_with_arrow(AssignmentIterator it) {
   it->second = 0;
 }
 
+unsigned source();
+
+struct AggregateValue {
+  unsigned first;
+  unsigned second;
+  unsigned third;
+};
+
+struct AggregateValues {
+  AggregateValue &operator[](unsigned);
+};
+
+AggregateValue make_aggregate();
+
+void overloaded_assignment_with_call_rhs(AggregateValues &values) {
+  values[0] =
+      make_aggregate();
+}
+
+void overloaded_assignment_with_braced_rhs(AggregateValues &values) {
+  values[0] = {
+      source(),
+      0, 1,
+  };
+}
+
 struct ContinuationStream {
   ContinuationStream &operator<<(unsigned);
   ContinuationStream &operator<<(ContinuationStream &(*)(ContinuationStream &));
@@ -103,6 +129,11 @@ template void dependent_operators<Value>(Value, Value);
 // MAP-LABEL: _Z32overloaded_assignment_with_arrow18AssignmentIterator:
 // MAP: Gap,File 0, [[FIRST_ASSIGN:[0-9]+]]:17 -> [[SECOND_ASSIGN:[0-9]+]]:3 = #[[AFTER_FIRST:[0-9]+]]
 // MAP-NEXT: File 0, [[SECOND_ASSIGN]]:3 -> [[SECOND_ASSIGN]]:7 = #[[AFTER_FIRST]]
+
+// An implicit overloaded assignment from a braced temporary evaluates the RHS
+// first. Bound its continuation before returning to the earlier operator[] LHS.
+// The object and SPI export RUN lines above verify that no backwards region is
+// encoded for this function.
 
 // A non-assignment overloaded operator needs the same source anchor. Without
 // it, the continuation after the preceding call can start at the final operand

@@ -2185,7 +2185,22 @@ struct CounterCoverageMappingBuilder
       // traversal so a continuation cannot end before it starts.
       if (isa<CXXOperatorCallExpr>(E))
         extendRegion(E);
-      if (hasDefaultAndWrittenArgs(E->arguments())) {
+      if (const auto *OperatorCall = dyn_cast<CXXOperatorCallExpr>(E);
+          OperatorCall && OperatorCall->isAssignmentOp()) {
+        // An overloaded assignment evaluates its RHS before its source-leading
+        // LHS. Keep each operand's continuations inside that operand so an RHS
+        // continuation cannot be completed at an earlier LHS operator.
+        Counter ParentCount = getRegion().getCounter();
+        Counter ExitCount = ParentCount;
+        visitCallContinuationCallChildren(
+            E, ReverseDefaultCallArgs, [&](const Stmt *Child) {
+              ExitCount = propagateCounts(ExitCount, Child);
+            });
+        if (!IsCounterEqual(ExitCount, ParentCount)) {
+          getRegion().setCounter(ExitCount);
+          GapRegionCounter = ExitCount;
+        }
+      } else if (hasDefaultAndWrittenArgs(E->arguments())) {
         visitCallContinuationChildrenWithDefaultArg(
             [&](llvm::function_ref<void(const Stmt *)> VisitChild) {
               visitCallContinuationCallChildren(E, ReverseDefaultCallArgs,
