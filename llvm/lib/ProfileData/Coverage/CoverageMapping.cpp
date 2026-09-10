@@ -992,6 +992,43 @@ Error CoverageMapping::loadFunctionRecord(
   return Error::success();
 }
 
+static bool isRecoverableSPIError(coveragemap_error Error) {
+  switch (Error) {
+  case coveragemap_error::no_data_found:
+  case coveragemap_error::truncated:
+  case coveragemap_error::malformed:
+  case coveragemap_error::decompression_failed:
+    return true;
+  case coveragemap_error::success:
+  case coveragemap_error::eof:
+  case coveragemap_error::unsupported_version:
+  case coveragemap_error::invalid_or_missing_arch_specifier:
+    return false;
+  }
+  llvm_unreachable("unknown coverage mapping error");
+}
+
+/// Handle an error returned while iterating one coverage reader. Returns true
+/// for EOF and false when a malformed record from an SPI reader was ignored.
+static Expected<bool> handleCoverageReaderError(Error E, bool IsSPIContainer) {
+  bool IsEOF = false;
+  E = handleErrors(std::move(E), [&](const CoverageMapError &CME) -> Error {
+    if (CME.get() == coveragemap_error::eof) {
+      IsEOF = true;
+      return Error::success();
+    }
+    if (IsSPIContainer && isRecoverableSPIError(CME.get())) {
+      errs() << "warning: ignoring malformed coverage mapping SPI record: "
+             << CME.message() << '\n';
+      return Error::success();
+    }
+    return make_error<CoverageMapError>(CME.get(), CME.getMessage());
+  });
+  if (E)
+    return std::move(E);
+  return IsEOF;
+}
+
 // This function is for memory optimization by shortening the lifetimes
 // of CoverageMappingReader instances.
 Error CoverageMapping::loadFromReaders(
@@ -1005,10 +1042,17 @@ Error CoverageMapping::loadFromReaders(
   Coverage.SingleByteCoverage =
       !ProfileReader || ProfileReader.value().get().hasSingleByteCoverage();
   for (const auto &CoverageReader : CoverageReaders) {
-    for (auto RecordOrErr : *CoverageReader) {
-      if (Error E = RecordOrErr.takeError())
-        return E;
-      const auto &Record = *RecordOrErr;
+    for (;;) {
+      CoverageMappingRecord Record;
+      if (Error E = CoverageReader->readNextRecord(Record)) {
+        auto IsEOF = handleCoverageReaderError(
+            std::move(E), CoverageReader->isSPIContainer());
+        if (!IsEOF)
+          return IsEOF.takeError();
+        if (*IsEOF)
+          break;
+        continue;
+      }
       if (Error E = Coverage.loadFunctionRecord(Record, ProfileReader))
         return E;
     }

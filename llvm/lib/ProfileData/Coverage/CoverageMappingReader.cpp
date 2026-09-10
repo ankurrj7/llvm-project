@@ -1084,6 +1084,7 @@ class SPICoverageReader final : public CoverageMappingReader {
   std::vector<CoverageMappingSPIRecord> Records;
   StringRef CompilationDir;
   size_t NextRecord = 0;
+  StringRef CurrentRecordKey;
   std::unique_ptr<BinaryCoverageReader> CurrentReader;
 
   SPICoverageReader(std::vector<CoverageMappingSPIRecord> Records,
@@ -1091,6 +1092,8 @@ class SPICoverageReader final : public CoverageMappingReader {
       : Records(std::move(Records)), CompilationDir(CompilationDir) {}
 
 public:
+  bool isSPIContainer() const override { return true; }
+
   static Expected<std::unique_ptr<CoverageMappingReader>>
   create(StringRef Data, StringRef CompilationDir) {
     auto Contents = readCoverageMappingSPI(Data);
@@ -1117,10 +1120,21 @@ public:
       if (!CurrentReader) {
         if (NextRecord == Records.size())
           return make_error<CoverageMapError>(coveragemap_error::eof);
-        auto Reader = loadCoverageMappingSPIPayload(
-            Records[NextRecord++].Payload, CompilationDir);
-        if (!Reader)
-          return Reader.takeError();
+        const CoverageMappingSPIRecord &SPIRecord = Records[NextRecord++];
+        CurrentRecordKey = SPIRecord.Key;
+        auto Reader =
+            loadCoverageMappingSPIPayload(SPIRecord.Payload, CompilationDir);
+        if (!Reader) {
+          Error E = Reader.takeError();
+          return handleErrors(
+              std::move(E), [&](const CoverageMapError &CME) -> Error {
+                std::string Context =
+                    (Twine("SPI record '") + CurrentRecordKey + "'").str();
+                if (!CME.getMessage().empty())
+                  Context += ": " + CME.getMessage();
+                return make_error<CoverageMapError>(CME.get(), Context);
+              });
+        }
         CurrentReader = std::move(*Reader);
       }
 
@@ -1134,7 +1148,17 @@ public:
           ReachedEnd = true;
           return Error::success();
         }
-        return make_error<CoverageMapError>(CME.get(), CME.getMessage());
+        std::string Context =
+            (Twine("SPI record '") + CurrentRecordKey + "'").str();
+        if (!Record.FunctionName.empty())
+          Context += (Twine(", function '") +
+                      getPGOFuncNameWithoutCoverageMappingSPIUnit(
+                          Record.FunctionName) +
+                      "'")
+                         .str();
+        if (!CME.getMessage().empty())
+          Context += ": " + CME.getMessage();
+        return make_error<CoverageMapError>(CME.get(), Context);
       });
       if (E)
         return E;
@@ -1482,22 +1506,20 @@ Error BinaryCoverageReader::readNextRecord(CoverageMappingRecord &Record) {
   if (CurrentRecord >= MappingRecords.size())
     return make_error<CoverageMapError>(coveragemap_error::eof);
 
+  auto &R = MappingRecords[CurrentRecord++];
+  Record.FunctionName = R.FunctionName;
+  Record.FunctionHash = R.FunctionHash;
   FunctionsFilenames.clear();
   Expressions.clear();
   MappingRegions.clear();
-  auto &R = MappingRecords[CurrentRecord];
   auto F = ArrayRef(Filenames).slice(R.FilenamesBegin, R.FilenamesSize);
   RawCoverageMappingReader Reader(R.CoverageMapping, F, FunctionsFilenames,
                                   Expressions, MappingRegions);
   if (auto Err = Reader.read())
     return Err;
 
-  Record.FunctionName = R.FunctionName;
-  Record.FunctionHash = R.FunctionHash;
   Record.Filenames = FunctionsFilenames;
   Record.Expressions = Expressions;
   Record.MappingRegions = MappingRegions;
-
-  ++CurrentRecord;
   return Error::success();
 }

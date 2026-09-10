@@ -102,6 +102,7 @@ public:
   virtual ~CoverageMappingReader() = default;
 
   virtual Error readNextRecord(CoverageMappingRecord &Record) = 0;
+  virtual bool isSPIContainer() const { return false; }
   CoverageMappingIterator begin() { return CoverageMappingIterator(this); }
   CoverageMappingIterator end() { return CoverageMappingIterator(); }
 };
