@@ -2179,6 +2179,12 @@ struct CounterCoverageMappingBuilder
 
   void VisitCallExpr(const CallExpr *E) {
     if (CallContinuationCounters) {
+      // An overloaded operator's callee is represented at the operator token,
+      // which may follow source-leading operands that are visited later.
+      // Anchor the region at the whole expression before runtime-order child
+      // traversal so a continuation cannot end before it starts.
+      if (isa<CXXOperatorCallExpr>(E))
+        extendRegion(E);
       if (hasDefaultAndWrittenArgs(E->arguments())) {
         visitCallContinuationChildrenWithDefaultArg(
             [&](llvm::function_ref<void(const Stmt *)> VisitChild) {
