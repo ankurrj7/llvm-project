@@ -62,6 +62,15 @@ RUN: printf '\3\0bar\0\0\0' >> %t-bar.profraw
 
 RUN: cat %t-foo.profraw %t-bar.profraw > %t-pad.profraw
 RUN: llvm-profdata show %t-pad.profraw -all-functions -counts | FileCheck %s
+RUN: cat %t-foo.profraw %t-foo.profraw > %t-repeat.profraw
+RUN: llvm-profdata merge -sparse -num-threads=1 -name-cache-stats \
+RUN:   %t-repeat.profraw -o %t-cached.profdata 2>&1 \
+RUN:   | FileCheck %s -check-prefix=NAME-CACHE
+RUN: llvm-profdata merge -sparse -num-threads=1 -disable-name-cache \
+RUN:   %t-repeat.profraw -o %t-uncached.profdata
+RUN: cmp %t-cached.profdata %t-uncached.profdata
+
+NAME-CACHE: raw profile name cache: lookups=2, hits=1, misses=1, additions=1, resets=0, name-bytes=3
 
 CHECK: Counters:
 CHECK:   foo:

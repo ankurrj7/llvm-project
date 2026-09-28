@@ -210,7 +210,8 @@ public:
       const object::BuildIDFetcher *BIDFetcher = nullptr,
       const InstrProfCorrelator::ProfCorrelatorKind BIDFetcherCorrelatorKind =
           InstrProfCorrelator::ProfCorrelatorKind::NONE,
-      std::function<void(Error)> Warn = nullptr);
+      std::function<void(Error)> Warn = nullptr,
+      const InstrProfNameLookup *NameLookup = nullptr);
 
   LLVM_ABI static Expected<std::unique_ptr<InstrProfReader>> create(
       std::unique_ptr<MemoryBuffer> Buffer,
@@ -218,7 +219,8 @@ public:
       const object::BuildIDFetcher *BIDFetcher = nullptr,
       const InstrProfCorrelator::ProfCorrelatorKind BIDFetcherCorrelatorKind =
           InstrProfCorrelator::ProfCorrelatorKind::NONE,
-      std::function<void(Error)> Warn = nullptr);
+      std::function<void(Error)> Warn = nullptr,
+      const InstrProfNameLookup *NameLookup = nullptr);
 
   /// \param Weight for raw profiles use this as the temporal profile trace
   ///               weight
@@ -324,8 +326,7 @@ public:
 ///
 /// Templated on the unsigned type whose size matches pointers on the platform
 /// that wrote the profile.
-template <class IntPtrT>
-class RawInstrProfReader : public InstrProfReader {
+template <class IntPtrT> class RawInstrProfReader : public InstrProfReader {
 private:
   /// The profile data file contents.
   std::unique_ptr<MemoryBuffer> DataBuffer;
@@ -340,6 +341,8 @@ private:
   /// Indicates if should use debuginfo or binary to correlate with build id
   /// fetcher.
   InstrProfCorrelator::ProfCorrelatorKind BIDFetcherCorrelatorKind;
+  /// Optional shared lookup for names stored outside the raw profile.
+  const InstrProfNameLookup *NameLookup;
   /// A list of timestamps paired with a function name reference.
   std::vector<std::pair<uint64_t, uint64_t>> TemporalProfTimestamps;
   bool ShouldSwapBytes;
@@ -380,12 +383,13 @@ public:
       const InstrProfCorrelator *Correlator,
       const object::BuildIDFetcher *BIDFetcher,
       const InstrProfCorrelator::ProfCorrelatorKind BIDFetcherCorrelatorKind,
-      std::function<void(Error)> Warn)
+      std::function<void(Error)> Warn, const InstrProfNameLookup *NameLookup)
       : DataBuffer(std::move(DataBuffer)),
         Correlator(dyn_cast_or_null<const InstrProfCorrelatorImpl<IntPtrT>>(
             Correlator)),
         BIDFetcher(BIDFetcher),
-        BIDFetcherCorrelatorKind(BIDFetcherCorrelatorKind), Warn(Warn) {}
+        BIDFetcherCorrelatorKind(BIDFetcherCorrelatorKind),
+        NameLookup(NameLookup), Warn(Warn) {}
 
   RawInstrProfReader(const RawInstrProfReader &) = delete;
   RawInstrProfReader &operator=(const RawInstrProfReader &) = delete;

@@ -14,6 +14,7 @@
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/ProfileSummary.h"
@@ -158,20 +159,21 @@ Expected<std::unique_ptr<InstrProfReader>> InstrProfReader::create(
     const InstrProfCorrelator *Correlator,
     const object::BuildIDFetcher *BIDFetcher,
     const InstrProfCorrelator::ProfCorrelatorKind BIDFetcherCorrelatorKind,
-    std::function<void(Error)> Warn) {
+    std::function<void(Error)> Warn, const InstrProfNameLookup *NameLookup) {
   // Set up the buffer to read.
   auto BufferOrError = setupMemoryBuffer(Path, FS);
   if (Error E = BufferOrError.takeError())
     return std::move(E);
   return InstrProfReader::create(std::move(BufferOrError.get()), Correlator,
-                                 BIDFetcher, BIDFetcherCorrelatorKind, Warn);
+                                 BIDFetcher, BIDFetcherCorrelatorKind, Warn,
+                                 NameLookup);
 }
 
 Expected<std::unique_ptr<InstrProfReader>> InstrProfReader::create(
     std::unique_ptr<MemoryBuffer> Buffer, const InstrProfCorrelator *Correlator,
     const object::BuildIDFetcher *BIDFetcher,
     const InstrProfCorrelator::ProfCorrelatorKind BIDFetcherCorrelatorKind,
-    std::function<void(Error)> Warn) {
+    std::function<void(Error)> Warn, const InstrProfNameLookup *NameLookup) {
   if (Buffer->getBufferSize() == 0)
     return make_error<InstrProfError>(instrprof_error::empty_raw_profile);
 
@@ -182,11 +184,11 @@ Expected<std::unique_ptr<InstrProfReader>> InstrProfReader::create(
   else if (RawInstrProfReader64::hasFormat(*Buffer))
     Result.reset(new RawInstrProfReader64(std::move(Buffer), Correlator,
                                           BIDFetcher, BIDFetcherCorrelatorKind,
-                                          Warn));
+                                          Warn, NameLookup));
   else if (RawInstrProfReader32::hasFormat(*Buffer))
     Result.reset(new RawInstrProfReader32(std::move(Buffer), Correlator,
                                           BIDFetcher, BIDFetcherCorrelatorKind,
-                                          Warn));
+                                          Warn, NameLookup));
   else if (TextInstrProfReader::hasFormat(*Buffer))
     Result.reset(new TextInstrProfReader(std::move(Buffer)));
   else
@@ -550,9 +552,60 @@ Error RawInstrProfReader<IntPtrT>::readNextHeader(const char *CurrentPos) {
 
 template <class IntPtrT>
 Error RawInstrProfReader<IntPtrT>::createSymtab(InstrProfSymtab &Symtab) {
-  if (Error E = Symtab.create(StringRef(NamesStart, NamesEnd - NamesStart),
-                              StringRef(VNamesStart, VNamesEnd - VNamesStart)))
-    return error(std::move(E));
+  bool UseExternalNames = NameLookup;
+  SmallVector<StringRef, 0> ExternalNames;
+  if (UseExternalNames) {
+    ExternalNames.reserve(DataEnd - Data);
+    for (const RawInstrProf::ProfileData<IntPtrT> *I = Data; I != DataEnd;
+         ++I) {
+      StringRef Name = NameLookup->lookup(swap(I->NameRef));
+      if (Name.empty()) {
+        UseExternalNames = false;
+        ExternalNames.clear();
+        break;
+      }
+      ExternalNames.push_back(Name);
+    }
+  }
+
+  if (UseExternalNames) {
+    for (StringRef Name : ExternalNames)
+      if (Error E = Symtab.addFuncName(Name))
+        return error(std::move(E));
+    if (VNamesStart && VNamesEnd) {
+      if (Error E = Symtab.initVTableNamesFromCompressedStrings(
+              StringRef(VNamesStart, VNamesEnd - VNamesStart)))
+        return error(std::move(E));
+    }
+  } else {
+    StringRef FuncNames(NamesStart, NamesEnd - NamesStart);
+    StringRef VTableNames =
+        VNamesStart && VNamesEnd
+            ? StringRef(VNamesStart, VNamesEnd - VNamesStart)
+            : StringRef();
+    if (NameLookup) {
+      DenseSet<uint64_t> RequiredNames;
+      RequiredNames.reserve(DataEnd - Data);
+      for (const RawInstrProf::ProfileData<IntPtrT> *I = Data; I != DataEnd;
+           ++I)
+        RequiredNames.insert(swap(I->NameRef));
+
+      if (Error E =
+              readAndDecodeStrings(FuncNames, [&](StringRef Name) -> Error {
+                if (!RequiredNames.contains(
+                        IndexedInstrProf::ComputeHash(Name)))
+                  return Error::success();
+                if (Error E = Symtab.addFuncName(Name))
+                  return E;
+                return NameLookup->addName(Name);
+              }))
+        return error(std::move(E));
+      if (Error E = Symtab.initVTableNamesFromCompressedStrings(VTableNames))
+        return error(std::move(E));
+    } else if (Error E = Symtab.create(FuncNames, VTableNames)) {
+      return error(std::move(E));
+    }
+  }
   for (const RawInstrProf::ProfileData<IntPtrT> *I = Data; I != DataEnd; ++I) {
     const IntPtrT FPtr = swap(I->FunctionPointer);
     if (!FPtr)

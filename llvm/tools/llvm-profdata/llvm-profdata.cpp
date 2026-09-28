@@ -10,6 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -17,6 +19,7 @@
 #include "llvm/Debuginfod/HTTPClient.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Object/Binary.h"
+#include "llvm/ProfileData/Coverage/CoverageMappingSPI.h"
 #include "llvm/ProfileData/DataAccessProf.h"
 #include "llvm/ProfileData/InstrProfCorrelator.h"
 #include "llvm/ProfileData/InstrProfReader.h"
@@ -46,7 +49,10 @@
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <optional>
 
 using namespace llvm;
@@ -185,6 +191,19 @@ static cl::opt<std::string>
     InputFilenamesFile("input-files", cl::init(""), cl::sub(MergeSubcommand),
                        cl::desc("Path to file containing newline-separated "
                                 "[<weight>,]<filename> entries"));
+static cl::opt<std::string> CoverageSPINameCache(
+    "coverage-spi", cl::init(""), cl::sub(MergeSubcommand),
+    cl::desc("Use function names from a coverage mapping SPI container and "
+             "fall back to names embedded in each raw profile"));
+static cl::opt<bool> ShowCoverageSPINameCacheStats(
+    "coverage-spi-stats", cl::init(false), cl::sub(MergeSubcommand),
+    cl::desc("Report coverage SPI name-cache construction and lookup stats"));
+static cl::opt<bool> DisableInstrProfNameCache(
+    "disable-name-cache", cl::init(false), cl::sub(MergeSubcommand),
+    cl::desc("Disable reuse of decoded raw-profile function names"));
+static cl::opt<bool> ShowInstrProfNameCacheStats(
+    "name-cache-stats", cl::init(false), cl::sub(MergeSubcommand),
+    cl::desc("Report raw-profile function-name cache statistics"));
 static cl::alias InputFilenamesFileA("f", cl::desc("Alias for --input-files"),
                                      cl::aliasopt(InputFilenamesFile));
 static cl::opt<bool> DumpInputFileList(
@@ -546,6 +565,231 @@ static void exitWithErrorCode(std::error_code EC, StringRef Whence = "") {
   exitWithError(EC.message(), Whence);
 }
 
+class CompactInstrProfNameLookup final : public InstrProfNameLookup {
+public:
+  struct Entry {
+    uint64_t Hash;
+    uint32_t Offset;
+    uint32_t Length;
+  };
+
+private:
+  std::vector<Entry> Entries;
+  std::string Names;
+  std::vector<uint32_t> Slots;
+  bool TrackStats;
+  mutable std::atomic<uint64_t> Hits{0};
+  mutable std::atomic<uint64_t> Misses{0};
+
+public:
+  CompactInstrProfNameLookup(std::vector<Entry> Entries, std::string Names,
+                             bool TrackStats)
+      : Entries(std::move(Entries)), Names(std::move(Names)),
+        TrackStats(TrackStats) {
+    size_t NumSlots = 1;
+    while (NumSlots < this->Entries.size() * 2)
+      NumSlots *= 2;
+    Slots.assign(NumSlots, 0);
+    const size_t Mask = NumSlots - 1;
+    for (size_t I = 0; I != this->Entries.size(); ++I) {
+      size_t Slot = this->Entries[I].Hash & Mask;
+      while (Slots[Slot] != 0)
+        Slot = (Slot + 1) & Mask;
+      Slots[Slot] = static_cast<uint32_t>(I + 1);
+    }
+  }
+
+  StringRef lookup(uint64_t NameRef) const override {
+    const size_t Mask = Slots.size() - 1;
+    size_t Slot = NameRef & Mask;
+    for (;;) {
+      uint32_t EntryIndex = Slots[Slot];
+      if (EntryIndex == 0) {
+        if (TrackStats)
+          ++Misses;
+        return {};
+      }
+      const Entry &E = Entries[EntryIndex - 1];
+      if (E.Hash == NameRef) {
+        if (TrackStats)
+          ++Hits;
+        return StringRef(Names).substr(E.Offset, E.Length);
+      }
+      Slot = (Slot + 1) & Mask;
+    }
+  }
+
+  uint64_t getHits() const { return Hits.load(); }
+  uint64_t getMisses() const { return Misses.load(); }
+  size_t getNumNames() const { return Entries.size(); }
+  size_t getNameBytes() const { return Names.size(); }
+  size_t getStorageBytes() const {
+    return Entries.size() * sizeof(Entry) + Names.size() +
+           Slots.size() * sizeof(uint32_t);
+  }
+};
+
+class AdaptiveInstrProfNameLookup final : public InstrProfNameLookup {
+  static constexpr size_t MaxNameBytes = 64 * 1024 * 1024;
+  static constexpr size_t MaxNames = 500 * 1024;
+
+  mutable DenseMap<uint64_t, std::string> Names;
+  mutable DenseSet<uint64_t> UncacheableNames;
+  mutable size_t NameBytes = 0;
+  mutable bool NeedsReset = false;
+  bool TrackStats;
+  mutable uint64_t Lookups = 0;
+  mutable uint64_t Hits = 0;
+  mutable uint64_t Misses = 0;
+  mutable uint64_t Additions = 0;
+  uint64_t Resets = 0;
+
+public:
+  explicit AdaptiveInstrProfNameLookup(bool TrackStats)
+      : TrackStats(TrackStats) {}
+
+  StringRef lookup(uint64_t NameRef) const override {
+    if (TrackStats)
+      ++Lookups;
+    auto It = Names.find(NameRef);
+    if (It == Names.end()) {
+      if (TrackStats)
+        ++Misses;
+      return {};
+    }
+    if (TrackStats)
+      ++Hits;
+    return It->second;
+  }
+
+  Error addName(StringRef Name) const override {
+    uint64_t Hash = IndexedInstrProf::ComputeHash(Name);
+    if (UncacheableNames.contains(Hash))
+      return Error::success();
+
+    auto It = Names.find(Hash);
+    if (It != Names.end()) {
+      if (It->second != Name) {
+        NameBytes -= It->second.size();
+        Names.erase(It);
+        UncacheableNames.insert(Hash);
+      }
+      return Error::success();
+    }
+
+    if (Name.size() > MaxNameBytes - NameBytes || Names.size() >= MaxNames) {
+      NeedsReset = true;
+      return Error::success();
+    }
+
+    NameBytes += Name.size();
+    Names.insert({Hash, Name.str()});
+    if (TrackStats)
+      ++Additions;
+    return Error::success();
+  }
+
+  void prepareForInput() {
+    if (!NeedsReset)
+      return;
+    Names.clear();
+    UncacheableNames.clear();
+    NameBytes = 0;
+    NeedsReset = false;
+    if (TrackStats)
+      ++Resets;
+  }
+
+  uint64_t getLookups() const { return Lookups; }
+  uint64_t getHits() const { return Hits; }
+  uint64_t getMisses() const { return Misses; }
+  uint64_t getAdditions() const { return Additions; }
+  uint64_t getResets() const { return Resets; }
+  size_t getNameBytes() const { return NameBytes; }
+};
+
+static Expected<std::unique_ptr<CompactInstrProfNameLookup>>
+buildCoverageSPINameLookup(StringRef Filename) {
+  auto BufferOrErr = MemoryBuffer::getFile(Filename, /*IsText=*/false,
+                                           /*RequiresNullTerminator=*/false);
+  if (!BufferOrErr)
+    return errorCodeToError(BufferOrErr.getError());
+
+  auto ContentsOrErr =
+      coverage::readCoverageMappingSPI((*BufferOrErr)->getBuffer());
+  if (!ContentsOrErr)
+    return ContentsOrErr.takeError();
+  coverage::CoverageMappingSPIContents &Contents = *ContentsOrErr;
+
+  DenseMap<StringRef, size_t> LatestRecord;
+  for (size_t I = 0; I != Contents.Records.size(); ++I)
+    LatestRecord[Contents.Records[I].Key] = I;
+
+  std::vector<CompactInstrProfNameLookup::Entry> Entries;
+  std::string Names;
+  DenseMap<uint64_t, uint32_t> EntryByHash;
+  uint64_t NameOccurrences = 0;
+  uint64_t DuplicateNames = 0;
+
+  for (size_t I = 0; I != Contents.Records.size(); ++I) {
+    const coverage::CoverageMappingSPIRecord &Record = Contents.Records[I];
+    if (LatestRecord.lookup(Record.Key) != I)
+      continue;
+
+    auto PayloadOrErr = coverage::readCoverageMappingSPIPayload(Record.Payload);
+    if (!PayloadOrErr) {
+      warn(toString(PayloadOrErr.takeError()), Record.Key);
+      continue;
+    }
+
+    Error E = readAndDecodeStrings(
+        PayloadOrErr->ProfileNames, [&](StringRef Name) -> Error {
+          ++NameOccurrences;
+          uint64_t Hash = IndexedInstrProf::ComputeHash(Name);
+          auto Existing = EntryByHash.find(Hash);
+          if (Existing != EntryByHash.end()) {
+            const auto &Old = Entries[Existing->second];
+            if (StringRef(Names).substr(Old.Offset, Old.Length) != Name)
+              return createStringError(
+                  inconvertibleErrorCode(),
+                  "coverage SPI profile-name hash collision for 0x%016" PRIx64,
+                  Hash);
+            ++DuplicateNames;
+            return Error::success();
+          }
+
+          if (Name.size() > std::numeric_limits<uint32_t>::max() ||
+              Names.size() > std::numeric_limits<uint32_t>::max() - Name.size())
+            return createStringError(inconvertibleErrorCode(),
+                                     "coverage SPI profile names exceed 4 GiB");
+          if (Entries.size() >= std::numeric_limits<uint32_t>::max() - 1)
+            return createStringError(
+                inconvertibleErrorCode(),
+                "coverage SPI contains too many profile names");
+          uint32_t Index = static_cast<uint32_t>(Entries.size());
+          EntryByHash[Hash] = Index;
+          Entries.push_back({Hash, static_cast<uint32_t>(Names.size()),
+                             static_cast<uint32_t>(Name.size())});
+          Names.append(Name.data(), Name.size());
+          return Error::success();
+        });
+    if (E)
+      return std::move(E);
+  }
+
+  if (Entries.empty())
+    return createStringError(inconvertibleErrorCode(),
+                             "coverage SPI contains no profile names");
+  if (ShowCoverageSPINameCacheStats)
+    errs() << "coverage SPI name cache: records=" << Contents.Records.size()
+           << ", effective-records=" << LatestRecord.size()
+           << ", name-occurrences=" << NameOccurrences
+           << ", duplicate-names=" << DuplicateNames << '\n';
+
+  return std::make_unique<CompactInstrProfNameLookup>(
+      std::move(Entries), std::move(Names), ShowCoverageSPINameCacheStats);
+}
+
 static void warnOrExitGivenError(FailureMode FailMode, std::error_code EC,
                                  StringRef Whence = "") {
   if (FailMode == failIfAnyAreInvalid)
@@ -695,7 +939,8 @@ static void
 loadInput(const WeightedFile &Input, SymbolRemapper *Remapper,
           const InstrProfCorrelator *Correlator, const StringRef ProfiledBinary,
           WriterContext *WC, const object::BuildIDFetcher *BIDFetcher = nullptr,
-          const ProfCorrelatorKind *BIDFetcherCorrelatorKind = nullptr) {
+          const ProfCorrelatorKind *BIDFetcherCorrelatorKind = nullptr,
+          const InstrProfNameLookup *NameLookup = nullptr) {
   std::unique_lock<std::mutex> CtxGuard{WC->Lock};
 
   // Copy the filename, because llvm::ThreadPool copied the input "const
@@ -798,8 +1043,9 @@ loadInput(const WeightedFile &Input, SymbolRemapper *Remapper,
   const ProfCorrelatorKind CorrelatorKind = BIDFetcherCorrelatorKind
                                                 ? *BIDFetcherCorrelatorKind
                                                 : ProfCorrelatorKind::NONE;
-  auto ReaderOrErr = InstrProfReader::create(Input.Filename, *FS, Correlator,
-                                             BIDFetcher, CorrelatorKind, Warn);
+  auto ReaderOrErr =
+      InstrProfReader::create(Input.Filename, *FS, Correlator, BIDFetcher,
+                              CorrelatorKind, Warn, NameLookup);
   if (Error E = ReaderOrErr.takeError()) {
     // Skip the empty profiles by returning silently.
     auto [ErrCode, Msg] = InstrProfError::take(std::move(E));
@@ -1030,6 +1276,22 @@ static void mergeInstrProfile(const WeightedFileVector &Inputs,
                   "--correlate is provided");
   }
 
+  std::unique_ptr<CompactInstrProfNameLookup> SPINameLookup;
+  if (!CoverageSPINameCache.empty()) {
+    auto LookupOrErr = buildCoverageSPINameLookup(CoverageSPINameCache);
+    if (!LookupOrErr) {
+      warn(toString(LookupOrErr.takeError()), CoverageSPINameCache);
+    } else {
+      SPINameLookup = std::move(*LookupOrErr);
+      if (ShowCoverageSPINameCacheStats)
+        errs() << "coverage SPI name cache: unique-names="
+               << SPINameLookup->getNumNames()
+               << ", name-bytes=" << SPINameLookup->getNameBytes()
+               << ", storage-bytes=" << SPINameLookup->getStorageBytes()
+               << '\n';
+    }
+  }
+
   std::mutex ErrorLock;
   SmallSet<instrprof_error, 4> WriterErrorCodes;
 
@@ -1040,15 +1302,29 @@ static void mergeInstrProfile(const WeightedFileVector &Inputs,
 
   // Initialize the writer contexts.
   SmallVector<std::unique_ptr<WriterContext>, 4> Contexts;
+  SmallVector<std::unique_ptr<AdaptiveInstrProfNameLookup>, 4> NameLookups;
   for (unsigned I = 0; I < NumThreads; ++I)
     Contexts.emplace_back(std::make_unique<WriterContext>(
         OutputSparse, ErrorLock, WriterErrorCodes, TraceReservoirSize,
         MaxTraceLength));
+  for (unsigned I = 0; I < NumThreads; ++I)
+    NameLookups.emplace_back(std::make_unique<AdaptiveInstrProfNameLookup>(
+        ShowInstrProfNameCacheStats));
+
+  auto getNameLookup = [&](unsigned ContextIndex) -> InstrProfNameLookup * {
+    if (SPINameLookup)
+      return SPINameLookup.get();
+    if (DisableInstrProfNameCache)
+      return nullptr;
+    NameLookups[ContextIndex]->prepareForInput();
+    return NameLookups[ContextIndex].get();
+  };
 
   if (NumThreads == 1) {
     for (const auto &Input : Inputs)
       loadInput(Input, Remapper, Correlator.get(), ProfiledBinary,
-                Contexts[0].get(), BIDFetcher.get(), &BIDFetcherCorrelateKind);
+                Contexts[0].get(), BIDFetcher.get(), &BIDFetcherCorrelateKind,
+                getNameLookup(0));
   } else {
     DefaultThreadPool Pool(hardware_concurrency(NumThreads));
 
@@ -1062,7 +1338,7 @@ static void mergeInstrProfile(const WeightedFileVector &Inputs,
         for (size_t I = Ctx; I < Inputs.size(); I += NumThreads)
           loadInput(Inputs[I], Remapper, Correlator.get(), ProfiledBinary,
                     Contexts[Ctx].get(), BIDFetcher.get(),
-                    &BIDFetcherCorrelateKind);
+                    &BIDFetcherCorrelateKind, getNameLookup(Ctx));
       });
     Pool.wait();
 
@@ -1083,6 +1359,30 @@ static void mergeInstrProfile(const WeightedFileVector &Inputs,
       End = Mid;
       Mid /= 2;
     } while (Mid > 0);
+  }
+
+  if (SPINameLookup && ShowCoverageSPINameCacheStats)
+    errs() << "coverage SPI name cache: hits=" << SPINameLookup->getHits()
+           << ", misses=" << SPINameLookup->getMisses() << '\n';
+  if (!SPINameLookup && !DisableInstrProfNameCache &&
+      ShowInstrProfNameCacheStats) {
+    uint64_t Lookups = 0;
+    uint64_t Hits = 0;
+    uint64_t Misses = 0;
+    uint64_t Additions = 0;
+    uint64_t Resets = 0;
+    size_t NameBytes = 0;
+    for (const auto &Lookup : NameLookups) {
+      Lookups += Lookup->getLookups();
+      Hits += Lookup->getHits();
+      Misses += Lookup->getMisses();
+      Additions += Lookup->getAdditions();
+      Resets += Lookup->getResets();
+      NameBytes += Lookup->getNameBytes();
+    }
+    errs() << "raw profile name cache: lookups=" << Lookups << ", hits=" << Hits
+           << ", misses=" << Misses << ", additions=" << Additions
+           << ", resets=" << Resets << ", name-bytes=" << NameBytes << '\n';
   }
 
   // Handle deferred errors encountered during merging. If the number of errors

@@ -49,6 +49,17 @@
 
 namespace llvm {
 
+/// A mapping from instrumentation profile name hashes to their original PGO
+/// names. Raw profile readers may use this to avoid repeatedly decoding
+/// identical embedded name sections. Mutable implementations can learn names
+/// when a raw profile must be decoded after a cache miss.
+class InstrProfNameLookup {
+public:
+  virtual ~InstrProfNameLookup() = default;
+  virtual StringRef lookup(uint64_t NameRef) const = 0;
+  virtual Error addName(StringRef Name) const { return Error::success(); }
+};
+
 class Function;
 class GlobalVariable;
 struct InstrProfRecord;
