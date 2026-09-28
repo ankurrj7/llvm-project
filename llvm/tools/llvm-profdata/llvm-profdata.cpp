@@ -1052,14 +1052,18 @@ static void mergeInstrProfile(const WeightedFileVector &Inputs,
   } else {
     DefaultThreadPool Pool(hardware_concurrency(NumThreads));
 
-    // Load the inputs in parallel (N/NumThreads serial steps).
-    unsigned Ctx = 0;
-    for (const auto &Input : Inputs) {
-      Pool.async(loadInput, Input, Remapper, Correlator.get(), ProfiledBinary,
-                 Contexts[Ctx].get(), BIDFetcher.get(),
-                 &BIDFetcherCorrelateKind);
-      Ctx = (Ctx + 1) % NumThreads;
-    }
+    // Give each writer context one task which processes its inputs serially.
+    // Submitting one task per input can leave pool threads blocked on a busy
+    // context's mutex while inputs for other contexts remain queued. Preserve
+    // the existing round-robin input assignment and order because some profile
+    // data, such as temporal traces, is order-sensitive.
+    for (unsigned Ctx = 0; Ctx < NumThreads; ++Ctx)
+      Pool.async([&, Ctx] {
+        for (size_t I = Ctx; I < Inputs.size(); I += NumThreads)
+          loadInput(Inputs[I], Remapper, Correlator.get(), ProfiledBinary,
+                    Contexts[Ctx].get(), BIDFetcher.get(),
+                    &BIDFetcherCorrelateKind);
+      });
     Pool.wait();
 
     // Merge the writer contexts together (~ lg(NumThreads) serial steps).
