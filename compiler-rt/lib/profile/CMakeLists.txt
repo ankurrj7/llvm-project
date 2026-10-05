@@ -108,9 +108,10 @@ if(WIN32)
   )
 endif()
 
-# Keep clang_rt.profile compatible with the existing profile runtime. The
-# coverage variant adds process-wide DSO dumping and sparse raw serialization;
-# callers select it by installing it under the canonical profile archive name.
+# The coverage variant adds process-wide DSO dumping and sparse raw
+# serialization. On Linux it is also the canonical profile runtime so a normal
+# build and install cannot silently restore the dense runtime. Keep that dense
+# runtime available under the explicit .legacy archive name.
 set(PROFILE_COVERAGE_SOURCES ${PROFILE_SOURCES})
 if (NOT COMPILER_RT_PROFILE_BAREMETAL)
   list(APPEND PROFILE_COVERAGE_SOURCES InstrProfilingDumpAll.c)
@@ -181,13 +182,21 @@ append_list_if(COMPILER_RT_HAS_WD4221_FLAG /wd4221 EXTRA_FLAGS)
 # Disable 'nonstandard extension used: translation unit is empty'.
 append_list_if(COMPILER_RT_HAS_WD4206_FLAG /wd4206 EXTRA_FLAGS)
 
+set(PROFILE_CANONICAL_SOURCES ${PROFILE_SOURCES})
+set(PROFILE_CANONICAL_FLAGS ${EXTRA_FLAGS})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT COMPILER_RT_PROFILE_BAREMETAL)
+  set(PROFILE_CANONICAL_SOURCES ${PROFILE_COVERAGE_SOURCES})
+  list(APPEND PROFILE_CANONICAL_FLAGS
+    -DCOMPILER_RT_PROFILE_COVERAGE_RUNTIME=1)
+endif()
+
 if(APPLE)
   add_compiler_rt_runtime(clang_rt.profile
     STATIC
     OS ${PROFILE_SUPPORTED_OS}
     ARCHS ${PROFILE_SUPPORTED_ARCH}
-    CFLAGS ${EXTRA_FLAGS}
-    SOURCES ${PROFILE_SOURCES}
+    CFLAGS ${PROFILE_CANONICAL_FLAGS}
+    SOURCES ${PROFILE_CANONICAL_SOURCES}
     ADDITIONAL_HEADERS ${PROFILE_HEADERS}
     PARENT_TARGET profile)
 
@@ -203,10 +212,20 @@ else()
   add_compiler_rt_runtime(clang_rt.profile
     STATIC
     ARCHS ${PROFILE_SUPPORTED_ARCH}
-    CFLAGS ${EXTRA_FLAGS}
-    SOURCES ${PROFILE_SOURCES}
+    CFLAGS ${PROFILE_CANONICAL_FLAGS}
+    SOURCES ${PROFILE_CANONICAL_SOURCES}
     ADDITIONAL_HEADERS ${PROFILE_HEADERS}
     PARENT_TARGET profile)
+
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT COMPILER_RT_PROFILE_BAREMETAL)
+    add_compiler_rt_runtime(clang_rt.profile.legacy
+      STATIC
+      ARCHS ${PROFILE_SUPPORTED_ARCH}
+      CFLAGS ${EXTRA_FLAGS}
+      SOURCES ${PROFILE_SOURCES}
+      ADDITIONAL_HEADERS ${PROFILE_HEADERS}
+      PARENT_TARGET profile)
+  endif()
 
   add_compiler_rt_runtime(clang_rt.profile_coverage
     STATIC
@@ -223,6 +242,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT COMPILER_RT_PROFILE_BAREMETAL)
     PARENT_TARGET profile
     EXTRA profile.syms.extra)
   add_sanitizer_rt_symbols(clang_rt.profile_coverage
+    ARCHS ${PROFILE_SUPPORTED_ARCH}
+    PARENT_TARGET profile
+    EXTRA profile.syms.extra)
+  add_sanitizer_rt_symbols(clang_rt.profile.legacy
     ARCHS ${PROFILE_SUPPORTED_ARCH}
     PARENT_TARGET profile
     EXTRA profile.syms.extra)
